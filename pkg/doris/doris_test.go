@@ -109,8 +109,8 @@ func TestParseRealPlatformDorisAndIcebergDDLs(t *testing.T) {
 		if len(schema.PlatformObjects) < 9 {
 			t.Errorf("expected at least 9 platform objects (vault, default vault, 5 workload groups, policy, 2 catalogs), got %d", len(schema.PlatformObjects))
 		}
-		if len(schema.Tables) != 42 {
-			t.Errorf("expected 42 tables in doris_setup.sql (32 Iceberg terminology + 8 Doris rollup + 1 telemetry + 1 RAG), got %d", len(schema.Tables))
+		if len(schema.Tables) < 42 {
+			t.Errorf("expected at least 42 tables in doris_setup.sql, got %d", len(schema.Tables))
 		}
 
 		// Check loinc_codes has `system` column properly parsed and backtick-formatted

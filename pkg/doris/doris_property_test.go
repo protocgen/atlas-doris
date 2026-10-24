@@ -15,7 +15,7 @@ func drawIdent(ht *hegel.T, prefix string) string {
 	var b strings.Builder
 	for i, r := range raw {
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
-			b.WriteRune(r + ('a' - 'A')*((r-'A')/26)) // keep ascii
+			b.WriteRune(r + ('a'-'A')*((r-'A')/26)) // keep ascii
 		} else if i > 0 && r >= '0' && r <= '9' {
 			b.WriteRune(r)
 		} else if i > 0 && r == '_' {

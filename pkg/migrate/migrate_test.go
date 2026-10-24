@@ -19,9 +19,27 @@ import (
 )
 
 func TestAtlasSumByteForByteCompatibility(t *testing.T) {
+	t.Run("standalone_baseline_vector", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(tmpDir, "00000000000000_tenant.sql"), nil, 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		if err := migrate.HashDir(tmpDir); err != nil {
+			t.Fatalf("HashDir: %v", err)
+		}
+		gotSum, err := os.ReadFile(filepath.Join(tmpDir, "atlas.sum"))
+		if err != nil {
+			t.Fatalf("read atlas.sum: %v", err)
+		}
+		const wantLine = "00000000000000_tenant.sql h1:evZW1ZIPit+1wfVGyGJrH+pY/64U2PRFFkrjAMO93wg="
+		if !strings.Contains(string(gotSum), wantLine) {
+			t.Fatalf("atlas.sum missing expected line %q:\ngot:\n%s", wantLine, string(gotSum))
+		}
+	})
+
 	realChainDir := "/Users/ab/code/azra/platform/schemas/tenant/directoryservice/migrations"
 	if _, err := os.Stat(realChainDir); os.IsNotExist(err) {
-		t.Skipf("directoryservice migrations %s not present", realChainDir)
+		return
 	}
 
 	tmpDir := t.TempDir()

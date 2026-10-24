@@ -87,10 +87,14 @@ func runMigrateDiff(ctx context.Context, args []string, stdout, stderr io.Writer
 	fs.StringVar(&target, "target", "all", "target filter: all | doris | iceberg")
 	fs.StringVar(&pluginPath, "plugin", "", "path to protoc-gen-proto2type binary")
 	fs.StringVar(&versionOverride, "version", "", "optional explicit 14-digit migration version")
+	fs.BoolVar(&allowDestructive, "allow-drop-column", false, "allow destructive column/table drops")
 	fs.BoolVar(&allowDestructive, "allow-destructive", false, "allow destructive column/table drops")
 	fs.Var(&includes, "include", "proto include directory (repeatable)")
 
-	reordered := reorderFlagsFirst(args, map[string]bool{"--allow-destructive": true})
+	reordered := reorderFlagsFirst(args, map[string]bool{
+		"--allow-drop-column": true,
+		"--allow-destructive": true,
+	})
 	if err := fs.Parse(reordered); err != nil {
 		return 1
 	}
@@ -135,9 +139,13 @@ func runMigrateValidate(args []string, stdout, stderr io.Writer) int {
 	var dirURL string
 	var allowDestructive bool
 	fs.StringVar(&dirURL, "dir", "", "migration directory URL (file://path/to/migrations)")
+	fs.BoolVar(&allowDestructive, "allow-drop-column", false, "allow destructive column/table drops")
 	fs.BoolVar(&allowDestructive, "allow-destructive", false, "allow destructive column/table drops")
 
-	reordered := reorderFlagsFirst(args, map[string]bool{"--allow-destructive": true})
+	reordered := reorderFlagsFirst(args, map[string]bool{
+		"--allow-drop-column": true,
+		"--allow-destructive": true,
+	})
 	if err := fs.Parse(reordered); err != nil {
 		return 1
 	}
@@ -184,10 +192,14 @@ func runMigrateLint(ctx context.Context, args []string, stdout, stderr io.Writer
 	fs.StringVar(&toURL, "to", "", "optional desired target schema URL (file:// or proto://)")
 	fs.StringVar(&target, "target", "all", "target filter: all | doris | iceberg")
 	fs.StringVar(&pluginPath, "plugin", "", "path to protoc-gen-proto2type binary")
+	fs.BoolVar(&allowDestructive, "allow-drop-column", false, "allow destructive column/table drops")
 	fs.BoolVar(&allowDestructive, "allow-destructive", false, "allow destructive column/table drops")
 	fs.Var(&includes, "include", "proto include directory (repeatable)")
 
-	reordered := reorderFlagsFirst(args, map[string]bool{"--allow-destructive": true})
+	reordered := reorderFlagsFirst(args, map[string]bool{
+		"--allow-drop-column": true,
+		"--allow-destructive": true,
+	})
 	if err := fs.Parse(reordered); err != nil {
 		return 1
 	}
@@ -231,6 +243,7 @@ func runMigrateStatus(ctx context.Context, args []string, stdout, stderr io.Writ
 	var dirURL, dbURL, revisionsSchema string
 	fs.StringVar(&dirURL, "dir", "", "migration directory URL (file://path/to/migrations)")
 	fs.StringVar(&dbURL, "url", "", "Doris FE URL (doris://user:pass@host:9030/db)")
+	fs.StringVar(&revisionsSchema, "revisions-table", "", "optional database/schema or table for atlas_schema_revisions")
 	fs.StringVar(&revisionsSchema, "revisions-schema", "", "optional database/schema for atlas_schema_revisions")
 
 	if err := fs.Parse(reorderFlagsFirst(args, nil)); err != nil {
@@ -272,13 +285,16 @@ func runMigrateApply(ctx context.Context, args []string, stdout, stderr io.Write
 	fs.StringVar(&dirURL, "dir", "", "migration directory URL (file://path/to/migrations)")
 	fs.StringVar(&dbURL, "url", "", "Doris FE URL (doris://user:pass@host:9030/db)")
 	fs.StringVar(&baseline, "baseline", "", "optional baseline version to mark as already applied")
+	fs.StringVar(&revisionsSchema, "revisions-table", "", "optional database/schema or table for atlas_schema_revisions")
 	fs.StringVar(&revisionsSchema, "revisions-schema", "", "optional database/schema for atlas_schema_revisions")
 	fs.BoolVar(&dryRun, "dry-run", false, "validate and render SQL without executing against Doris")
+	fs.BoolVar(&allowDestructive, "allow-drop-column", false, "allow destructive column/table drops")
 	fs.BoolVar(&allowDestructive, "allow-destructive", false, "allow destructive column/table drops")
 	fs.Var(&varPairs, "var", "template variable KEY=VALUE (repeatable)")
 
 	reordered := reorderFlagsFirst(args, map[string]bool{
 		"--dry-run":           true,
+		"--allow-drop-column": true,
 		"--allow-destructive": true,
 	})
 	if err := fs.Parse(reordered); err != nil {
@@ -399,10 +415,14 @@ func runSchemaDiff(ctx context.Context, args []string, stdout, stderr io.Writer)
 	fs.StringVar(&toURL, "to", "", "target schema URL (file://path or proto://path)")
 	fs.StringVar(&target, "target", "all", "target filter: all | doris | iceberg")
 	fs.StringVar(&pluginPath, "plugin", "", "path to protoc-gen-proto2type binary")
+	fs.BoolVar(&allowDestructive, "allow-drop-column", false, "allow destructive column/table drops")
 	fs.BoolVar(&allowDestructive, "allow-destructive", false, "allow destructive column/table drops")
 	fs.Var(&includes, "include", "proto include directory (repeatable)")
 
-	reordered := reorderFlagsFirst(args, map[string]bool{"--allow-destructive": true})
+	reordered := reorderFlagsFirst(args, map[string]bool{
+		"--allow-drop-column": true,
+		"--allow-destructive": true,
+	})
 	if err := fs.Parse(reordered); err != nil {
 		return 1
 	}

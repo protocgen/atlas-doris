@@ -1,0 +1,351 @@
+// Package external implements the Atlas external_schema loader and proto2type
+// runner for Apache Doris 4.x and Apache Iceberg schemas.
+package external
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io/fs"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/protocgen/atlas-doris/pkg/doris"
+	"github.com/protocgen/atlas-doris/pkg/migrate"
+)
+
+// TargetFilter controls which generated DDL files are loaded from a directory or proto run.
+type TargetFilter string
+
+const (
+	TargetAll     TargetFilter = "all"
+	TargetDoris   TargetFilter = "doris"
+	TargetIceberg TargetFilter = "iceberg"
+)
+
+// LoadOptions configures how LoadSchema loads SQL or Protobuf schema definitions.
+type LoadOptions struct {
+	Target        TargetFilter
+	ProtoIncludes []string
+	PluginPath    string
+}
+
+// ExternalSchemaOptions configures the external-schema command output.
+type ExternalSchemaOptions struct {
+	SQLDir        string
+	SQLFiles      []string
+	ProtoPath     string
+	URL           string
+	Target        TargetFilter
+	ProtoIncludes []string
+	PluginPath    string
+}
+
+// LoadSchema loads a doris.Schema from a file:// URL, local file/directory path,
+// or proto:// URL (which invokes protoc + protoc-gen-proto2type with backend=doris,doris_mode=ddl).
+func LoadSchema(ctx context.Context, targetURL string, opts LoadOptions) (*doris.Schema, error) {
+	raw := strings.TrimSpace(targetURL)
+	if raw == "" {
+		return nil, fmt.Errorf("empty schema URL or path")
+	}
+	if strings.HasPrefix(raw, "proto://") {
+		return loadFromProtoURL(ctx, raw, opts)
+	}
+	target := opts.Target
+	if strings.HasPrefix(raw, "file://") {
+		if u, err := url.Parse(raw); err == nil {
+			if qTarget := strings.TrimSpace(u.Query().Get("target")); qTarget != "" && target == "" {
+				target = TargetFilter(strings.ToLower(qTarget))
+			}
+		}
+	}
+	localPath, err := migrate.ResolvePath(raw)
+	if err != nil {
+		return nil, err
+	}
+	return LoadFromPath(localPath, target)
+}
+
+// LoadFromPath loads a doris.Schema from a single .sql file, a directory of .sql files,
+// or an Atlas migration directory (when atlas.sum is present).
+func LoadFromPath(localPath string, target TargetFilter) (*doris.Schema, error) {
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return nil, fmt.Errorf("stat schema path %q: %w", localPath, err)
+	}
+	if !info.IsDir() {
+		data, err := os.ReadFile(localPath)
+		if err != nil {
+			return nil, fmt.Errorf("read schema file %q: %w", localPath, err)
+		}
+		s, err := doris.ParseSchema(string(data))
+		if err != nil {
+			return nil, fmt.Errorf("parse schema file %q: %w", localPath, err)
+		}
+		return s, nil
+	}
+
+	// If the directory is an Atlas migration chain (contains atlas.sum), replay it.
+	if _, err := os.Stat(filepath.Join(localPath, "atlas.sum")); err == nil {
+		s, _, err := migrate.ReplayDir(localPath)
+		if err != nil {
+			return nil, err
+		}
+		return s, nil
+	}
+
+	var sqlFiles []string
+	err = filepath.WalkDir(localPath, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		name := strings.ToLower(d.Name())
+		if !strings.HasSuffix(name, ".sql") {
+			return nil
+		}
+		if !matchesTargetFilter(name, target) {
+			return nil
+		}
+		sqlFiles = append(sqlFiles, p)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("scan SQL directory %q: %w", localPath, err)
+	}
+	sort.Strings(sqlFiles)
+	if len(sqlFiles) == 0 {
+		return nil, fmt.Errorf("no matching .sql files found in %q (target=%q)", localPath, target)
+	}
+
+	merged := doris.NewSchema()
+	for _, f := range sqlFiles {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			return nil, fmt.Errorf("read %q: %w", f, err)
+		}
+		sub, err := doris.ParseSchema(string(data))
+		if err != nil {
+			return nil, fmt.Errorf("parse %q: %w", f, err)
+		}
+		merged.Merge(sub)
+	}
+	return merged, nil
+}
+
+// ExternalSchemaSQL resolves the schema from ExternalSchemaOptions and formats it
+// as deterministic canonical SQL suitable for Atlas data "external_schema".
+func ExternalSchemaSQL(ctx context.Context, opts ExternalSchemaOptions) (string, error) {
+	merged := doris.NewSchema()
+	loadedAny := false
+
+	if opts.URL != "" {
+		s, err := LoadSchema(ctx, opts.URL, LoadOptions{
+			Target:        opts.Target,
+			ProtoIncludes: opts.ProtoIncludes,
+			PluginPath:    opts.PluginPath,
+		})
+		if err != nil {
+			return "", err
+		}
+		merged.Merge(s)
+		loadedAny = true
+	}
+
+	if opts.SQLDir != "" {
+		s, err := LoadFromPath(opts.SQLDir, opts.Target)
+		if err != nil {
+			return "", err
+		}
+		merged.Merge(s)
+		loadedAny = true
+	}
+
+	for _, f := range opts.SQLFiles {
+		if strings.TrimSpace(f) == "" {
+			continue
+		}
+		s, err := LoadFromPath(f, opts.Target)
+		if err != nil {
+			return "", err
+		}
+		merged.Merge(s)
+		loadedAny = true
+	}
+
+	if opts.ProtoPath != "" {
+		protoURL := opts.ProtoPath
+		if !strings.HasPrefix(protoURL, "proto://") {
+			protoURL = "proto://" + protoURL
+		}
+		s, err := loadFromProtoURL(ctx, protoURL, LoadOptions{
+			Target:        opts.Target,
+			ProtoIncludes: opts.ProtoIncludes,
+			PluginPath:    opts.PluginPath,
+		})
+		if err != nil {
+			return "", err
+		}
+		merged.Merge(s)
+		loadedAny = true
+	}
+
+	if !loadedAny {
+		return "", fmt.Errorf("external-schema requires at least one of --sql-dir, --sql-file, --proto, or --url")
+	}
+
+	return doris.FormatSchema(merged), nil
+}
+
+func loadFromProtoURL(ctx context.Context, rawURL string, opts LoadOptions) (*doris.Schema, error) {
+	withoutScheme := strings.TrimPrefix(rawURL, "proto://")
+	pathPart := withoutScheme
+	var queryValues url.Values
+	if qIdx := strings.IndexByte(withoutScheme, '?'); qIdx >= 0 {
+		pathPart = withoutScheme[:qIdx]
+		parsedQ, err := url.ParseQuery(withoutScheme[qIdx+1:])
+		if err != nil {
+			return nil, fmt.Errorf("invalid proto:// query parameters in %q: %w", rawURL, err)
+		}
+		queryValues = parsedQ
+	}
+
+	target := opts.Target
+	if qTarget := queryValues.Get("target"); qTarget != "" {
+		target = TargetFilter(strings.ToLower(qTarget))
+	}
+	pluginPath := opts.PluginPath
+	if qPlugin := queryValues.Get("plugin"); qPlugin != "" {
+		pluginPath = qPlugin
+	}
+	var includes []string
+	includes = append(includes, opts.ProtoIncludes...)
+	for _, inc := range queryValues["include"] {
+		for _, part := range strings.Split(inc, ",") {
+			if p := strings.TrimSpace(part); p != "" {
+				includes = append(includes, p)
+			}
+		}
+	}
+
+	protoTarget := filepath.Clean(pathPart)
+	info, err := os.Stat(protoTarget)
+	if err != nil {
+		return nil, fmt.Errorf("stat proto target %q: %w", protoTarget, err)
+	}
+
+	var protoFiles []string
+	var rootInclude string
+	if info.IsDir() {
+		rootInclude = protoTarget
+		err := filepath.WalkDir(protoTarget, func(p string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if !d.IsDir() && strings.HasSuffix(d.Name(), ".proto") {
+				protoFiles = append(protoFiles, p)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("walk proto directory %q: %w", protoTarget, err)
+		}
+	} else {
+		rootInclude = filepath.Dir(protoTarget)
+		protoFiles = []string{protoTarget}
+	}
+	sort.Strings(protoFiles)
+	if len(protoFiles) == 0 {
+		return nil, fmt.Errorf("no .proto files found in %q", protoTarget)
+	}
+
+	resolvedPlugin, cleanupPlugin, err := resolveProto2TypePlugin(ctx, pluginPath)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanupPlugin()
+
+	tmpOut, err := os.MkdirTemp("", "atlas-doris-proto2type-*")
+	if err != nil {
+		return nil, fmt.Errorf("create temp output dir: %w", err)
+	}
+	defer os.RemoveAll(tmpOut)
+
+	var args []string
+	args = append(args, "--plugin=protoc-gen-proto2type="+resolvedPlugin)
+	args = append(args, "--proto2type_out="+tmpOut)
+	args = append(args, "--proto2type_opt=lang=go,backend=doris,doris_mode=ddl")
+	seenInc := make(map[string]bool)
+	for _, inc := range append([]string{rootInclude}, includes...) {
+		cleanInc := filepath.Clean(inc)
+		if !seenInc[cleanInc] {
+			seenInc[cleanInc] = true
+			args = append(args, "-I", cleanInc)
+		}
+	}
+	args = append(args, protoFiles...)
+
+	cmd := exec.CommandContext(ctx, "protoc", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("protoc + protoc-gen-proto2type failed: %w\n%s", err, strings.TrimSpace(stderr.String()))
+	}
+
+	return LoadFromPath(tmpOut, target)
+}
+
+func resolveProto2TypePlugin(ctx context.Context, explicitPath string) (string, func(), error) {
+	noop := func() {}
+	if explicitPath != "" {
+		abs, err := filepath.Abs(explicitPath)
+		if err != nil {
+			return "", noop, err
+		}
+		if _, err := os.Stat(abs); err != nil {
+			return "", noop, fmt.Errorf("protoc-gen-proto2type plugin not found at %q: %w", abs, err)
+		}
+		return abs, noop, nil
+	}
+	if p, err := exec.LookPath("protoc-gen-proto2type"); err == nil {
+		return p, noop, nil
+	}
+	// Check sibling proto2type repository if present in workspace
+	candidates := []string{
+		"/Users/ab/code/azra/proto2type",
+		filepath.Join("..", "proto2type"),
+	}
+	for _, repoDir := range candidates {
+		if info, err := os.Stat(filepath.Join(repoDir, "go.mod")); err == nil && !info.IsDir() {
+			tmpBinDir, err := os.MkdirTemp("", "protoc-gen-proto2type-bin-*")
+			if err != nil {
+				continue
+			}
+			binPath := filepath.Join(tmpBinDir, "protoc-gen-proto2type")
+			buildCmd := exec.CommandContext(ctx, "go", "build", "-workfile=off", "-o", binPath, ".")
+			buildCmd.Dir = repoDir
+			if err := buildCmd.Run(); err == nil {
+				return binPath, func() { _ = os.RemoveAll(tmpBinDir) }, nil
+			}
+			_ = os.RemoveAll(tmpBinDir)
+		}
+	}
+	return "", noop, fmt.Errorf("protoc-gen-proto2type binary not found in PATH (pass --plugin or install protoc-gen-proto2type)")
+}
+
+func matchesTargetFilter(lowerFileName string, target TargetFilter) bool {
+	switch target {
+	case TargetDoris:
+		return strings.HasSuffix(lowerFileName, "_doris.sql") || strings.Contains(lowerFileName, "doris")
+	case TargetIceberg:
+		return strings.HasSuffix(lowerFileName, "_iceberg.sql") || strings.Contains(lowerFileName, "iceberg")
+	default:
+		return true
+	}
+}

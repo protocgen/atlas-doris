@@ -1,0 +1,17 @@
+# Binaries
+atlas-doris
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Build & Cache
+.bin/
+.gocache/
+.go_cache/
+.modcache/
+.cache/

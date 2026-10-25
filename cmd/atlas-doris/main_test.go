@@ -116,7 +116,7 @@ PROPERTIES (
 		t.Errorf("unexpected migrate apply --dry-run output:\n%s", out)
 	}
 
-	// 10. schema inspect and external-schema
+	// 10. schema inspect and external-schema (both SQL and HCL formats)
 	outInspect, errOut, code := runCLI(ctx, "schema", "inspect", "--url", "file://"+migDir)
 	if code != 0 {
 		t.Fatalf("schema inspect failed (code=%d): %s", code, errOut)
@@ -127,6 +127,26 @@ PROPERTIES (
 	}
 	if outInspect != outExt {
 		t.Errorf("replayed migration chain schema != desired v2 schema:\ninspect:\n%s\nexternal:\n%s", outInspect, outExt)
+	}
+
+	outInspectHCL, errOut, code := runCLI(ctx, "schema", "inspect", "--url", "file://"+migDir, "--format", "hcl")
+	if code != 0 {
+		t.Fatalf("schema inspect --format=hcl failed (code=%d): %s", code, errOut)
+	}
+	if !strings.Contains(outInspectHCL, `table "patients"`) {
+		t.Errorf("expected HCL table block in schema inspect --format=hcl output:\n%s", outInspectHCL)
+	}
+
+	hclFile := filepath.Join(tmpDir, "schema_v2_doris.hcl")
+	if err := os.WriteFile(hclFile, []byte(outInspectHCL), 0o644); err != nil {
+		t.Fatalf("write hclFile: %v", err)
+	}
+	outExtFromHCL, errOut, code := runCLI(ctx, "external-schema", "--hcl-file", hclFile)
+	if code != 0 {
+		t.Fatalf("external-schema --hcl-file failed (code=%d): %s", code, errOut)
+	}
+	if outExtFromHCL != outInspect {
+		t.Errorf("external-schema --hcl-file SQL != inspected SQL:\ngot:\n%s\nwant:\n%s", outExtFromHCL, outInspect)
 	}
 
 	// 11. version command

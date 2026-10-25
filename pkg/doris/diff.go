@@ -132,10 +132,16 @@ func diffTable(current, desired *TableDef, opts DiffOptions) []Statement {
 	for _, dc := range desired.Columns {
 		cc, existed := currentColByName[dc.Name]
 		if !existed {
+			colToAdd := dc.Clone()
+			if desired.IsIcebergTable() {
+				colToAdd.Nullable = true
+				colToAdd.HasDefault = false
+				colToAdd.Default = ""
+			}
 			stmts = append(stmts, Statement{
 				Kind:        StmtAlterTableAddColumn,
 				TargetTable: targetName,
-				Column:      dc.Clone(),
+				Column:      colToAdd,
 			})
 			continue
 		}

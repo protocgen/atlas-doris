@@ -481,7 +481,7 @@ func (e *Executor) Apply(ctx context.Context, opts ApplyOptions) (*ApplyResult, 
 			res.ExecutedSQL = append(res.ExecutedSQL, stmtSQL)
 
 			if requiresAsyncJobWait(st) {
-				if err := e.waitForTableAlterCompletion(ctx, st.TargetTable); err != nil {
+				if err := e.waitForStatementJobCompletion(ctx, st); err != nil {
 					return nil, fmt.Errorf("migration %s async schema change on %s: %w", f.Name, st.TargetTable, err)
 				}
 			}
@@ -517,7 +517,18 @@ func requiresAsyncJobWait(st doris.Statement) bool {
 	}
 }
 
+func (e *Executor) waitForStatementJobCompletion(ctx context.Context, st doris.Statement) error {
+	if st.Kind == doris.StmtBuildIndex {
+		return e.waitForAsyncDorisJob(ctx, st.TargetTable, "SHOW BUILD INDEX")
+	}
+	return e.waitForTableAlterCompletion(ctx, st.TargetTable)
+}
+
 func (e *Executor) waitForTableAlterCompletion(ctx context.Context, fullTableName string) error {
+	return e.waitForAsyncDorisJob(ctx, fullTableName, "SHOW ALTER TABLE COLUMN")
+}
+
+func (e *Executor) waitForAsyncDorisJob(ctx context.Context, fullTableName, showPrefix string) error {
 	if e == nil || e.db == nil {
 		return nil
 	}
@@ -527,7 +538,7 @@ func (e *Executor) waitForTableAlterCompletion(ctx context.Context, fullTableNam
 	if len(parts) >= 2 {
 		dbPrefix = " FROM " + strings.Join(parts[:len(parts)-1], ".")
 	}
-	query := fmt.Sprintf("SHOW ALTER TABLE COLUMN%s WHERE TableName = '%s';", dbPrefix, shortTable)
+	query := fmt.Sprintf("%s%s WHERE TableName = '%s';", showPrefix, dbPrefix, shortTable)
 
 	interval := e.pollInterval
 	if interval <= 0 {
@@ -542,14 +553,15 @@ func (e *Executor) waitForTableAlterCompletion(ctx context.Context, fullTableNam
 	for {
 		state, err := e.queryLatestAlterState(ctx, query)
 		if err != nil {
-			// If the mock/driver doesn't support SHOW ALTER TABLE COLUMN or returns no rows, treat as complete.
+			// If the mock/driver doesn't support SHOW ALTER TABLE COLUMN / SHOW BUILD INDEX or returns no rows, treat as complete.
 			return nil
 		}
-		switch strings.ToUpper(state) {
+		upperState := strings.ToUpper(strings.TrimSpace(state))
+		switch upperState {
 		case "", "FINISHED":
 			return nil
-		case "CANCELLED":
-			return fmt.Errorf("Doris async schema change job for table %q was CANCELLED", fullTableName)
+		case "CANCELLED", "CANCELED", "FAILED":
+			return fmt.Errorf("Doris async schema change job for table %q was %s", fullTableName, upperState)
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timed out waiting for Doris schema change job on %q (last state=%q)", fullTableName, state)

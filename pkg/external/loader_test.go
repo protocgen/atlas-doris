@@ -90,4 +90,86 @@ PROPERTIES (
 	if len(schemaDoris.Tables) != 1 || schemaDoris.Tables[0].FullName != "internal.tenant_${TENANT_SLUG}.patients" {
 		t.Errorf("LoadSchema(file://?target=doris) tables = %d, want 1", len(schemaDoris.Tables))
 	}
+
+	// 5. Add *_doris.hcl and *_iceberg.hcl (simulating doris_mode=all directory) and verify clean deduplication + target filtering + HCL output
+	dorisHCL := `
+table "patients" {
+  schema = "schema.tenant_${TENANT_SLUG}"
+  column "patient_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "mrn" {
+    type = varchar(64)
+    null = false
+    default = ""
+  }
+  column "publication_generation" {
+    type = bigint
+    null = false
+    default = "0"
+  }
+  unique_key {
+    columns = [column.patient_id]
+    merge_on_write = true
+    sequence_col = column.publication_generation
+  }
+  distributed_by_hash {
+    columns = [column.patient_id]
+    buckets = "${TENANT_BUCKETS}"
+  }
+  properties = {
+    storage_vault_name = "azra_lakehouse_vault"
+    enable_unique_key_merge_on_write = "true"
+    "function_column.sequence_col" = "publication_generation"
+  }
+}`
+	icebergHCL := `
+table "patients" {
+  catalog = "azra_lake"
+  schema = "schema.tenant_${TENANT_SLUG}"
+  column "patient_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "mrn" {
+    type = varchar(64)
+    null = false
+  }
+  column "publication_generation" {
+    type = bigint
+    null = false
+  }
+  properties = {
+    compression_codec = "zstd"
+  }
+}`
+	dorisHCLPath := filepath.Join(tmpDir, "patient_profile_doris.hcl")
+	icebergHCLPath := filepath.Join(tmpDir, "patient_profile_iceberg.hcl")
+	if err := os.WriteFile(dorisHCLPath, []byte(dorisHCL), 0o644); err != nil {
+		t.Fatalf("write doris hcl: %v", err)
+	}
+	if err := os.WriteFile(icebergHCLPath, []byte(icebergHCL), 0o644); err != nil {
+		t.Fatalf("write iceberg hcl: %v", err)
+	}
+
+	schemaAllMode, err := external.LoadFromPath(tmpDir, external.TargetAll)
+	if err != nil {
+		t.Fatalf("LoadFromPath(doris_mode=all dir): %v", err)
+	}
+	if len(schemaAllMode.Tables) != 2 {
+		t.Fatalf("expected 2 deduplicated tables from doris_mode=all dir, got %d", len(schemaAllMode.Tables))
+	}
+
+	// Test --hcl-file and Format="hcl"
+	hclRendered, err := external.ExternalSchemaSQL(ctx, external.ExternalSchemaOptions{
+		HCLFiles: []string{dorisHCLPath},
+		Format:   "hcl",
+	})
+	if err != nil {
+		t.Fatalf("ExternalSchemaSQL(HCLFiles, Format=hcl) failed: %v", err)
+	}
+	if !strings.Contains(hclRendered, `table "patients"`) || !strings.Contains(hclRendered, `unique_key`) {
+		t.Errorf("unexpected HCL output:\n%s", hclRendered)
+	}
 }

@@ -243,6 +243,9 @@ func (t *TableDef) IsIcebergTable() bool {
 	if strings.EqualFold(t.Engine, "iceberg") {
 		return true
 	}
+	if eng, ok := t.GetProperty("engine"); ok && strings.EqualFold(eng, "iceberg") {
+		return true
+	}
 	if _, ok := t.GetProperty("compression_codec"); ok {
 		return true
 	}

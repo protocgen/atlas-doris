@@ -5,9 +5,12 @@ import (
 	"strings"
 )
 
-// ParseSchema parses a SQL document containing one or more Doris / Iceberg DDL
-// statements and returns the resulting Schema state.
+// ParseSchema parses a SQL or Atlas HCL document containing one or more Doris /
+// Iceberg DDL or table definitions and returns the resulting Schema state.
 func ParseSchema(sqlText string) (*Schema, error) {
+	if IsHCLContent(sqlText) {
+		return ParseHCL(sqlText)
+	}
 	stmts, err := ParseStatements(sqlText)
 	if err != nil {
 		return nil, err
@@ -1572,6 +1575,14 @@ func consumeQuotedOrToken(s string) (string, string, error) {
 		return "", "", fmt.Errorf("expected quoted string or token")
 	}
 	quote := s[0]
+	if quote == '[' {
+		closeIdx := strings.IndexByte(s, ']')
+		if closeIdx < 0 {
+			return "", "", fmt.Errorf("unterminated bracket literal in %q", s)
+		}
+		inner := strings.TrimSpace(s[1:closeIdx])
+		return "[" + inner + "]", strings.TrimSpace(s[closeIdx+1:]), nil
+	}
 	if quote == '"' || quote == '\'' {
 		var b strings.Builder
 		for i := 1; i < len(s); i++ {

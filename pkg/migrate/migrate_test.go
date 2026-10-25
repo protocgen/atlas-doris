@@ -238,12 +238,15 @@ func TestParseDorisDSN(t *testing.T) {
 
 // In-process mock SQL driver to test Executor end-to-end (revisions table, async polling, status, apply)
 type mockDorisDriver struct {
-	mu           sync.Mutex
-	executedSQL  []string
-	revisions    []migrate.RevisionRecord
-	alterPolls   int
-	alterCancel  bool
-	failOnSubstr string
+	mu              sync.Mutex
+	executedSQL     []string
+	revisions       []migrate.RevisionRecord
+	alterPolls      int
+	buildIndexPolls int
+	alterCancel     bool
+	alterState      string
+	buildIndexState string
+	failOnSubstr    string
 }
 
 var (
@@ -345,7 +348,9 @@ func (s *mockStmt) Query(args []driver.Value) (driver.Rows, error) {
 	if strings.HasPrefix(q, "SHOW ALTER TABLE COLUMN") {
 		s.c.m.alterPolls++
 		state := "FINISHED"
-		if s.c.m.alterCancel {
+		if s.c.m.alterState != "" {
+			state = s.c.m.alterState
+		} else if s.c.m.alterCancel {
 			state = "CANCELLED"
 		} else if s.c.m.alterPolls == 1 {
 			state = "RUNNING"
@@ -353,6 +358,20 @@ func (s *mockStmt) Query(args []driver.Value) (driver.Rows, error) {
 		return &mockRows{
 			cols: []string{"JobId", "TableName", "State"},
 			rows: [][]driver.Value{{"1001", "patients", []byte(state)}},
+		}, nil
+	}
+
+	if strings.HasPrefix(q, "SHOW BUILD INDEX") {
+		s.c.m.buildIndexPolls++
+		state := "FINISHED"
+		if s.c.m.buildIndexState != "" {
+			state = s.c.m.buildIndexState
+		} else if s.c.m.buildIndexPolls == 1 {
+			state = "RUNNING"
+		}
+		return &mockRows{
+			cols: []string{"JobId", "TableName", "State"},
+			rows: [][]driver.Value{{"2001", "patients", []byte(state)}},
 		}, nil
 	}
 
@@ -481,6 +500,9 @@ PROPERTIES (
 	if mock.alterPolls < 2 {
 		t.Errorf("expected async SHOW ALTER TABLE COLUMN polling (RUNNING -> FINISHED), got %d polls", mock.alterPolls)
 	}
+	if mock.buildIndexPolls < 2 {
+		t.Errorf("expected async SHOW BUILD INDEX polling (RUNNING -> FINISHED), got %d polls", mock.buildIndexPolls)
+	}
 
 	stAfter, err := exec.Status(ctx, migDir)
 	if err != nil {
@@ -503,5 +525,30 @@ PROPERTIES (
 	}
 	if !resNoop.AlreadyUpToDate {
 		t.Errorf("expected AlreadyUpToDate=true on second Apply")
+	}
+
+	// Verify immediate failure on CANCELLED, CANCELED, and FAILED states
+	for _, terminalState := range []string{"CANCELLED", "CANCELED", "FAILED"} {
+		t.Run("terminal_state_"+terminalState, func(t *testing.T) {
+			dbFail, mockFail := setupMockDB(t)
+			mockFail.alterState = terminalState
+			execFail := migrate.NewExecutor(dbFail, "internal")
+			_, err := execFail.Apply(ctx, migrate.ApplyOptions{
+				DirPath:         migDir,
+				BaselineVersion: "00000000000000",
+				Vars: map[string]string{
+					"TENANT_SLUG":    "duke_health",
+					"TENANT_BUCKETS": "16",
+				},
+				PollInterval: 5 * time.Millisecond,
+				PollTimeout:  50 * time.Millisecond,
+			})
+			if err == nil || !strings.Contains(err.Error(), terminalState) {
+				t.Fatalf("expected immediate error containing %s, got %v", terminalState, err)
+			}
+			if mockFail.alterPolls != 1 {
+				t.Errorf("expected exactly 1 poll before failing on %s, got %d", terminalState, mockFail.alterPolls)
+			}
+		})
 	}
 }

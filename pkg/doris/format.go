@@ -92,7 +92,11 @@ func FormatColumnDef(c *ColumnDef) string {
 		b.WriteString(" NOT NULL")
 	}
 	if c.HasDefault {
-		b.WriteString(fmt.Sprintf(" DEFAULT %q", c.Default))
+		if strings.HasPrefix(NormalizeType(c.Type), "ARRAY<") && strings.TrimSpace(c.Default) == "[]" {
+			b.WriteString(" DEFAULT []")
+		} else {
+			b.WriteString(fmt.Sprintf(" DEFAULT %q", c.Default))
+		}
 	}
 	if c.Comment != "" {
 		b.WriteString(fmt.Sprintf(" COMMENT %q", c.Comment))

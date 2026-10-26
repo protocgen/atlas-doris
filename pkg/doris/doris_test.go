@@ -1183,4 +1183,184 @@ table "concepts" {
 	if twoPartDiff[0].SQL() != wantAlter {
 		t.Fatalf("expected 2-part ALTER TABLE %q, got %q", wantAlter, twoPartDiff[0].SQL())
 	}
+
+	// Verify schemaHasDatabaseObjects also detects existing views in a database
+	viewOnlyCurrent, err := doris.ParseSchema(`CREATE OR REPLACE VIEW terminology.v_concepts AS SELECT 1;`)
+	if err != nil {
+		t.Fatalf("ParseSchema(viewOnlyCurrent): %v", err)
+	}
+	viewOnlyDesired, err := doris.ParseHCL(`
+schema "terminology" {
+  catalog = "internal"
+}
+view "v_concepts" {
+  schema = schema.terminology
+  as     = "SELECT 1"
+}`)
+	if err != nil {
+		t.Fatalf("ParseHCL(viewOnlyDesired): %v", err)
+	}
+	viewDiff, err := doris.Diff(viewOnlyCurrent, viewOnlyDesired)
+	if err != nil {
+		t.Fatalf("Diff(viewOnlyCurrent, viewOnlyDesired): %v", err)
+	}
+	if len(viewDiff) != 0 {
+		t.Fatalf("expected 0 statements when view already exists in database, got %d", len(viewDiff))
+	}
+}
+
+func TestASTFormattingAndEqualityHelpers(t *testing.T) {
+	// PartitionClause, DistributionClause, ColumnDef, IndexDef equality edge cases
+	var nilPart *doris.PartitionClause
+	p1 := &doris.PartitionClause{Kind: "RANGE", Columns: []string{"dt"}}
+	if !nilPart.Equal(nil) || nilPart.Equal(p1) || p1.Equal(nil) || !p1.Equal(p1.Clone()) {
+		t.Errorf("unexpected PartitionClause.Equal behavior")
+	}
+	var nilDist *doris.DistributionClause
+	d1 := &doris.DistributionClause{Kind: "HASH", Columns: []string{"id"}, Buckets: "8"}
+	if !nilDist.Equal(nil) || nilDist.Equal(d1) || d1.Equal(nil) || !d1.Equal(d1.Clone()) {
+		t.Errorf("unexpected DistributionClause.Equal behavior")
+	}
+	var nilCol *doris.ColumnDef
+	c1 := &doris.ColumnDef{Name: "id", Type: "BIGINT", Nullable: false}
+	if !nilCol.Equal(nil) || nilCol.Equal(c1) || c1.Equal(nil) || !c1.Equal(c1.Clone()) {
+		t.Errorf("unexpected ColumnDef.Equal behavior")
+	}
+	var nilIdx *doris.IndexDef
+	idx1 := &doris.IndexDef{
+		Name:       "idx_a",
+		Columns:    []string{"a"},
+		Using:      "INVERTED",
+		Properties: []doris.Property{{Key: "parser", Value: "english"}},
+	}
+	idx2 := &doris.IndexDef{
+		Name:       "idx_a",
+		Columns:    []string{"a"},
+		Using:      "INVERTED",
+		Properties: []doris.Property{{Key: "parser", Value: "unicode"}},
+	}
+	if !nilIdx.Equal(nil) || nilIdx.Equal(idx1) || idx1.Equal(nil) || idx1.Equal(idx2) || !idx1.Equal(idx1.Clone()) {
+		t.Errorf("unexpected IndexDef.Equal behavior")
+	}
+
+	// TableDef.IsIcebergTable & ViewDef.CanonicalName branches
+	var nilTable *doris.TableDef
+	if nilTable.IsIcebergTable() {
+		t.Errorf("nil table should not be iceberg")
+	}
+	icebergByCodec := &doris.TableDef{
+		Name:       "t_codec",
+		Key:        &doris.KeyClause{Kind: "DUPLICATE", Columns: []string{"id"}},
+		Properties: []doris.Property{{Key: "compression_codec", Value: "zstd"}},
+	}
+	icebergByParquet := &doris.TableDef{
+		Name:       "t_parquet",
+		Key:        &doris.KeyClause{Kind: "DUPLICATE", Columns: []string{"id"}},
+		Properties: []doris.Property{{Key: "write.parquet.compression-codec", Value: "zstd"}},
+	}
+	icebergByPropEngine := &doris.TableDef{
+		Name:       "t_eng",
+		Key:        &doris.KeyClause{Kind: "DUPLICATE", Columns: []string{"id"}},
+		Properties: []doris.Property{{Key: "engine", Value: "iceberg"}},
+	}
+	if !icebergByCodec.IsIcebergTable() || !icebergByParquet.IsIcebergTable() || !icebergByPropEngine.IsIcebergTable() {
+		t.Errorf("expected iceberg table detection for codec/parquet/engine properties")
+	}
+
+	var nilView *doris.ViewDef
+	if nilView.CanonicalName() != "" || nilView.LookupKey() != "" || nilView.Clone() != nil {
+		t.Errorf("unexpected nil ViewDef behavior")
+	}
+	v3 := &doris.ViewDef{Catalog: "internal", Database: "db", Name: "v", OrReplace: false, AsSQL: "SELECT 1;"}
+	vFull := &doris.ViewDef{FullName: "db.v", Name: "v", OrReplace: true, AsSQL: "SELECT 1"}
+	vShort := &doris.ViewDef{Name: "v", AsSQL: "SELECT 1"}
+	if v3.CanonicalName() != "internal.db.v" || vFull.CanonicalName() != "db.v" || vShort.CanonicalName() != "v" {
+		t.Errorf("unexpected ViewDef.CanonicalName values")
+	}
+	if !strings.HasPrefix(doris.FormatView(v3), "CREATE VIEW internal.db.v AS") {
+		t.Errorf("unexpected FormatView(v3): %s", doris.FormatView(v3))
+	}
+	if !strings.HasPrefix(doris.FormatView(vFull), "CREATE OR REPLACE VIEW db.v AS") {
+		t.Errorf("unexpected FormatView(vFull): %s", doris.FormatView(vFull))
+	}
+
+	// FormatPlatformObject when RawSQL is empty
+	if doris.FormatPlatformObject(nil) != "" || doris.FormatPlatformObject(&doris.PlatformObject{Kind: "UNKNOWN"}) != "" {
+		t.Errorf("expected empty FormatPlatformObject for nil/unknown")
+	}
+	pSet := &doris.PlatformObject{Kind: "SET_DEFAULT_STORAGE_VAULT", Name: "v1"}
+	pVault := &doris.PlatformObject{
+		Kind:        "STORAGE_VAULT",
+		Name:        "v1",
+		IfNotExists: true,
+		Properties:  []doris.Property{{Key: "type", Value: "S3"}},
+	}
+	pAlterWG := &doris.PlatformObject{
+		Kind:       "ALTER_WORKLOAD_GROUP",
+		Name:       "wg1",
+		Properties: []doris.Property{{Key: "cpu_share", Value: "1024"}},
+	}
+	if doris.FormatPlatformObject(pSet) != "SET v1 AS DEFAULT STORAGE VAULT;" {
+		t.Errorf("unexpected FormatPlatformObject(pSet): %s", doris.FormatPlatformObject(pSet))
+	}
+	if !strings.Contains(doris.FormatPlatformObject(pVault), "CREATE STORAGE VAULT IF NOT EXISTS v1") {
+		t.Errorf("unexpected FormatPlatformObject(pVault): %s", doris.FormatPlatformObject(pVault))
+	}
+	if !strings.Contains(doris.FormatPlatformObject(pAlterWG), "ALTER WORKLOAD GROUP wg1") {
+		t.Errorf("unexpected FormatPlatformObject(pAlterWG): %s", doris.FormatPlatformObject(pAlterWG))
+	}
+
+	// Statement.SQL() across all StatementKind variants
+	stmts := []doris.Statement{
+		{Kind: doris.StmtCreateDatabase, Database: &doris.DatabaseDef{Name: "db1", IfNotExists: true}},
+		{Kind: doris.StmtCreateTable, Table: &doris.TableDef{Database: "db1", Name: "t1", Columns: []*doris.ColumnDef{c1}}},
+		{Kind: doris.StmtDropTable, TargetTable: "db1.t1", IfExists: false},
+		{Kind: doris.StmtDropTable, TargetTable: "db1.t1", IfExists: true},
+		{Kind: doris.StmtAlterTableAddColumn, TargetTable: "db1.t1", Column: c1, First: true},
+		{Kind: doris.StmtAlterTableModifyColumn, TargetTable: "db1.t1", Column: c1, First: true},
+		{Kind: doris.StmtAlterTableModifyColumn, TargetTable: "db1.t1", Column: c1, AfterColumn: "other_col"},
+		{Kind: doris.StmtCreateOrReplaceView, View: vFull},
+		{Kind: doris.StmtPlatformObject, Platform: pSet},
+		{RawSQL: "SELECT 1"},
+	}
+	rendered := doris.FormatStatements(stmts)
+	for _, wantSub := range []string{
+		"CREATE DATABASE IF NOT EXISTS db1;",
+		"DROP TABLE db1.t1;",
+		"DROP TABLE IF EXISTS db1.t1;",
+		"ADD COLUMN id BIGINT NOT NULL FIRST;",
+		"MODIFY COLUMN id BIGINT NOT NULL FIRST;",
+		"MODIFY COLUMN id BIGINT NOT NULL AFTER other_col;",
+		"SET v1 AS DEFAULT STORAGE VAULT;",
+		"SELECT 1;",
+	} {
+		if !strings.Contains(rendered, wantSub) {
+			t.Errorf("FormatStatements missing %q in:\n%s", wantSub, rendered)
+		}
+	}
+
+	// Schema.Merge replacement branches & LintRuleViolation formatting
+	sBase := &doris.Schema{
+		Databases:       []*doris.DatabaseDef{{Name: "db1"}},
+		Tables:          []*doris.TableDef{{Database: "db1", Name: "t1", Columns: []*doris.ColumnDef{c1}}},
+		Views:           []*doris.ViewDef{vFull},
+		PlatformObjects: []*doris.PlatformObject{pVault},
+	}
+	sOverride := &doris.Schema{
+		Databases:       []*doris.DatabaseDef{{Catalog: "internal", Name: "db1"}, {Name: "db2"}},
+		Tables:          []*doris.TableDef{{Catalog: "internal", Database: "db1", Name: "t1", Columns: []*doris.ColumnDef{c1}}},
+		Views:           []*doris.ViewDef{v3},
+		PlatformObjects: []*doris.PlatformObject{pVault, pSet},
+	}
+	sBase.Merge(sOverride)
+	if len(sBase.Databases) != 2 || len(sBase.Tables) != 1 || len(sBase.Views) != 1 || len(sBase.PlatformObjects) != 2 {
+		t.Errorf("unexpected Schema.Merge counts: dbs=%d tables=%d views=%d platform=%d",
+			len(sBase.Databases), len(sBase.Tables), len(sBase.Views), len(sBase.PlatformObjects))
+	}
+
+	vNoCol := doris.Violation{Rule: "R1", TableName: "t1", Message: "msg"}
+	vWithCol := doris.Violation{Rule: "R2", TableName: "t1", ColumnName: "c1", Message: "msg"}
+	if vNoCol.Error() != "[R1] table t1: msg" || vWithCol.String() != "[R2] table t1 column c1: msg" {
+		t.Errorf("unexpected Violation formatting: %q / %q", vNoCol.Error(), vWithCol.String())
+	}
 }

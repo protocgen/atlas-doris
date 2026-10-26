@@ -217,7 +217,7 @@ func diffTable(current, desired *TableDef, opts DiffOptions) []Statement {
 				TargetTable: targetName,
 				Index:       dIdx.Clone(),
 			})
-			if desired.IsDorisInternalTable() && !desired.IsStarRocksTable() && shouldBuildIndexOnline(dIdx.Using) {
+			if desired.IsDorisInternalTable() && shouldBuildIndexOnline(dIdx.Using) {
 				stmts = append(stmts, Statement{
 					Kind:          StmtBuildIndex,
 					TargetTable:   targetName,
@@ -341,11 +341,7 @@ func isMutableTableProperty(key string) bool {
 		"colocate_with",
 		"compression_codec",
 		"replication_num",
-		"enable_single_replica_compaction",
-		"datacache.enable",
-		"datacache.partition_duration",
-		"enable_persistent_index",
-		"storage_volume":
+		"enable_single_replica_compaction":
 		return true
 	}
 	return strings.HasPrefix(key, "write.parquet.")

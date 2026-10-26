@@ -128,7 +128,7 @@ func lintTableKeyAndANN(t *TableDef, colByName map[string]*ColumnDef) []Violatio
 					ColumnName: kc,
 					Message:    fmt.Sprintf("key column %q uses floating-point type %s (prohibited by Doris)", kc, col.Type),
 				})
-			} else if IsNonScalarColumnType(col.Type) || upperType == "BITMAP" || upperType == "HLL" || (t.Key.Kind == KeyPrimary && (upperType == "STRING" || upperType == "TEXT")) {
+			} else if IsNonScalarColumnType(col.Type) || upperType == "BITMAP" || upperType == "HLL" {
 				violations = append(violations, Violation{
 					Rule:       DORIS001_IMMUTABLE_KEY,
 					TableName:  tblName,
@@ -163,89 +163,57 @@ func lintTableKeyAndANN(t *TableDef, colByName map[string]*ColumnDef) []Violatio
 		}
 	}
 
-	for _, oc := range t.OrderBy {
-		col, ok := colByName[oc]
-		if !ok {
-			violations = append(violations, Violation{
-				Rule:       DORIS001_IMMUTABLE_KEY,
-				TableName:  tblName,
-				ColumnName: oc,
-				Message:    fmt.Sprintf("ORDER BY column %q does not exist in table", oc),
-			})
-			continue
-		}
-		upperType := NormalizeType(col.Type)
-		if upperType == "FLOAT" || upperType == "DOUBLE" || IsNonScalarColumnType(col.Type) || upperType == "BITMAP" || upperType == "HLL" {
-			violations = append(violations, Violation{
-				Rule:       DORIS001_IMMUTABLE_KEY,
-				TableName:  tblName,
-				ColumnName: oc,
-				Message:    fmt.Sprintf("ORDER BY column %q uses ineligible sort key type %s", oc, col.Type),
-			})
-		}
-	}
-
 	if seq := strings.TrimSpace(t.SequenceCol()); seq != "" {
-		if t.Key != nil && t.Key.Kind != KeyUnique && t.Key.Kind != KeyPrimary {
+		if t.Key != nil && t.Key.Kind != KeyUnique {
 			violations = append(violations, Violation{
 				Rule:       DORIS002_IMMUTABLE_SEQUENCE,
 				TableName:  tblName,
 				ColumnName: seq,
-				Message:    fmt.Sprintf("function_column.sequence_col %q is only supported on UNIQUE KEY or PRIMARY KEY tables (found %s KEY)", seq, t.Key.Kind),
+				Message:    fmt.Sprintf("function_column.sequence_col %q is only supported on UNIQUE KEY tables (found %s KEY)", seq, t.Key.Kind),
 			})
 		}
 	}
 
 	for _, idx := range t.Indexes {
 		usingUpper := strings.ToUpper(strings.TrimSpace(idx.Using))
-		if usingUpper != "ANN" && usingUpper != "VECTOR" {
+		if usingUpper != "ANN" {
 			continue
 		}
 		if t.Key != nil {
-			if usingUpper == "VECTOR" {
-				if t.Key.Kind != KeyDuplicate {
-					violations = append(violations, Violation{
-						Rule:      DORIS006_SAFE_TYPE_EVOLUTION,
-						TableName: tblName,
-						Message:   fmt.Sprintf("VECTOR index %q is only supported on DUPLICATE KEY tables in StarRocks 4.x (found %s KEY)", idx.Name, t.Key.Kind),
-					})
-				}
-			} else {
-				validKeyModel := false
-				switch t.Key.Kind {
-				case KeyDuplicate:
-					validKeyModel = true
-				case KeyUnique:
-					validKeyModel = t.HasUniqueKeyMergeOnWrite()
-				}
-				if !validKeyModel {
-					violations = append(violations, Violation{
-						Rule:      DORIS006_SAFE_TYPE_EVOLUTION,
-						TableName: tblName,
-						Message:   fmt.Sprintf("%s index %q is only supported on DUPLICATE KEY tables or UNIQUE KEY tables with merge-on-write enabled (found %s KEY)", usingUpper, idx.Name, t.Key.Kind),
-					})
-				}
+			validKeyModel := false
+			switch t.Key.Kind {
+			case KeyDuplicate:
+				validKeyModel = true
+			case KeyUnique:
+				validKeyModel = t.HasUniqueKeyMergeOnWrite()
+			}
+			if !validKeyModel {
+				violations = append(violations, Violation{
+					Rule:      DORIS006_SAFE_TYPE_EVOLUTION,
+					TableName: tblName,
+					Message:   fmt.Sprintf("ANN index %q is only supported on DUPLICATE KEY tables or UNIQUE KEY tables with merge-on-write enabled (found %s KEY)", idx.Name, t.Key.Kind),
+				})
 			}
 		}
 		if len(idx.Columns) != 1 {
 			violations = append(violations, Violation{
 				Rule:      DORIS006_SAFE_TYPE_EVOLUTION,
 				TableName: tblName,
-				Message:   fmt.Sprintf("%s index %q must target exactly 1 column", usingUpper, idx.Name),
+				Message:   fmt.Sprintf("ANN index %q must target exactly 1 column", idx.Name),
 			})
 		} else if col, ok := colByName[idx.Columns[0]]; !ok {
 			violations = append(violations, Violation{
 				Rule:       DORIS006_SAFE_TYPE_EVOLUTION,
 				TableName:  tblName,
 				ColumnName: idx.Columns[0],
-				Message:    fmt.Sprintf("%s index %q references unknown column %q", usingUpper, idx.Name, idx.Columns[0]),
+				Message:    fmt.Sprintf("ANN index %q references unknown column %q", idx.Name, idx.Columns[0]),
 			})
 		} else if NormalizeType(col.Type) != "ARRAY<FLOAT>" || col.Nullable {
 			violations = append(violations, Violation{
 				Rule:       DORIS006_SAFE_TYPE_EVOLUTION,
 				TableName:  tblName,
 				ColumnName: col.Name,
-				Message:    fmt.Sprintf("%s index %q column %q must be ARRAY<FLOAT> NOT NULL (got %s, nullable=%v)", usingUpper, idx.Name, col.Name, col.Type, col.Nullable),
+				Message:    fmt.Sprintf("ANN index %q column %q must be ARRAY<FLOAT> NOT NULL (got %s, nullable=%v)", idx.Name, col.Name, col.Type, col.Nullable),
 			})
 		}
 		idxProps := propertiesToMap(idx.Properties)
@@ -256,7 +224,7 @@ func lintTableKeyAndANN(t *TableDef, colByName map[string]*ColumnDef) []Violatio
 			violations = append(violations, Violation{
 				Rule:      DORIS006_SAFE_TYPE_EVOLUTION,
 				TableName: tblName,
-				Message:   fmt.Sprintf("%s index %q must set \"index_type\" to \"hnsw\", \"ivf\", \"ivf_on_disk\", or \"ivfpq\" (got %q)", usingUpper, idx.Name, idxProps["index_type"]),
+				Message:   fmt.Sprintf("ANN index %q must set \"index_type\" to \"hnsw\", \"ivf\", \"ivf_on_disk\", or \"ivfpq\" (got %q)", idx.Name, idxProps["index_type"]),
 			})
 		}
 		metricType := strings.ToLower(strings.TrimSpace(idxProps["metric_type"]))
@@ -266,14 +234,14 @@ func lintTableKeyAndANN(t *TableDef, colByName map[string]*ColumnDef) []Violatio
 			violations = append(violations, Violation{
 				Rule:      DORIS006_SAFE_TYPE_EVOLUTION,
 				TableName: tblName,
-				Message:   fmt.Sprintf("%s index %q must set \"metric_type\" to \"l2_distance\", \"inner_product\", or \"cosine_distance\" (got %q)", usingUpper, idx.Name, idxProps["metric_type"]),
+				Message:   fmt.Sprintf("ANN index %q must set \"metric_type\" to \"l2_distance\", \"inner_product\", or \"cosine_distance\" (got %q)", idx.Name, idxProps["metric_type"]),
 			})
 		}
 		if dim, err := strconv.Atoi(strings.TrimSpace(idxProps["dim"])); err != nil || dim <= 0 {
 			violations = append(violations, Violation{
 				Rule:      DORIS006_SAFE_TYPE_EVOLUTION,
 				TableName: tblName,
-				Message:   fmt.Sprintf("%s index %q must specify positive integer \"dim\"", usingUpper, idx.Name),
+				Message:   fmt.Sprintf("ANN index %q must specify positive integer \"dim\"", idx.Name),
 			})
 		}
 	}
@@ -306,22 +274,13 @@ func LintTableEvolution(before, after *TableDef, opts LintOptions) []Violation {
 
 	var violations []Violation
 
-	// DORIS001_IMMUTABLE_KEY: Block mutating PRIMARY KEY, UNIQUE KEY, DUPLICATE KEY, or AGGREGATE KEY columns.
+	// DORIS001_IMMUTABLE_KEY: Block mutating UNIQUE KEY, DUPLICATE KEY, or AGGREGATE KEY columns.
 	if !keysEqual(before.Key, after.Key) {
 		violations = append(violations, Violation{
 			Rule:      DORIS001_IMMUTABLE_KEY,
 			TableName: tblName,
 			Message:   fmt.Sprintf("table key clause cannot be mutated on existing table (before=%s, after=%s)", formatKeyDebug(before.Key), formatKeyDebug(after.Key)),
 		})
-	}
-	if before.Key != nil && before.Key.Kind == KeyPrimary && before.HasPersistentIndex() {
-		if afterVal, ok := after.GetProperty("enable_persistent_index"); ok && strings.EqualFold(strings.TrimSpace(afterVal), "false") {
-			violations = append(violations, Violation{
-				Rule:      DORIS001_IMMUTABLE_KEY,
-				TableName: tblName,
-				Message:   "enable_persistent_index cannot be disabled on existing PRIMARY KEY table",
-			})
-		}
 	}
 
 	// DORIS002_IMMUTABLE_SEQUENCE: Block mutating "function_column.sequence_col".

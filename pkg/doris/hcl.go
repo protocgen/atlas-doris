@@ -8,8 +8,7 @@ import (
 )
 
 // IsHCLContent reports whether raw text appears to be an Atlas HCL schema document
-// (starting with a top-level `schema`, `table`, `view`, `platform_object`,
-// `external_catalog`, or `storage_volume` block after stripping comments).
+// (starting with a top-level `schema`, `table`, `view`, or `platform_object` block after stripping comments).
 func IsHCLContent(raw string) bool {
 	s := skipLeadingCommentsAndSpace(raw)
 	if s == "" {
@@ -17,7 +16,7 @@ func IsHCLContent(raw string) bool {
 	}
 	tok, rest := readLeadingWord(s)
 	switch tok {
-	case "schema", "table", "view", "platform_object", "external_catalog", "storage_volume":
+	case "schema", "table", "view", "platform_object":
 	default:
 		return false
 	}
@@ -26,7 +25,7 @@ func IsHCLContent(raw string) bool {
 }
 
 // ParseSchemaAuto parses content as Atlas HCL if filename ends with .hcl or
-// IsHCLContent(content) is true; otherwise parses content as Doris/StarRocks/Iceberg SQL DDL.
+// IsHCLContent(content) is true; otherwise parses content as Doris/Iceberg SQL DDL.
 func ParseSchemaAuto(content, filename string) (*Schema, error) {
 	var (
 		s   *Schema
@@ -151,16 +150,6 @@ func ParseHCL(hclText string) (*Schema, error) {
 
 		case "platform_object":
 			po, err := parseHCLPlatformObjectBlock(labels, body)
-			if err != nil {
-				return nil, err
-			}
-			s.PlatformObjects = append(s.PlatformObjects, po)
-
-		case "external_catalog", "storage_volume":
-			if len(labels) != 1 || strings.TrimSpace(labels[0]) == "" {
-				return nil, fmt.Errorf("%s block requires a <name> label", blockKind)
-			}
-			po, err := parseHCLPlatformObjectBlock([]string{strings.ToUpper(blockKind), labels[0]}, body)
 			if err != nil {
 				return nil, err
 			}
@@ -333,8 +322,6 @@ func FormatTableHCL(t *TableDef) string {
 	if t.Key != nil && len(t.Key.Columns) > 0 {
 		blockName := "unique_key"
 		switch t.Key.Kind {
-		case KeyPrimary:
-			blockName = "primary_key"
 		case KeyDuplicate:
 			blockName = "duplicate_key"
 		case KeyAggregate:
@@ -342,7 +329,7 @@ func FormatTableHCL(t *TableDef) string {
 		}
 		fmt.Fprintf(&b, "  %s {\n", blockName)
 		fmt.Fprintf(&b, "    columns = %s\n", formatHCLColRefList(t.Key.Columns))
-		if t.Key.Kind == KeyUnique || t.Key.Kind == KeyPrimary {
+		if t.Key.Kind == KeyUnique {
 			if mow, ok := t.GetProperty("enable_unique_key_merge_on_write"); ok && strings.EqualFold(mow, "true") {
 				b.WriteString("    merge_on_write = true\n")
 			}
@@ -642,7 +629,6 @@ func parseHCLTableBlock(labels []string, body string) (*TableDef, error) {
 
 	seenCols := make(map[string]bool)
 	var keyMoW bool
-	var keyPersistentIdx bool
 	var keySeqCol string
 
 	for _, it := range items {
@@ -702,16 +688,13 @@ func parseHCLTableBlock(labels []string, body string) (*TableDef, error) {
 			tbl.Columns = append(tbl.Columns, col)
 
 		case "primary_key", "unique_key", "duplicate_key", "aggregate_key", "key":
-			kc, mow, persistentIdx, seqCol, err := parseHCLKeyBlock(bKind, bLabels, it.BlockBody)
+			kc, mow, seqCol, err := parseHCLKeyBlock(bKind, bLabels, it.BlockBody)
 			if err != nil {
 				return nil, fmt.Errorf("table %q: %w", shortName, err)
 			}
 			tbl.Key = kc
 			if mow {
 				keyMoW = true
-			}
-			if persistentIdx {
-				keyPersistentIdx = true
 			}
 			if seqCol != "" {
 				keySeqCol = seqCol
@@ -798,11 +781,6 @@ func parseHCLTableBlock(labels []string, body string) (*TableDef, error) {
 			tbl.SetProperty("enable_unique_key_merge_on_write", "true")
 		}
 	}
-	if keyPersistentIdx {
-		if _, ok := tbl.GetProperty("enable_persistent_index"); !ok {
-			tbl.SetProperty("enable_persistent_index", "true")
-		}
-	}
 	if keySeqCol != "" {
 		if _, ok := tbl.GetProperty("function_column.sequence_col"); !ok {
 			tbl.SetProperty("function_column.sequence_col", keySeqCol)
@@ -859,12 +837,10 @@ func parseHCLColumnBlock(colName, body string) (*ColumnDef, error) {
 	return col, nil
 }
 
-func parseHCLKeyBlock(blockKind string, blockLabels []string, body string) (*KeyClause, bool, bool, string, error) {
+func parseHCLKeyBlock(blockKind string, blockLabels []string, body string) (*KeyClause, bool, string, error) {
 	kind := KeyUnique
 	switch blockKind {
-	case "primary_key":
-		kind = KeyPrimary
-	case "unique_key":
+	case "primary_key", "unique_key":
 		kind = KeyUnique
 	case "duplicate_key":
 		kind = KeyDuplicate
@@ -873,81 +849,70 @@ func parseHCLKeyBlock(blockKind string, blockLabels []string, body string) (*Key
 	case "key":
 		if len(blockLabels) > 0 {
 			switch strings.ToUpper(strings.TrimSpace(blockLabels[0])) {
-			case "PRIMARY":
-				kind = KeyPrimary
-			case "UNIQUE":
+			case "UNIQUE", "PRIMARY":
 				kind = KeyUnique
 			case "DUPLICATE":
 				kind = KeyDuplicate
 			case "AGGREGATE":
 				kind = KeyAggregate
 			default:
-				return nil, false, false, "", fmt.Errorf("key: unsupported key kind %q", blockLabels[0])
+				return nil, false, "", fmt.Errorf("key: unsupported key kind %q", blockLabels[0])
 			}
 		}
 	}
 
 	kvs, err := parseHCLKeyValueSlice(body)
 	if err != nil {
-		return nil, false, false, "", fmt.Errorf("%s: %w", blockKind, err)
+		return nil, false, "", fmt.Errorf("%s: %w", blockKind, err)
 	}
 
 	var cols []string
 	hasCols := false
 	mow := false
-	persistentIdx := false
 	seqCol := ""
 
 	for _, kv := range kvs {
 		switch kv.Key {
 		case "type", "kind":
 			switch strings.ToUpper(strings.TrimSpace(unquoteHCLString(kv.Value))) {
-			case "PRIMARY":
-				kind = KeyPrimary
-			case "UNIQUE":
+			case "UNIQUE", "PRIMARY", "UNIQUE_KEY", "PRIMARY_KEY":
 				kind = KeyUnique
-			case "DUPLICATE":
+			case "DUPLICATE", "DUPLICATE_KEY":
 				kind = KeyDuplicate
-			case "AGGREGATE":
+			case "AGGREGATE", "AGGREGATE_KEY":
 				kind = KeyAggregate
 			default:
-				return nil, false, false, "", fmt.Errorf("%s: unsupported key kind %q", blockKind, kv.Value)
+				return nil, false, "", fmt.Errorf("%s: unsupported key kind %q", blockKind, kv.Value)
 			}
 		case "columns":
 			parsedCols, err := parseHCLColumnRefList(kv.Value)
 			if err != nil {
-				return nil, false, false, "", fmt.Errorf("%s: %w", blockKind, err)
+				return nil, false, "", fmt.Errorf("%s: %w", blockKind, err)
 			}
 			cols = parsedCols
 			hasCols = true
 		case "merge_on_write":
 			b, err := strconv.ParseBool(unquoteHCLString(kv.Value))
 			if err != nil {
-				return nil, false, false, "", fmt.Errorf("%s: invalid merge_on_write %q", blockKind, kv.Value)
+				return nil, false, "", fmt.Errorf("%s: invalid merge_on_write %q", blockKind, kv.Value)
 			}
 			mow = b
-		case "enable_persistent_index", "persistent_index":
-			b, err := strconv.ParseBool(unquoteHCLString(kv.Value))
-			if err != nil {
-				return nil, false, false, "", fmt.Errorf("%s: invalid %s %q", blockKind, kv.Key, kv.Value)
-			}
-			persistentIdx = b
 		case "sequence_col":
 			sc := strings.TrimPrefix(unquoteHCLString(kv.Value), "column.")
 			sc = strings.TrimSpace(sc)
 			if !isValidHCLIdent(sc) {
-				return nil, false, false, "", fmt.Errorf("%s: invalid sequence_col %q", blockKind, kv.Value)
+				return nil, false, "", fmt.Errorf("%s: invalid sequence_col %q", blockKind, kv.Value)
 			}
 			seqCol = sc
 		default:
-			return nil, false, false, "", fmt.Errorf("%s: unsupported attribute %q", blockKind, kv.Key)
+			return nil, false, "", fmt.Errorf("%s: unsupported attribute %q", blockKind, kv.Key)
 		}
 	}
 
 	if !hasCols || len(cols) == 0 {
-		return nil, false, false, "", fmt.Errorf("%s missing columns attribute", blockKind)
+		return nil, false, "", fmt.Errorf("%s missing columns attribute", blockKind)
 	}
-	return &KeyClause{Kind: kind, Columns: cols}, mow, persistentIdx, seqCol, nil
+	return &KeyClause{Kind: kind, Columns: cols}, mow, seqCol, nil
 }
 
 func parseHCLDistributionBlock(blockKind, body string) (*DistributionClause, error) {
@@ -1142,8 +1107,6 @@ func parseHCLIndexBlock(idxName, body string) (*IndexDef, error) {
 			idx.Columns = cols
 		case "using", "type":
 			idx.Using = strings.ToUpper(strings.TrimSpace(unquoteHCLString(it.Value)))
-		case "gram_num", "bloom_filter_fpp":
-			idx.Properties = setOrAppendProperty(idx.Properties, it.Key, unquoteHCLString(it.Value))
 		case "comment":
 			idx.Comment = unquoteHCLString(it.Value)
 		default:
@@ -1151,49 +1114,10 @@ func parseHCLIndexBlock(idxName, body string) (*IndexDef, error) {
 		}
 	}
 
-	if len(idx.Properties) > 1 {
-		var gramProp, fppProp *Property
-		var others []Property
-		for i := range idx.Properties {
-			p := idx.Properties[i]
-			switch p.Key {
-			case "gram_num":
-				cp := p
-				gramProp = &cp
-			case "bloom_filter_fpp":
-				cp := p
-				fppProp = &cp
-			default:
-				others = append(others, p)
-			}
-		}
-		if gramProp != nil || fppProp != nil {
-			var ordered []Property
-			if gramProp != nil {
-				ordered = append(ordered, *gramProp)
-			}
-			if fppProp != nil {
-				ordered = append(ordered, *fppProp)
-			}
-			ordered = append(ordered, others...)
-			idx.Properties = ordered
-		}
-	}
-
 	if len(idx.Columns) == 0 {
 		return nil, fmt.Errorf("index %q: missing columns attribute", idxName)
 	}
 	return idx, nil
-}
-
-func setOrAppendProperty(props []Property, key, val string) []Property {
-	for i := range props {
-		if props[i].Key == key {
-			props[i].Value = val
-			return props
-		}
-	}
-	return append(props, Property{Key: key, Value: val})
 }
 
 // parseHCLBodyItems scans a block body into ordered key=value attributes and nested {...} blocks.

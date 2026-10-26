@@ -9,17 +9,16 @@ import (
 	"strings"
 )
 
-// KeyKind identifies the Apache Doris / StarRocks table key model.
+// KeyKind identifies the Apache Doris table key model.
 type KeyKind string
 
 const (
-	KeyPrimary   KeyKind = "PRIMARY"
 	KeyUnique    KeyKind = "UNIQUE"
 	KeyDuplicate KeyKind = "DUPLICATE"
 	KeyAggregate KeyKind = "AGGREGATE"
 )
 
-// KeyClause represents a PRIMARY KEY(...), UNIQUE KEY(...), DUPLICATE KEY(...), or AGGREGATE KEY(...) clause.
+// KeyClause represents a UNIQUE KEY(...), DUPLICATE KEY(...), or AGGREGATE KEY(...) clause.
 type KeyClause struct {
 	Kind    KeyKind
 	Columns []string
@@ -225,7 +224,7 @@ func (idx *IndexDef) Equal(other *IndexDef) bool {
 	return true
 }
 
-// TableDef describes a parsed Apache Doris 4.x, StarRocks 4.x, or Apache Iceberg table definition.
+// TableDef describes a parsed Apache Doris 4.x or Apache Iceberg table definition.
 type TableDef struct {
 	FullName     string
 	Catalog      string
@@ -263,7 +262,7 @@ func (t *TableDef) CanonicalName() string {
 }
 
 // LookupKey returns the catalog-normalized matching key for the table, treating
-// an omitted catalog and the default Doris "internal" / StarRocks "default_catalog" catalogs as equivalent.
+// an omitted catalog and the default Doris "internal" catalog as equivalent.
 func (t *TableDef) LookupKey() string {
 	if t == nil {
 		return ""
@@ -271,8 +270,8 @@ func (t *TableDef) LookupKey() string {
 	return normalizeTableLookupKey(t.CanonicalName())
 }
 
-// DialectLookupKey returns a dialect-scoped lookup key ("iceberg:<key>", "starrocks:<key>", or "doris:<key>")
-// so multi-target schemas containing Doris, StarRocks, and Iceberg variants of the same logical table do not collide.
+// DialectLookupKey returns a dialect-scoped lookup key ("iceberg:<key>" or "doris:<key>")
+// so multi-target schemas containing Doris and Iceberg variants of the same logical table do not collide.
 func (t *TableDef) DialectLookupKey() string {
 	if t == nil {
 		return ""
@@ -280,9 +279,6 @@ func (t *TableDef) DialectLookupKey() string {
 	key := t.LookupKey()
 	if t.IsIcebergTable() {
 		return "iceberg:" + key
-	}
-	if t.IsStarRocksTable() {
-		return "starrocks:" + key
 	}
 	return "doris:" + key
 }
@@ -314,44 +310,9 @@ func (t *TableDef) IsIcebergTable() bool {
 	return t.Key == nil && t.Distribution == nil
 }
 
-// IsDorisInternalTable reports whether the table is an Apache Doris / StarRocks internal OLAP table.
+// IsDorisInternalTable reports whether the table is an Apache Doris internal OLAP table.
 func (t *TableDef) IsDorisInternalTable() bool {
 	return !t.IsIcebergTable()
-}
-
-// IsStarRocksTable reports whether the table is a StarRocks 4.x native table
-// (identified by Dialect == "starrocks", PRIMARY KEY model, StarRocks-specific
-// properties such as enable_persistent_index, storage_volume, or datacache.enable,
-// or StarRocks GIN / VECTOR indexes).
-func (t *TableDef) IsStarRocksTable() bool {
-	if t == nil || t.IsIcebergTable() {
-		return false
-	}
-	if strings.EqualFold(strings.TrimSpace(t.Dialect), "starrocks") {
-		return true
-	}
-	if t.Key != nil && t.Key.Kind == KeyPrimary {
-		return true
-	}
-	for _, p := range t.Properties {
-		switch p.Key {
-		case "enable_persistent_index", "storage_volume", "datacache.enable", "datacache.partition_duration":
-			return true
-		}
-	}
-	for _, idx := range t.Indexes {
-		u := strings.ToUpper(strings.TrimSpace(idx.Using))
-		if u == "GIN" || u == "VECTOR" || u == "NGRAMBF" {
-			return true
-		}
-	}
-	return false
-}
-
-// HasPersistentIndex reports whether "enable_persistent_index" is set to "true".
-func (t *TableDef) HasPersistentIndex() bool {
-	v, ok := t.GetProperty("enable_persistent_index")
-	return ok && strings.EqualFold(strings.TrimSpace(v), "true")
 }
 
 // ColumnByName looks up a column by its unquoted identifier.
@@ -725,15 +686,13 @@ func (s *Schema) Merge(other *Schema) {
 
 func isDefaultDorisCatalog(cat string) bool {
 	c := strings.TrimSpace(cat)
-	return c == "" || strings.EqualFold(c, "internal") || strings.EqualFold(c, "default_catalog")
+	return c == "" || strings.EqualFold(c, "internal")
 }
 
 // pairSchemaTables pairs tables between current and desired schemas:
-//  1. First by exact DialectLookupKey() so multi-target schemas (Doris + StarRocks + Iceberg)
+//  1. First by exact DialectLookupKey() so multi-target schemas (Doris + Iceberg)
 //     pair each table with its matching dialect counterpart without colliding.
-//  2. Second, any remaining unmatched non-Iceberg tables with the same LookupKey() are paired
-//     so single-dialect migrations that illegally mutate a table's key model (e.g., UNIQUE KEY
-//     to PRIMARY KEY) still trigger DORIS001_IMMUTABLE_KEY.
+//  2. Second, any remaining unmatched non-Iceberg tables with the same LookupKey() are paired.
 func pairSchemaTables(current, desired []*TableDef) (map[*TableDef]*TableDef, map[*TableDef]*TableDef) {
 	currentForDesired := make(map[*TableDef]*TableDef, len(desired))
 	desiredForCurrent := make(map[*TableDef]*TableDef, len(current))
@@ -774,8 +733,6 @@ func inferDialectHint(content, filename string) string {
 	if trimmed != "" {
 		lowerBase := strings.ToLower(filepath.Base(trimmed))
 		switch {
-		case strings.Contains(lowerBase, "starrocks"):
-			return "starrocks"
 		case strings.Contains(lowerBase, "iceberg"):
 			return "iceberg"
 		case strings.Contains(lowerBase, "doris"):
@@ -784,8 +741,6 @@ func inferDialectHint(content, filename string) string {
 	}
 	lowerContent := strings.ToLower(content)
 	switch {
-	case strings.Contains(lowerContent, "backend: starrocks"), strings.Contains(lowerContent, "backend=starrocks"):
-		return "starrocks"
 	case strings.Contains(lowerContent, "backend: iceberg"), strings.Contains(lowerContent, "backend=iceberg"):
 		return "iceberg"
 	case strings.Contains(lowerContent, "backend: doris"), strings.Contains(lowerContent, "backend=doris"):

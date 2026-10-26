@@ -50,12 +50,56 @@ func FormatIdentList(cols []string) string {
 }
 
 // NormalizeType normalizes a Doris or Iceberg SQL type string into canonical
-// uppercase form with standardized comma spacing (e.g. "DECIMALV3(12, 4)", "ARRAY<VARCHAR(64)>").
+// uppercase form with standardized comma spacing (e.g. "DECIMALV3(12, 4)", "ARRAY<VARCHAR(64)>"),
+// preserving STRUCT<...> field names in their original case and normalizing live Doris
+// SHOW CREATE TABLE type aliases (e.g. TINYINT(1) -> BOOLEAN, INT(11) -> INT,
+// INTEGER -> INT, DOUBLE PRECISION -> DOUBLE).
 func NormalizeType(raw string) string {
 	s := strings.TrimSpace(raw)
 	if s == "" {
 		return ""
 	}
+	upper := strings.ToUpper(s)
+
+	if strings.HasPrefix(upper, "ARRAY<") && strings.HasSuffix(s, ">") {
+		inner := s[6 : len(s)-1]
+		return "ARRAY<" + NormalizeType(inner) + ">"
+	}
+	if strings.HasPrefix(upper, "MAP<") && strings.HasSuffix(s, ">") {
+		inner := s[4 : len(s)-1]
+		parts := splitTopLevelComma(inner)
+		if len(parts) == 2 {
+			return "MAP<" + NormalizeType(parts[0]) + ", " + NormalizeType(parts[1]) + ">"
+		}
+	}
+	if strings.HasPrefix(upper, "STRUCT<") && strings.HasSuffix(s, ">") {
+		inner := s[7 : len(s)-1]
+		fields := splitTopLevelComma(inner)
+		normFields := make([]string, 0, len(fields))
+		for _, f := range fields {
+			f = strings.TrimSpace(f)
+			if f == "" {
+				continue
+			}
+			fName, fType, ok := splitStructField(f)
+			if !ok {
+				normFields = append(normFields, NormalizeType(f))
+				continue
+			}
+			normFields = append(normFields, fName+":"+NormalizeType(fType))
+		}
+		return "STRUCT<" + strings.Join(normFields, ", ") + ">"
+	}
+
+	// Normalize multi-word SQL type aliases before stripping whitespace.
+	collapsed := strings.Join(strings.Fields(upper), " ")
+	switch {
+	case collapsed == "DOUBLE PRECISION":
+		return "DOUBLE"
+	case strings.HasPrefix(collapsed, "CHARACTER VARYING("):
+		s = "VARCHAR(" + strings.TrimPrefix(collapsed, "CHARACTER VARYING(")
+	}
+
 	var b strings.Builder
 	b.Grow(len(s) + 4)
 	for i := 0; i < len(s); i++ {
@@ -72,7 +116,148 @@ func NormalizeType(raw string) string {
 		}
 		b.WriteByte(ch)
 	}
-	return b.String()
+	norm := b.String()
+	switch norm {
+	case "BOOL", "TINYINT(1)":
+		return "BOOLEAN"
+	case "INTEGER":
+		return "INT"
+	}
+	if base, ok := stripIntegerDisplayWidth(norm); ok {
+		return base
+	}
+	return norm
+}
+
+func splitStructField(field string) (string, string, bool) {
+	inBacktick := false
+	parenDepth := 0
+	angleDepth := 0
+	for i := 0; i < len(field); i++ {
+		ch := field[i]
+		if ch == '`' {
+			inBacktick = !inBacktick
+			continue
+		}
+		if inBacktick {
+			continue
+		}
+		switch ch {
+		case '(':
+			parenDepth++
+		case ')':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case '<':
+			angleDepth++
+		case '>':
+			if angleDepth > 0 {
+				angleDepth--
+			}
+		case ':':
+			if parenDepth == 0 && angleDepth == 0 {
+				name := strings.Trim(strings.TrimSpace(field[:i]), "`")
+				typ := strings.TrimSpace(field[i+1:])
+				if name != "" && typ != "" {
+					return name, typ, true
+				}
+			}
+		}
+	}
+	nameTok, rest := nextToken(field)
+	name := strings.Trim(strings.TrimSpace(nameTok), "`")
+	typ := strings.TrimSpace(rest)
+	if name != "" && typ != "" {
+		return name, typ, true
+	}
+	return "", "", false
+}
+
+func stripIntegerDisplayWidth(norm string) (string, bool) {
+	openIdx := strings.IndexByte(norm, '(')
+	if openIdx <= 0 || !strings.HasSuffix(norm, ")") {
+		return "", false
+	}
+	base := norm[:openIdx]
+	digits := norm[openIdx+1 : len(norm)-1]
+	if digits == "" {
+		return "", false
+	}
+	for i := 0; i < len(digits); i++ {
+		if digits[i] < '0' || digits[i] > '9' {
+			return "", false
+		}
+	}
+	switch base {
+	case "TINYINT":
+		if digits == "1" {
+			return "BOOLEAN", true
+		}
+		return "TINYINT", true
+	case "SMALLINT":
+		return "SMALLINT", true
+	case "INT", "INTEGER":
+		return "INT", true
+	case "BIGINT":
+		return "BIGINT", true
+	case "LARGEINT":
+		return "LARGEINT", true
+	default:
+		return "", false
+	}
+}
+
+// TypesSemanticallyEqual reports whether t1 and t2 are semantically identical
+// in Apache Doris 4.x / Apache Iceberg, accounting for Doris 4.x SHOW CREATE TABLE
+// type aliases (DATE == DATEV2, DATETIME == DATETIMEV2 == DATETIME(0) == DATETIMEV2(0),
+// DATETIME(p) == DATETIMEV2(p), and DECIMAL(p, s) == DECIMALV3(p, s)), including nested
+// ARRAY, MAP, and STRUCT types.
+func TypesSemanticallyEqual(t1, t2 string) bool {
+	return CanonicalSemanticType(t1) == CanonicalSemanticType(t2)
+}
+
+// CanonicalSemanticType maps a normalized SQL type to its canonical Doris 4.x
+// semantic form for equality comparisons.
+func CanonicalSemanticType(raw string) string {
+	norm := NormalizeType(raw)
+	if norm == "" {
+		return ""
+	}
+	if strings.HasPrefix(norm, "ARRAY<") && strings.HasSuffix(norm, ">") {
+		return "ARRAY<" + CanonicalSemanticType(norm[6:len(norm)-1]) + ">"
+	}
+	if strings.HasPrefix(norm, "MAP<") && strings.HasSuffix(norm, ">") {
+		parts := splitTopLevelComma(norm[4 : len(norm)-1])
+		if len(parts) == 2 {
+			return "MAP<" + CanonicalSemanticType(parts[0]) + ", " + CanonicalSemanticType(parts[1]) + ">"
+		}
+	}
+	if strings.HasPrefix(norm, "STRUCT<") && strings.HasSuffix(norm, ">") {
+		fields := splitTopLevelComma(norm[7 : len(norm)-1])
+		out := make([]string, 0, len(fields))
+		for _, f := range fields {
+			if fName, fType, ok := splitStructField(f); ok {
+				out = append(out, fName+":"+CanonicalSemanticType(fType))
+			} else {
+				out = append(out, CanonicalSemanticType(f))
+			}
+		}
+		return "STRUCT<" + strings.Join(out, ", ") + ">"
+	}
+	switch norm {
+	case "DATE", "DATEV2":
+		return "DATEV2"
+	case "DATETIME", "DATETIMEV2", "DATETIME(0)", "DATETIMEV2(0)":
+		return "DATETIMEV2"
+	}
+	if strings.HasPrefix(norm, "DATETIME(") && strings.HasSuffix(norm, ")") {
+		return "DATETIMEV2(" + strings.TrimPrefix(norm, "DATETIME(")
+	}
+	if strings.HasPrefix(norm, "DECIMAL(") && strings.HasSuffix(norm, ")") {
+		return "DECIMALV3(" + strings.TrimPrefix(norm, "DECIMAL(")
+	}
+	return norm
 }
 
 // FormatColumnDef formats a single ColumnDef for use inside CREATE TABLE or ALTER TABLE.
@@ -221,6 +406,21 @@ func FormatCreateTable(t *TableDef) string {
 			b.WriteString(FormatIdentList(t.Distribution.Columns))
 			b.WriteString(") BUCKETS ")
 			b.WriteString(t.Distribution.Buckets)
+		}
+	}
+
+	if len(t.Rollups) > 0 {
+		parts := make([]string, 0, len(t.Rollups))
+		for _, r := range t.Rollups {
+			if r == nil || r.Name == "" || len(r.Columns) == 0 {
+				continue
+			}
+			parts = append(parts, fmt.Sprintf("%s (%s)", FormatIdent(r.Name), FormatIdentList(r.Columns)))
+		}
+		if len(parts) > 0 {
+			b.WriteString("\nROLLUP (")
+			b.WriteString(strings.Join(parts, ", "))
+			b.WriteByte(')')
 		}
 	}
 

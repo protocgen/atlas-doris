@@ -4,15 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/protocgen/atlas-doris/pkg/doris"
-)
-
-var (
-	tinyintBoolInspectRe    = regexp.MustCompile(`\bTINYINT\(1\)`)
-	intDisplaySizeInspectRe = regexp.MustCompile(`\b(TINYINT|SMALLINT|INT|INTEGER|BIGINT|LARGEINT)\(\d+\)`)
 )
 
 // InspectLiveSchema connects to a live Doris / MySQL-protocol database URL
@@ -135,9 +129,11 @@ func InspectSchemaFromDB(ctx context.Context, db *sql.DB, defaultDB string) (*do
 			for _, v := range parsed.Views {
 				if v.Database == "" && shortDB != "" {
 					v.Database = shortDB
+					v.RawSQL = ""
 				}
 				if v.Catalog == "" && catalog != "" {
 					v.Catalog = catalog
+					v.RawSQL = ""
 				}
 				v.FullName = v.CanonicalName()
 				s.Views = append(s.Views, v)
@@ -250,9 +246,6 @@ func InspectTableFromInfoSchema(ctx context.Context, db *sql.DB, catalog, schema
 			return nil, err
 		}
 		normType := doris.NormalizeType(colType)
-		normType = tinyintBoolInspectRe.ReplaceAllString(normType, "BOOLEAN")
-		normType = intDisplaySizeInspectRe.ReplaceAllString(normType, "$1")
-		normType = strings.ReplaceAll(normType, "INTEGER", "INT")
 
 		col := &doris.ColumnDef{
 			Name:       name,

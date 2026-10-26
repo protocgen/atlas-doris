@@ -2,6 +2,7 @@ package doris
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -50,7 +51,7 @@ func ApplyStatement(s *Schema, st Statement) error {
 			return fmt.Errorf("CREATE TABLE statement has nil TableDef")
 		}
 		for i, existing := range s.Tables {
-			if existing.CanonicalName() == st.Table.CanonicalName() {
+			if existing.LookupKey() == st.Table.LookupKey() {
 				if st.Table.IfNotExists {
 					return nil
 				}
@@ -63,8 +64,9 @@ func ApplyStatement(s *Schema, st Statement) error {
 
 	case StmtDropTable:
 		target := normalizeQualifiedName(st.TargetTable)
+		lookup := normalizeTableLookupKey(st.TargetTable)
 		for i, existing := range s.Tables {
-			if existing.CanonicalName() == target || existing.Name == target {
+			if existing.CanonicalName() == target || existing.Name == target || (lookup != "" && existing.LookupKey() == lookup) {
 				s.Tables = append(s.Tables[:i], s.Tables[i+1:]...)
 				return nil
 			}
@@ -226,7 +228,7 @@ func ApplyStatement(s *Schema, st Statement) error {
 			return fmt.Errorf("CREATE VIEW statement has nil ViewDef")
 		}
 		for i, v := range s.Views {
-			if v.CanonicalName() == st.View.CanonicalName() {
+			if v.LookupKey() == st.View.LookupKey() {
 				s.Views[i] = st.View.Clone()
 				return nil
 			}
@@ -570,8 +572,8 @@ func parseCreateDatabase(stmt string) (*DatabaseDef, error) {
 	}
 
 	nameRaw := strings.TrimSpace(rest)
-	if nameRaw == "" {
-		return nil, fmt.Errorf("missing database name in CREATE DATABASE")
+	if nameRaw == "" || !isValidQualifiedObjectName(nameRaw, 2) {
+		return nil, fmt.Errorf("missing or invalid database name in CREATE DATABASE: %q", nameRaw)
 	}
 	fullName, catalog, db, short := splitQualifiedName(nameRaw)
 	if db != "" && catalog == "" {
@@ -594,8 +596,8 @@ func parseDropTable(stmt string) (Statement, error) {
 		rest = after
 	}
 	nameRaw := strings.TrimSpace(rest)
-	if nameRaw == "" {
-		return Statement{}, fmt.Errorf("missing table name in DROP TABLE")
+	if nameRaw == "" || !isValidQualifiedObjectName(nameRaw, 3) {
+		return Statement{}, fmt.Errorf("missing or invalid table name in DROP TABLE: %q", nameRaw)
 	}
 	fullName, _, _, _ := splitQualifiedName(nameRaw)
 	return Statement{
@@ -609,22 +611,23 @@ func parseDropTable(stmt string) (Statement, error) {
 func parseBuildIndex(stmt string) (Statement, error) {
 	rest := consumePhraseCI(stmt, "BUILD", "INDEX")
 	idxName, rest := nextToken(rest)
-	if idxName == "" {
-		return Statement{}, fmt.Errorf("missing index name in BUILD INDEX")
+	cleanIdx := strings.Trim(idxName, "`")
+	if cleanIdx == "" || !isValidDorisIdentOrVar(cleanIdx) {
+		return Statement{}, fmt.Errorf("missing or invalid index name in BUILD INDEX")
 	}
 	afterOn := consumeKeywordCI(rest, "ON")
 	if afterOn == rest {
 		return Statement{}, fmt.Errorf("expected ON in BUILD INDEX statement: %q", stmt)
 	}
 	tblRaw := strings.TrimSpace(afterOn)
-	if tblRaw == "" {
-		return Statement{}, fmt.Errorf("missing table name in BUILD INDEX")
+	if tblRaw == "" || !isValidQualifiedObjectName(tblRaw, 3) {
+		return Statement{}, fmt.Errorf("missing or invalid table name in BUILD INDEX")
 	}
 	fullName, _, _, _ := splitQualifiedName(tblRaw)
 	return Statement{
 		Kind:          StmtBuildIndex,
 		TargetTable:   fullName,
-		DropIndexName: strings.Trim(idxName, "`"),
+		DropIndexName: cleanIdx,
 		RawSQL:        stmt,
 	}, nil
 }
@@ -635,8 +638,8 @@ func parseAlterTable(stmt string) (Statement, error) {
 
 	// Read qualified table name up to action keyword (ADD, DROP, MODIFY, SET)
 	tblToken, afterTbl := readQualifiedTableToken(rest)
-	if tblToken == "" {
-		return Statement{}, fmt.Errorf("missing table name in ALTER TABLE: %q", stmt)
+	if tblToken == "" || !isValidQualifiedObjectName(tblToken, 3) {
+		return Statement{}, fmt.Errorf("missing or invalid table name in ALTER TABLE: %q", stmt)
 	}
 	targetTable, _, _, _ := splitQualifiedName(tblToken)
 	afterTbl = strings.TrimSpace(afterTbl)
@@ -753,6 +756,9 @@ func parseCreateTable(stmt string) (*TableDef, error) {
 	}
 
 	nameRaw := strings.TrimSpace(rest[:openIdx])
+	if !isValidQualifiedObjectName(nameRaw, 3) {
+		return nil, fmt.Errorf("CREATE TABLE missing or invalid table name: %q", nameRaw)
+	}
 	fullName, catalog, db, shortName := splitQualifiedName(nameRaw)
 	if shortName == "" {
 		return nil, fmt.Errorf("CREATE TABLE missing table name")
@@ -825,8 +831,8 @@ func parseIndexDef(item string) (*IndexDef, error) {
 	rest := consumeKeywordCI(strings.TrimSpace(item), "INDEX")
 	idxName, rest := nextToken(rest)
 	idxName = strings.Trim(idxName, "`")
-	if idxName == "" {
-		return nil, fmt.Errorf("missing index name in %q", item)
+	if idxName == "" || !isValidDorisIdentOrVar(idxName) {
+		return nil, fmt.Errorf("missing or invalid index name in %q", item)
 	}
 
 	rest = strings.TrimSpace(rest)
@@ -846,8 +852,8 @@ func parseIndexDef(item string) (*IndexDef, error) {
 	usingType := "INVERTED"
 	if afterUsing := consumeKeywordCI(rest, "USING"); afterUsing != rest {
 		uTok, rem := nextToken(afterUsing)
-		if uTok == "" {
-			return nil, fmt.Errorf("index %s: missing index type after USING", idxName)
+		if uTok == "" || !isValidDorisIdentOrVar(uTok) {
+			return nil, fmt.Errorf("index %s: missing or invalid index type after USING", idxName)
 		}
 		usingType = strings.ToUpper(uTok)
 		rest = strings.TrimSpace(rem)
@@ -901,7 +907,7 @@ func parseColumnDef(item string) (*ColumnDef, error) {
 
 func parseColumnDefWithPosition(item string) (*ColumnDef, bool, string, error) {
 	colName, rest, err := consumeIdent(item)
-	if err != nil || colName == "" {
+	if err != nil || colName == "" || !isValidDorisIdentOrVar(colName) {
 		return nil, false, "", fmt.Errorf("invalid column name in %q", item)
 	}
 
@@ -1135,6 +1141,45 @@ func parseCreateTableTail(tbl *TableDef, tail string) error {
 			return fmt.Errorf("unsupported DISTRIBUTED BY clause: %q", after)
 		}
 
+		// ROLLUP (r1 (c1, c2), r2 (c1))
+		if after := consumeKeywordCI(rest, "ROLLUP"); after != rest {
+			after = strings.TrimSpace(after)
+			if !strings.HasPrefix(after, "(") {
+				return fmt.Errorf("expected '(' after ROLLUP")
+			}
+			inside, afterIdx, ok := extractBalancedParens(after, 0)
+			if !ok {
+				return fmt.Errorf("unbalanced parentheses in ROLLUP")
+			}
+			items := splitTopLevelComma(inside)
+			for _, item := range items {
+				item = strings.TrimSpace(item)
+				if item == "" {
+					continue
+				}
+				rName, rem := nextToken(item)
+				rName = strings.Trim(rName, "`")
+				rem = strings.TrimSpace(rem)
+				if rName == "" || !strings.HasPrefix(rem, "(") {
+					return fmt.Errorf("invalid ROLLUP entry %q", item)
+				}
+				colsInside, _, ok := extractBalancedParens(rem, 0)
+				if !ok {
+					return fmt.Errorf("unbalanced parentheses in ROLLUP %s", rName)
+				}
+				rCols := parseIdentList(colsInside)
+				if len(rCols) == 0 {
+					return fmt.Errorf("empty column list in ROLLUP %s", rName)
+				}
+				tbl.Rollups = append(tbl.Rollups, &RollupDef{
+					Name:    rName,
+					Columns: rCols,
+				})
+			}
+			rest = strings.TrimSpace(after[afterIdx:])
+			continue
+		}
+
 		// PROPERTIES (...)
 		if after := consumeKeywordCI(rest, "PROPERTIES"); after != rest {
 			after = strings.TrimSpace(after)
@@ -1184,8 +1229,8 @@ func parseCreateView(stmt string, orReplace bool) (*ViewDef, error) {
 
 	// Read view name before AS
 	nameTok, rem := readQualifiedTableToken(rest)
-	if nameTok == "" {
-		return nil, fmt.Errorf("missing view name in CREATE VIEW")
+	if nameTok == "" || !isValidQualifiedObjectName(nameTok, 3) {
+		return nil, fmt.Errorf("missing or invalid view name in CREATE VIEW")
 	}
 	fullName, catalog, db, short := splitQualifiedName(nameTok)
 
@@ -1219,8 +1264,8 @@ func parsePlatformCreate(stmt, kind, prefixPhrase string) (*PlatformObject, erro
 	}
 	nameTok, rem := nextToken(rest)
 	nameTok = strings.Trim(nameTok, "`")
-	if nameTok == "" {
-		return nil, fmt.Errorf("missing name in %s", prefixPhrase)
+	if nameTok == "" || !isValidDorisIdentOrVar(nameTok) {
+		return nil, fmt.Errorf("missing or invalid name in %s", prefixPhrase)
 	}
 	rem = strings.TrimSpace(rem)
 	var props []Property
@@ -1252,8 +1297,8 @@ func parsePlatformAlterWorkloadGroup(stmt string) (*PlatformObject, error) {
 	rest := consumePhraseCI(stmt, "ALTER", "WORKLOAD", "GROUP")
 	nameTok, rem := nextToken(rest)
 	nameTok = strings.Trim(nameTok, "`")
-	if nameTok == "" {
-		return nil, fmt.Errorf("missing workload group name in ALTER WORKLOAD GROUP")
+	if nameTok == "" || !isValidDorisIdentOrVar(nameTok) {
+		return nil, fmt.Errorf("missing or invalid workload group name in ALTER WORKLOAD GROUP")
 	}
 	rem = strings.TrimSpace(rem)
 	var props []Property
@@ -1289,8 +1334,8 @@ func parseWorkloadPolicy(stmt string) (*PlatformObject, error) {
 	}
 	nameTok, _ := nextToken(rest)
 	nameTok = strings.Trim(nameTok, "`")
-	if nameTok == "" {
-		return nil, fmt.Errorf("missing policy name in CREATE WORKLOAD POLICY")
+	if nameTok == "" || !isValidDorisIdentOrVar(nameTok) {
+		return nil, fmt.Errorf("missing or invalid policy name in CREATE WORKLOAD POLICY")
 	}
 	return &PlatformObject{
 		Kind:        "WORKLOAD_POLICY",
@@ -1325,6 +1370,70 @@ func parsePropertiesBody(body string) ([]Property, error) {
 		props = append(props, Property{Key: k, Value: v})
 	}
 	return props, nil
+}
+
+func isValidDorisIdentOrVar(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i := 0; i < len(s); {
+		if s[i] == '$' && i+1 < len(s) && s[i+1] == '{' {
+			closeIdx := strings.IndexByte(s[i+2:], '}')
+			if closeIdx <= 0 {
+				return false
+			}
+			varName := s[i+2 : i+2+closeIdx]
+			if !isValidHCLIdent(varName) {
+				return false
+			}
+			i += 2 + closeIdx + 1
+			continue
+		}
+		c := s[i]
+		isAlpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+		isDigit := c >= '0' && c <= '9'
+		if i == 0 && !isAlpha {
+			return false
+		}
+		if !isAlpha && !isDigit {
+			return false
+		}
+		i++
+	}
+	return true
+}
+
+func isValidQualifiedObjectName(raw string, maxParts int) bool {
+	s := strings.TrimSpace(raw)
+	if s == "" || strings.Count(s, "`")%2 != 0 {
+		return false
+	}
+	var parts []string
+	var cur strings.Builder
+	inBacktick := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch == '`' {
+			inBacktick = !inBacktick
+			continue
+		}
+		if ch == '.' && !inBacktick {
+			parts = append(parts, strings.TrimSpace(cur.String()))
+			cur.Reset()
+			continue
+		}
+		cur.WriteByte(ch)
+	}
+	parts = append(parts, strings.TrimSpace(cur.String()))
+	if len(parts) == 0 || len(parts) > maxParts {
+		return false
+	}
+	for _, p := range parts {
+		if !isValidDorisIdentOrVar(p) {
+			return false
+		}
+	}
+	return true
 }
 
 func splitQualifiedName(raw string) (fullName, catalog, db, name string) {
@@ -1434,7 +1543,26 @@ func consumeSQLType(s string) (string, string, error) {
 	if s == "" {
 		return "", "", fmt.Errorf("missing SQL type")
 	}
+	// Check multi-word SQL types first (e.g. DOUBLE PRECISION, CHARACTER VARYING(...))
+	if after := consumePhraseCI(s, "DOUBLE", "PRECISION"); after != s {
+		return "DOUBLE PRECISION", strings.TrimSpace(after), nil
+	}
+	if after := consumePhraseCI(s, "CHARACTER", "VARYING"); after != s {
+		afterTrim := strings.TrimSpace(after)
+		if strings.HasPrefix(afterTrim, "(") {
+			inside, afterIdx, ok := extractBalancedParens(afterTrim, 0)
+			if !ok {
+				return "", "", fmt.Errorf("unbalanced '(' in type %q", s)
+			}
+			return "VARCHAR(" + inside + ")", strings.TrimSpace(afterTrim[afterIdx:]), nil
+		}
+		return "VARCHAR", afterTrim, nil
+	}
+
 	// Read base type word
+	if !((s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z')) {
+		return "", "", fmt.Errorf("invalid type start in %q", s)
+	}
 	i := 0
 	for i < len(s) {
 		ch := s[i]
@@ -1443,9 +1571,6 @@ func consumeSQLType(s string) (string, string, error) {
 		} else {
 			break
 		}
-	}
-	if i == 0 {
-		return "", "", fmt.Errorf("invalid type start in %q", s)
 	}
 	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
 		// Only consume whitespace if followed by '(' or '<'
@@ -1676,6 +1801,11 @@ func consumeQuotedOrToken(s string) (string, string, error) {
 					i++
 					b.WriteByte(s[i])
 					continue
+				}
+				if quote == '"' {
+					if unq, err := strconv.Unquote(s[:i+1]); err == nil {
+						return unq, strings.TrimSpace(s[i+1:]), nil
+					}
 				}
 				return b.String(), strings.TrimSpace(s[i+1:]), nil
 			}

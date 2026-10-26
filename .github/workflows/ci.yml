@@ -30,8 +30,24 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Test
-        run: go test -race ./... -v
+      - name: Test & Coverage Gate (>= 88%)
+        run: |
+          OUTPUT=$(go test -race -cover ./... 2>&1) || { printf '%s\n' "$OUTPUT"; exit 1; }
+          printf '%s\n' "$OUTPUT"
+          echo "$OUTPUT" | awk -F'coverage: |% of statements' '
+            /coverage:/ {
+              pkg = $1
+              cov = $2 + 0
+              if (cov < 88.0) {
+                printf "FAIL: %s coverage %.1f%% is below 88.0%% threshold\n", pkg, cov
+                failed = 1
+              }
+            }
+            END { exit failed }
+          '
+
+      - name: Fuzz Smoke Test
+        run: go test -fuzz=FuzzParseAndRoundTripSchema -fuzztime=3s ./pkg/doris
 
   lint:
     name: Lint

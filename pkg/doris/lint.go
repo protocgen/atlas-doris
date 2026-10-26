@@ -290,6 +290,7 @@ func LintTableEvolution(before, after *TableDef, opts LintOptions) []Violation {
 	}
 
 	// DORIS005, DORIS006, and DORIS007 on after columns.
+	isIcebergV2 := after.IsIcebergTable() && strings.TrimSpace(after.PropertyMap()["format-version"]) != "3"
 	for _, ac := range after.Columns {
 		if IsForbiddenColumnType(ac.Type) {
 			violations = append(violations, Violation{
@@ -302,8 +303,9 @@ func LintTableEvolution(before, after *TableDef, opts LintOptions) []Violation {
 
 		bc, existed := beforeColByName[ac.Name]
 		if !existed {
-			// Newly added column: check DORIS005_NON_NULL_SCALAR_DEFAULT.
-			if !ac.Nullable && !IsNonScalarColumnType(ac.Type) && (!ac.HasDefault || strings.TrimSpace(ac.Default) == "") {
+			// Newly added column: check DORIS005_NON_NULL_SCALAR_DEFAULT (except on Iceberg v2 tables,
+			// where diffTable automatically relaxes newly added columns to Nullable = true).
+			if !isIcebergV2 && !ac.Nullable && !IsNonScalarColumnType(ac.Type) && (!ac.HasDefault || strings.TrimSpace(ac.Default) == "") {
 				violations = append(violations, Violation{
 					Rule:       DORIS005_NON_NULL_SCALAR_DEFAULT,
 					TableName:  tblName,
@@ -342,17 +344,17 @@ func LintSchemaEvolution(current, desired *Schema, opts LintOptions) []Violation
 	var violations []Violation
 	currentByName := make(map[string]*TableDef, len(current.Tables))
 	for _, t := range current.Tables {
-		currentByName[t.CanonicalName()] = t
+		currentByName[t.LookupKey()] = t
 	}
 	desiredByName := make(map[string]*TableDef, len(desired.Tables))
 	for _, t := range desired.Tables {
-		desiredByName[t.CanonicalName()] = t
+		desiredByName[t.LookupKey()] = t
 	}
 
 	// Check dropped tables if destructive changes are disallowed.
 	if !opts.AllowDestructive {
 		for _, ct := range current.Tables {
-			if _, ok := desiredByName[ct.CanonicalName()]; !ok {
+			if _, ok := desiredByName[ct.LookupKey()]; !ok {
 				violations = append(violations, Violation{
 					Rule:      DORIS004_NO_COLUMN_DROP,
 					TableName: ct.CanonicalName(),
@@ -363,7 +365,7 @@ func LintSchemaEvolution(current, desired *Schema, opts LintOptions) []Violation
 	}
 
 	for _, dt := range desired.Tables {
-		if ct, existed := currentByName[dt.CanonicalName()]; existed {
+		if ct, existed := currentByName[dt.LookupKey()]; existed {
 			violations = append(violations, LintTableEvolution(ct, dt, opts)...)
 		} else {
 			violations = append(violations, LintTable(dt)...)
@@ -388,7 +390,51 @@ func IsSafeTypeEvolution(beforeType, afterType string) bool {
 	if bt == "" || at == "" {
 		return false
 	}
-	if bt == at {
+	if TypesSemanticallyEqual(bt, at) {
+		return true
+	}
+
+	if strings.HasPrefix(bt, "ARRAY<") && strings.HasSuffix(bt, ">") {
+		if !(strings.HasPrefix(at, "ARRAY<") && strings.HasSuffix(at, ">")) {
+			return false
+		}
+		return IsSafeTypeEvolution(bt[6:len(bt)-1], at[6:len(at)-1])
+	}
+
+	if strings.HasPrefix(bt, "MAP<") && strings.HasSuffix(bt, ">") {
+		if !(strings.HasPrefix(at, "MAP<") && strings.HasSuffix(at, ">")) {
+			return false
+		}
+		partsB := splitTopLevelComma(bt[4 : len(bt)-1])
+		partsA := splitTopLevelComma(at[4 : len(at)-1])
+		if len(partsB) != 2 || len(partsA) != 2 {
+			return false
+		}
+		return TypesSemanticallyEqual(partsB[0], partsA[0]) && IsSafeTypeEvolution(partsB[1], partsA[1])
+	}
+
+	if strings.HasPrefix(bt, "STRUCT<") && strings.HasSuffix(bt, ">") {
+		if !(strings.HasPrefix(at, "STRUCT<") && strings.HasSuffix(at, ">")) {
+			return false
+		}
+		fieldsB := splitTopLevelComma(bt[7 : len(bt)-1])
+		fieldsA := splitTopLevelComma(at[7 : len(at)-1])
+		if len(fieldsA) < len(fieldsB) {
+			return false
+		}
+		for i := 0; i < len(fieldsB); i++ {
+			nameB, typeB, okB := splitStructField(fieldsB[i])
+			nameA, typeA, okA := splitStructField(fieldsA[i])
+			if !okB || !okA || nameB != nameA || !IsSafeTypeEvolution(typeB, typeA) {
+				return false
+			}
+		}
+		for i := len(fieldsB); i < len(fieldsA); i++ {
+			nameA, typeA, okA := splitStructField(fieldsA[i])
+			if !okA || nameA == "" || typeA == "" || IsForbiddenColumnType(typeA) {
+				return false
+			}
+		}
 		return true
 	}
 
@@ -431,6 +477,22 @@ func IsForbiddenColumnType(rawType string) bool {
 	if strings.HasPrefix(dt, "ARRAY<") && strings.HasSuffix(dt, ">") {
 		inner := strings.TrimSuffix(strings.TrimPrefix(dt, "ARRAY<"), ">")
 		return IsForbiddenColumnType(inner)
+	}
+	if strings.HasPrefix(dt, "MAP<") && strings.HasSuffix(dt, ">") {
+		parts := splitTopLevelComma(dt[4 : len(dt)-1])
+		for _, p := range parts {
+			if IsForbiddenColumnType(p) {
+				return true
+			}
+		}
+	}
+	if strings.HasPrefix(dt, "STRUCT<") && strings.HasSuffix(dt, ">") {
+		fields := splitTopLevelComma(dt[7 : len(dt)-1])
+		for _, f := range fields {
+			if _, fType, ok := splitStructField(f); ok && IsForbiddenColumnType(fType) {
+				return true
+			}
+		}
 	}
 	return false
 }

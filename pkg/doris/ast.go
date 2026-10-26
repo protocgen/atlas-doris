@@ -136,12 +136,40 @@ func (c *ColumnDef) Equal(other *ColumnDef) bool {
 		return false
 	}
 	return c.Name == other.Name &&
-		NormalizeType(c.Type) == NormalizeType(other.Type) &&
+		TypesSemanticallyEqual(c.Type, other.Type) &&
 		c.AggType == other.AggType &&
 		c.Nullable == other.Nullable &&
 		c.HasDefault == other.HasDefault &&
 		c.Default == other.Default &&
 		c.Comment == other.Comment
+}
+
+// RollupDef describes a Doris rollup index definition on a table.
+type RollupDef struct {
+	Name    string
+	Columns []string
+}
+
+// Clone returns a deep copy of RollupDef.
+func (r *RollupDef) Clone() *RollupDef {
+	if r == nil {
+		return nil
+	}
+	return &RollupDef{
+		Name:    r.Name,
+		Columns: append([]string(nil), r.Columns...),
+	}
+}
+
+// Equal reports whether two RollupDef values are semantically equal.
+func (r *RollupDef) Equal(other *RollupDef) bool {
+	if r == nil && other == nil {
+		return true
+	}
+	if r == nil || other == nil {
+		return false
+	}
+	return r.Name == other.Name && stringSlicesEqual(r.Columns, other.Columns)
 }
 
 // IndexDef describes an inline Doris index (USING INVERTED, NGRAM_BF, ANN, or BITMAP).
@@ -204,6 +232,7 @@ type TableDef struct {
 	IfNotExists  bool
 	Columns      []*ColumnDef
 	Indexes      []*IndexDef
+	Rollups      []*RollupDef
 	Engine       string
 	Key          *KeyClause
 	Comment      string
@@ -228,6 +257,15 @@ func (t *TableDef) CanonicalName() string {
 		return t.FullName
 	}
 	return t.Name
+}
+
+// LookupKey returns the catalog-normalized matching key for the table, treating
+// an omitted catalog and the default Doris "internal" catalog as equivalent.
+func (t *TableDef) LookupKey() string {
+	if t == nil {
+		return ""
+	}
+	return normalizeTableLookupKey(t.CanonicalName())
 }
 
 // IsIcebergTable reports whether the table is an Apache Iceberg catalog table
@@ -348,6 +386,10 @@ func (t *TableDef) Clone() *TableDef {
 	for i, idx := range t.Indexes {
 		idxs[i] = idx.Clone()
 	}
+	rollups := make([]*RollupDef, len(t.Rollups))
+	for i, r := range t.Rollups {
+		rollups[i] = r.Clone()
+	}
 	return &TableDef{
 		FullName:     t.FullName,
 		Catalog:      t.Catalog,
@@ -356,6 +398,7 @@ func (t *TableDef) Clone() *TableDef {
 		IfNotExists:  t.IfNotExists,
 		Columns:      cols,
 		Indexes:      idxs,
+		Rollups:      rollups,
 		Engine:       t.Engine,
 		Key:          t.Key.Clone(),
 		Comment:      t.Comment,
@@ -387,6 +430,15 @@ func (d *DatabaseDef) CanonicalName() string {
 		return d.FullName
 	}
 	return d.Name
+}
+
+// LookupKey returns the catalog-normalized matching key for the database, treating
+// an omitted catalog and the default Doris "internal" catalog as equivalent.
+func (d *DatabaseDef) LookupKey() string {
+	if d == nil {
+		return ""
+	}
+	return normalizeDatabaseLookupKey(d.CanonicalName())
 }
 
 // Clone returns a deep copy of DatabaseDef.
@@ -424,6 +476,15 @@ func (v *ViewDef) CanonicalName() string {
 		return v.FullName
 	}
 	return v.Name
+}
+
+// LookupKey returns the catalog-normalized matching key for the view, treating
+// an omitted catalog and the default Doris "internal" catalog as equivalent.
+func (v *ViewDef) LookupKey() string {
+	if v == nil {
+		return ""
+	}
+	return normalizeTableLookupKey(v.CanonicalName())
 }
 
 // Clone returns a deep copy of ViewDef.
@@ -499,14 +560,15 @@ func (s *Schema) Clone() *Schema {
 	return out
 }
 
-// TableByName looks up a table in Schema by its CanonicalName() or short Name (when unambiguous).
+// TableByName looks up a table in Schema by its CanonicalName(), LookupKey(), or short Name (when unambiguous).
 func (s *Schema) TableByName(name string) (*TableDef, bool) {
 	if s == nil {
 		return nil, false
 	}
 	clean := normalizeQualifiedName(name)
+	lookup := normalizeTableLookupKey(name)
 	for _, t := range s.Tables {
-		if t.CanonicalName() == clean || t.FullName == clean {
+		if t.CanonicalName() == clean || t.FullName == clean || (lookup != "" && t.LookupKey() == lookup) {
 			return t, true
 		}
 	}
@@ -525,28 +587,30 @@ func (s *Schema) TableByName(name string) (*TableDef, bool) {
 	return nil, false
 }
 
-// DatabaseByName looks up a database by its canonical name.
+// DatabaseByName looks up a database by its canonical name or LookupKey().
 func (s *Schema) DatabaseByName(name string) (*DatabaseDef, bool) {
 	if s == nil {
 		return nil, false
 	}
 	clean := normalizeQualifiedName(name)
+	lookup := normalizeDatabaseLookupKey(name)
 	for _, d := range s.Databases {
-		if d.CanonicalName() == clean || d.Name == clean {
+		if d.CanonicalName() == clean || d.Name == clean || (lookup != "" && d.LookupKey() == lookup) {
 			return d, true
 		}
 	}
 	return nil, false
 }
 
-// ViewByName looks up a view by its canonical name.
+// ViewByName looks up a view by its canonical name or LookupKey().
 func (s *Schema) ViewByName(name string) (*ViewDef, bool) {
 	if s == nil {
 		return nil, false
 	}
 	clean := normalizeQualifiedName(name)
+	lookup := normalizeTableLookupKey(name)
 	for _, v := range s.Views {
-		if v.CanonicalName() == clean || v.Name == clean {
+		if v.CanonicalName() == clean || v.Name == clean || (lookup != "" && v.LookupKey() == lookup) {
 			return v, true
 		}
 	}
@@ -566,7 +630,7 @@ func (s *Schema) Merge(other *Schema) {
 	for _, t := range other.Tables {
 		replaced := false
 		for i, existing := range s.Tables {
-			if existing.CanonicalName() == t.CanonicalName() {
+			if existing.LookupKey() == t.LookupKey() {
 				s.Tables[i] = t.Clone()
 				replaced = true
 				break
@@ -579,7 +643,7 @@ func (s *Schema) Merge(other *Schema) {
 	for _, v := range other.Views {
 		replaced := false
 		for i, existing := range s.Views {
-			if existing.CanonicalName() == v.CanonicalName() {
+			if existing.LookupKey() == v.LookupKey() {
 				s.Views[i] = v.Clone()
 				replaced = true
 				break
@@ -602,6 +666,39 @@ func (s *Schema) Merge(other *Schema) {
 			s.PlatformObjects = append(s.PlatformObjects, p.Clone())
 		}
 	}
+}
+
+func isDefaultDorisCatalog(cat string) bool {
+	c := strings.TrimSpace(cat)
+	return c == "" || strings.EqualFold(c, "internal")
+}
+
+func normalizeTableLookupKey(raw string) string {
+	full, cat, db, short := splitQualifiedName(raw)
+	if short == "" {
+		return full
+	}
+	if !isDefaultDorisCatalog(cat) && db != "" {
+		return cat + "." + db + "." + short
+	}
+	if db != "" {
+		return db + "." + short
+	}
+	return short
+}
+
+func normalizeDatabaseLookupKey(raw string) string {
+	full, cat, db, short := splitQualifiedName(raw)
+	if short == "" {
+		return full
+	}
+	if cat == "" && db != "" {
+		cat = db
+	}
+	if !isDefaultDorisCatalog(cat) {
+		return cat + "." + short
+	}
+	return short
 }
 
 // StatementKind classifies a parsed DDL / migration SQL statement.

@@ -347,4 +347,37 @@ exit 0
 	if len(sFromBuiltPlugin.Tables) != 1 {
 		t.Errorf("expected 1 table from PROTO2TYPE_DIR, got %d", len(sFromBuiltPlugin.Tables))
 	}
+
+	// Test FilterSchemaByTarget with nil schema and unknown target
+	if external.FilterSchemaByTarget(nil, external.TargetDoris) != nil {
+		t.Errorf("expected nil from FilterSchemaByTarget(nil)")
+	}
+	if len(external.FilterSchemaByTarget(sFromBuiltPlugin, external.TargetFilter("custom")).Tables) != 1 {
+		t.Errorf("expected custom target filter to retain table")
+	}
+
+	// Test invalid proto:// query string and failing protoc execution
+	if _, err := external.LoadSchema(ctx, "proto://"+protoFile+"?%zz", external.LoadOptions{}); err == nil {
+		t.Errorf("expected error for invalid query string in proto:// URL")
+	}
+	if err := os.WriteFile(fakeProtoc, []byte("#!/bin/sh\necho 'protoc boom' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write failing fake protoc: %v", err)
+	}
+	if _, err := external.LoadSchema(ctx, "proto://"+protoFile, external.LoadOptions{}); err == nil {
+		t.Errorf("expected error when protoc fails")
+	}
+
+	// Test ExternalSchemaSQL error propagation across all source options
+	for _, badOpts := range []external.ExternalSchemaOptions{
+		{URL: "file:///nonexistent/path.sql"},
+		{SQLDir: "/nonexistent/sql_dir"},
+		{SQLFiles: []string{"/nonexistent/file.sql"}},
+		{HCLDir: "/nonexistent/hcl_dir"},
+		{HCLFiles: []string{"/nonexistent/file.hcl"}},
+		{ProtoPath: "/nonexistent/proto_dir"},
+	} {
+		if _, err := external.ExternalSchemaSQL(ctx, badOpts); err == nil {
+			t.Errorf("expected error for ExternalSchemaSQL(%+v)", badOpts)
+		}
+	}
 }

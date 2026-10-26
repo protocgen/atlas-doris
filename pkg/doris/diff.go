@@ -129,21 +129,43 @@ func diffTable(current, desired *TableDef, opts DiffOptions) []Statement {
 	}
 
 	// 2. Added and modified columns in desired order.
+	isIceberg := desired.IsIcebergTable()
+	isIcebergV3 := isIceberg && strings.TrimSpace(desired.PropertyMap()["format-version"]) == "3"
 	for _, dc := range desired.Columns {
 		cc, existed := currentColByName[dc.Name]
 		if !existed {
+			colToAdd := dc.Clone()
+			if isIceberg && !isIcebergV3 {
+				colToAdd.Nullable = true
+				colToAdd.HasDefault = false
+				colToAdd.Default = ""
+			}
 			stmts = append(stmts, Statement{
 				Kind:        StmtAlterTableAddColumn,
 				TargetTable: targetName,
-				Column:      dc.Clone(),
+				Column:      colToAdd,
 			})
 			continue
 		}
-		if !cc.Equal(dc) {
+		targetCol := dc.Clone()
+		if isIceberg {
+			// Iceberg schema evolution cannot tighten a nullable column to NOT NULL
+			// ("Cannot change optional to required") or modify column defaults
+			// ("Modifying default values is not supported for Iceberg columns").
+			// Preserve current nullability (when nullable) and default attributes so a
+			// column added via Iceberg v2 ADD COLUMN does not trigger a spurious MODIFY COLUMN
+			// on subsequent diffs.
+			if cc.Nullable {
+				targetCol.Nullable = true
+			}
+			targetCol.HasDefault = cc.HasDefault
+			targetCol.Default = cc.Default
+		}
+		if !cc.Equal(targetCol) {
 			stmts = append(stmts, Statement{
 				Kind:        StmtAlterTableModifyColumn,
 				TargetTable: targetName,
-				Column:      dc.Clone(),
+				Column:      targetCol,
 			})
 		}
 	}

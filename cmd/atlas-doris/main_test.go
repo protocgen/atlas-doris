@@ -116,7 +116,7 @@ PROPERTIES (
 		t.Errorf("unexpected migrate apply --dry-run output:\n%s", out)
 	}
 
-	// 10. schema inspect and external-schema
+	// 10. schema inspect and external-schema (both SQL and HCL formats)
 	outInspect, errOut, code := runCLI(ctx, "schema", "inspect", "--url", "file://"+migDir)
 	if code != 0 {
 		t.Fatalf("schema inspect failed (code=%d): %s", code, errOut)
@@ -129,10 +129,93 @@ PROPERTIES (
 		t.Errorf("replayed migration chain schema != desired v2 schema:\ninspect:\n%s\nexternal:\n%s", outInspect, outExt)
 	}
 
+	outInspectHCL, errOut, code := runCLI(ctx, "schema", "inspect", "--url", "file://"+migDir, "--format", "hcl")
+	if code != 0 {
+		t.Fatalf("schema inspect --format=hcl failed (code=%d): %s", code, errOut)
+	}
+	if !strings.Contains(outInspectHCL, `table "patients"`) {
+		t.Errorf("expected HCL table block in schema inspect --format=hcl output:\n%s", outInspectHCL)
+	}
+
+	hclFile := filepath.Join(tmpDir, "schema_v2_doris.hcl")
+	if err := os.WriteFile(hclFile, []byte(outInspectHCL), 0o644); err != nil {
+		t.Fatalf("write hclFile: %v", err)
+	}
+	outExtFromHCL, errOut, code := runCLI(ctx, "external-schema", "--hcl-file", hclFile)
+	if code != 0 {
+		t.Fatalf("external-schema --hcl-file failed (code=%d): %s", code, errOut)
+	}
+	if outExtFromHCL != outInspect {
+		t.Errorf("external-schema --hcl-file SQL != inspected SQL:\ngot:\n%s\nwant:\n%s", outExtFromHCL, outInspect)
+	}
+
 	// 11. version command
 	outVer, _, code := runCLI(ctx, "version")
 	if code != 0 || !strings.Contains(outVer, "atlas-doris") {
 		t.Errorf("unexpected version output: %q (code=%d)", outVer, code)
+	}
+
+	// 12. help command
+	outHelp, _, code := runCLI(ctx, "help")
+	if code != 0 || !strings.Contains(outHelp, "Usage:") {
+		t.Errorf("unexpected help output: %q (code=%d)", outHelp, code)
+	}
+
+	// 13. migrate diff no-op when already synced
+	outNoop, errOut, code := runCLI(ctx, "migrate", "diff", "noop_sync", "--dir", "file://"+migDir, "--to", "file://"+v2File)
+	if code != 0 || !strings.Contains(outNoop, "no changes to be made") {
+		t.Errorf("expected no changes output on synced migrate diff, got code=%d out=%q err=%q", code, outNoop, errOut)
+	}
+
+	// 14. schema diff no-op when identical
+	outDiffNoop, errOut, code := runCLI(ctx, "schema", "diff", "--from", "file://"+v2File, "--to", "file://"+v2File)
+	if code != 0 || !strings.Contains(outDiffNoop, "Schemas are identical") {
+		t.Errorf("expected Schemas are identical, got code=%d out=%q err=%q", code, outDiffNoop, errOut)
+	}
+
+	// 15. CLI validation and error paths
+	errorCases := [][]string{
+		{},
+		{"unknown-cmd"},
+		{"migrate"},
+		{"migrate", "unknown-sub"},
+		{"migrate", "diff"},
+		{"migrate", "diff", "--unknown-flag"},
+		{"migrate", "diff", "bad", "--dir", "file://" + migDir, "--to", "file:///nonexistent.sql", "--", "extra"},
+		{"migrate", "validate"},
+		{"migrate", "validate", "--unknown-flag"},
+		{"migrate", "validate", "--dir", "file:///nonexistent_dir"},
+		{"migrate", "hash"},
+		{"migrate", "hash", "--unknown-flag"},
+		{"migrate", "hash", "--dir", "file:///nonexistent_dir"},
+		{"migrate", "lint"},
+		{"migrate", "lint", "--unknown-flag"},
+		{"migrate", "lint", "--dir", "file://" + migDir, "--to", "file:///nonexistent.sql"},
+		{"migrate", "status"},
+		{"migrate", "status", "--unknown-flag"},
+		{"migrate", "status", "--dir", "file://" + migDir, "--url", "invalid://url"},
+		{"migrate", "apply"},
+		{"migrate", "apply", "--unknown-flag"},
+		{"migrate", "apply", "--dir", "file://" + migDir},
+		{"migrate", "apply", "--dir", "file://" + migDir, "--url", "invalid://url"},
+		{"migrate", "apply", "--dir", "file://" + migDir, "--dry-run", "--var", "BAD_VAR_NO_EQUALS"},
+		{"schema"},
+		{"schema", "unknown-sub"},
+		{"schema", "inspect"},
+		{"schema", "inspect", "--unknown-flag"},
+		{"schema", "inspect", "--url", "file:///nonexistent.sql"},
+		{"schema", "inspect", "--url", "file://" + v2File, "--format", "invalid"},
+		{"schema", "diff"},
+		{"schema", "diff", "--unknown-flag"},
+		{"schema", "diff", "--from", "file:///nonexistent.sql", "--to", "file://" + v2File},
+		{"schema", "diff", "--from", "file://" + v2File, "--to", "file:///nonexistent.sql"},
+		{"external-schema"},
+		{"external-schema", "--unknown-flag"},
+	}
+	for _, tc := range errorCases {
+		if _, _, c := runCLI(ctx, tc...); c == 0 {
+			t.Errorf("expected non-zero exit code for args %v", tc)
+		}
 	}
 }
 

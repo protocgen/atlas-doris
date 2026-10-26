@@ -3,23 +3,24 @@
 [![CI](https://github.com/protocgen/atlas-doris/actions/workflows/ci.yml/badge.svg)](https://github.com/protocgen/atlas-doris/actions/workflows/ci.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/protocgen/atlas-doris)](https://goreportcard.com/report/github.com/protocgen/atlas-doris)
 
-An Atlas-compatible schema migration driver, AST parser, canonical formatter, schema differ, evolution linter, revision executor, and `external_schema` plugin for **Apache Doris 4.x** and **Apache Iceberg v2** that consumes [proto2type](https://github.com/protocgen/proto2type)-generated `*_doris.sql` and `*_iceberg.sql` DDL contracts.
+An Atlas-compatible schema migration driver, AST parser, canonical SQL & HCL formatter, schema differ, evolution linter, revision executor, and `external_schema` plugin for **Apache Doris 4.x** and **Apache Iceberg v2** that consumes [proto2type](https://github.com/protocgen/proto2type)-generated `*_doris.sql`, `*_iceberg.sql`, `*_doris.hcl`, and `*_iceberg.hcl` contracts.
 
 ## Why this exists
 
 Standard [Atlas](https://atlasgo.io) supports PostgreSQL, MySQL, MariaDB, SQLite, ClickHouse, and Snowflake, but its MySQL dialect parser rejects Apache Doris 4.x and Apache Iceberg table clauses (`UNIQUE KEY(...)`, `DUPLICATE KEY(...)`, `DISTRIBUTED BY HASH(...) BUCKETS ...`, `INDEX ... USING INVERTED / NGRAM_BF / ANN`, `DATETIMEV2(6)`, `DECIMALV3(P, S)`, `DATEV2`, `ARRAY<T>`, and `PROPERTIES (...)`).
 
 ```
-.proto contracts  ──►  proto2type (*_doris.sql / *_iceberg.sql)  ──►  atlas-doris (migrations/ + atlas.sum)  ──►  Apache Doris FE
+.proto contracts  ──►  proto2type (*_doris.sql|hcl / *_iceberg.sql|hcl)  ──►  atlas-doris (migrations/ + atlas.sum)  ──►  Apache Doris FE
 ```
 
 **atlas-doris bridges `proto2type` and Atlas:**
 
 - 🔐 **100% Byte-for-Byte `atlas.sum` Compatibility** — uses `ariga.io/atlas/sql/migrate` (`migrate.NewLocalDir`, `localDir.Checksum()`, `migrate.WriteSumFile`, `migrate.Validate`) so migration directories managed by `atlas-doris` are byte-for-byte compatible with `atlas migrate validate` and `atlas migrate hash`
+- 🧩 **Native SQL & Atlas HCL Parser/Formatter** — natively parses and formats both `*_doris.sql` / `*_iceberg.sql` DDL and `proto2type`-generated declarative Atlas HCL (`*_doris.hcl` / `*_iceberg.hcl`)
 - ⚡ **Zero-Cluster Offline Replay (`ReplayDir`)** — replays versioned migration files (`00000000000000_baseline.sql`, `<YYYYMMDDHHMMSS>_<name>.sql`) in lexical order to construct the current `*doris.Schema` state in memory, running `migrate diff`, `migrate validate`, and `migrate lint` in milliseconds in CI without spinning up a live Doris FE+BE cluster
-- 🛡️ **Compile-Time & Migration-Time Evolution Linter (`DORIS001`–`DORIS007`)** — enforces Apache Doris 4.x Light Schema Change (LSC), Merge-on-Write (`enable_unique_key_merge_on_write`), and Apache Iceberg v2 schema evolution invariants
-- 🏔️ **Doris FE Revision Executor** — connects to Apache Doris FE over the MySQL wire protocol (`doris://user:pass@host:9030/db`), manages `atlas_schema_revisions` as a Doris `UNIQUE KEY(version)` Merge-on-Write table, safely interpolates `${TENANT_SLUG}` and `${TENANT_BUCKETS}`, and polls `SHOW ALTER TABLE COLUMN` until asynchronous schema changes reach `FINISHED`
-- 🔌 **Atlas `external_schema` Provider** — loads desired schemas from `*_doris.sql` / `*_iceberg.sql` files or directly from `.proto` files via `protoc-gen-proto2type`
+- 🛡️ **Compile-Time & Migration-Time Evolution Linter (`DORIS001`–`DORIS007`)** — enforces Apache Doris 4.x Light Schema Change (LSC), Merge-on-Write (`enable_unique_key_merge_on_write`), `ANN` HNSW vector index, and Apache Iceberg v2 schema evolution invariants
+- 🏔️ **Doris FE Revision Executor** — connects to Apache Doris FE over the MySQL wire protocol (`doris://user:pass@host:9030/db`), manages `atlas_schema_revisions` as a Doris `UNIQUE KEY(version)` Merge-on-Write table, safely interpolates `${TENANT_SLUG}` and `${TENANT_BUCKETS}`, and polls `SHOW ALTER TABLE COLUMN` and `SHOW BUILD INDEX` until asynchronous schema changes reach `FINISHED`
+- 🔌 **Atlas `external_schema` Provider** — loads desired schemas from `*_doris.sql`, `*_iceberg.sql`, `*_doris.hcl`, `*_iceberg.hcl` files or directly from `.proto` files via `protoc-gen-proto2type`
 
 ## Architecture
 
@@ -57,13 +58,13 @@ go get github.com/protocgen/atlas-doris@latest
 
 ## CLI Usage
 
-### 1. Generate a Migration from `proto2type` SQL or Protobufs
+### 1. Generate a Migration from `proto2type` SQL, Atlas HCL, or Protobufs
 
 ```bash
-# From proto2type-generated *_doris.sql / *_iceberg.sql files:
+# From proto2type-generated *_doris.sql / *_iceberg.sql or *_doris.hcl / *_iceberg.hcl files:
 atlas-doris migrate diff add_order_status \
   --dir file://./migrations \
-  --to file://./schema/tenant_ddl.sql
+  --to file://./schema/tenant_doris.hcl
 
 # Or directly from .proto files via protoc + protoc-gen-proto2type:
 atlas-doris migrate diff add_order_status \
@@ -78,17 +79,19 @@ atlas-doris migrate validate --dir file://./migrations
 
 atlas-doris migrate lint \
   --dir file://./migrations \
-  --to file://./schema/tenant_ddl.sql
+  --to file://./schema/tenant_doris.hcl
 ```
 
-### 3. Inspect or Diff Schemas
+### 3. Inspect or Diff Schemas (SQL or Atlas HCL)
 
 ```bash
-atlas-doris schema inspect --url file://./schema/tenant_ddl.sql
+# Inspect as canonical SQL (default) or declarative Atlas HCL:
+atlas-doris schema inspect --url file://./schema/tenant_doris.hcl --format sql
+atlas-doris schema inspect --url file://./migrations --format hcl
 
 atlas-doris schema diff \
   --from file://./migrations \
-  --to file://./schema/tenant_ddl.sql
+  --to file://./schema/tenant_doris.hcl
 ```
 
 ### 4. Apply Migrations to Apache Doris FE
@@ -119,7 +122,7 @@ data "external_schema" "doris_schema" {
   program = [
     "atlas-doris",
     "external-schema",
-    "--url", "file://./schema/tenant_ddl.sql",
+    "--hcl-dir", "./schema",
   ]
 }
 ```

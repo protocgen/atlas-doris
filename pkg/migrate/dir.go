@@ -50,6 +50,9 @@ func ResolvePath(raw string) (string, error) {
 		}
 		return filepath.Clean(p), nil
 	}
+	if strings.Contains(s, "://") {
+		return "", fmt.Errorf("unsupported URL scheme in %q (expected file://)", raw)
+	}
 	return filepath.Clean(s), nil
 }
 

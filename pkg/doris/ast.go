@@ -243,6 +243,9 @@ func (t *TableDef) IsIcebergTable() bool {
 	if strings.EqualFold(t.Engine, "iceberg") {
 		return true
 	}
+	if eng, ok := t.GetProperty("engine"); ok && strings.EqualFold(eng, "iceberg") {
+		return true
+	}
 	if _, ok := t.GetProperty("compression_codec"); ok {
 		return true
 	}
@@ -324,6 +327,12 @@ func (t *TableDef) SequenceCol() string {
 func (t *TableDef) ColocateGroup() string {
 	v, _ := t.GetProperty("colocate_with")
 	return v
+}
+
+// HasUniqueKeyMergeOnWrite reports whether "enable_unique_key_merge_on_write" is set to "true".
+func (t *TableDef) HasUniqueKeyMergeOnWrite() bool {
+	v, ok := t.GetProperty("enable_unique_key_merge_on_write")
+	return ok && strings.EqualFold(strings.TrimSpace(v), "true")
 }
 
 // Clone returns a deep copy of TableDef.
@@ -621,6 +630,8 @@ type Statement struct {
 	TargetTable    string
 	IfExists       bool
 	Column         *ColumnDef
+	First          bool
+	AfterColumn    string
 	DropColumnName string
 	Index          *IndexDef
 	DropIndexName  string
@@ -648,13 +659,25 @@ func (st Statement) SQL() string {
 		return fmt.Sprintf("DROP TABLE %s;", st.TargetTable)
 	case StmtAlterTableAddColumn:
 		if st.Column != nil {
-			return fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s;", st.TargetTable, FormatColumnDef(st.Column))
+			posClause := ""
+			if st.First {
+				posClause = " FIRST"
+			} else if st.AfterColumn != "" {
+				posClause = " AFTER " + FormatIdent(st.AfterColumn)
+			}
+			return fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s%s;", st.TargetTable, FormatColumnDef(st.Column), posClause)
 		}
 	case StmtAlterTableDropColumn:
 		return fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s;", st.TargetTable, FormatIdent(st.DropColumnName))
 	case StmtAlterTableModifyColumn:
 		if st.Column != nil {
-			return fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s;", st.TargetTable, FormatColumnDef(st.Column))
+			posClause := ""
+			if st.First {
+				posClause = " FIRST"
+			} else if st.AfterColumn != "" {
+				posClause = " AFTER " + FormatIdent(st.AfterColumn)
+			}
+			return fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s%s;", st.TargetTable, FormatColumnDef(st.Column), posClause)
 		}
 	case StmtAlterTableAddIndex:
 		if st.Index != nil {

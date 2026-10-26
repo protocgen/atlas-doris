@@ -38,15 +38,18 @@ type LoadOptions struct {
 type ExternalSchemaOptions struct {
 	SQLDir        string
 	SQLFiles      []string
+	HCLDir        string
+	HCLFiles      []string
 	ProtoPath     string
 	URL           string
 	Target        TargetFilter
+	Format        string
 	ProtoIncludes []string
 	PluginPath    string
 }
 
 // LoadSchema loads a doris.Schema from a file:// URL, local file/directory path,
-// or proto:// URL (which invokes protoc + protoc-gen-proto2type with backend=doris,doris_mode=ddl).
+// doris:// or mysql:// live database URL, or proto:// URL.
 func LoadSchema(ctx context.Context, targetURL string, opts LoadOptions) (*doris.Schema, error) {
 	raw := strings.TrimSpace(targetURL)
 	if raw == "" {
@@ -54,6 +57,13 @@ func LoadSchema(ctx context.Context, targetURL string, opts LoadOptions) (*doris
 	}
 	if strings.HasPrefix(raw, "proto://") {
 		return loadFromProtoURL(ctx, raw, opts)
+	}
+	if strings.HasPrefix(raw, "doris://") || strings.HasPrefix(raw, "mysql://") {
+		s, err := migrate.InspectLiveSchema(ctx, raw)
+		if err != nil {
+			return nil, err
+		}
+		return FilterSchemaByTarget(s, opts.Target), nil
 	}
 	target := opts.Target
 	if strings.HasPrefix(raw, "file://") {
@@ -70,8 +80,32 @@ func LoadSchema(ctx context.Context, targetURL string, opts LoadOptions) (*doris
 	return LoadFromPath(localPath, target)
 }
 
-// LoadFromPath loads a doris.Schema from a single .sql file, a directory of .sql files,
-// or an Atlas migration directory (when atlas.sum is present).
+// FilterSchemaByTarget returns a copy of s retaining only tables that match target.
+func FilterSchemaByTarget(s *doris.Schema, target TargetFilter) *doris.Schema {
+	if s == nil || target == "" || target == TargetAll {
+		return s
+	}
+	out := s.Clone()
+	out.Tables = nil
+	for _, t := range s.Tables {
+		switch target {
+		case TargetDoris:
+			if t.IsDorisInternalTable() {
+				out.Tables = append(out.Tables, t)
+			}
+		case TargetIceberg:
+			if t.IsIcebergTable() {
+				out.Tables = append(out.Tables, t)
+			}
+		default:
+			out.Tables = append(out.Tables, t)
+		}
+	}
+	return out
+}
+
+// LoadFromPath loads a doris.Schema from a single .sql or .hcl file, a directory of
+// .sql / .hcl files, or an Atlas migration directory (when atlas.sum is present).
 func LoadFromPath(localPath string, target TargetFilter) (*doris.Schema, error) {
 	info, err := os.Stat(localPath)
 	if err != nil {
@@ -82,7 +116,7 @@ func LoadFromPath(localPath string, target TargetFilter) (*doris.Schema, error) 
 		if err != nil {
 			return nil, fmt.Errorf("read schema file %q: %w", localPath, err)
 		}
-		s, err := doris.ParseSchema(string(data))
+		s, err := doris.ParseSchemaAuto(string(data), localPath)
 		if err != nil {
 			return nil, fmt.Errorf("parse schema file %q: %w", localPath, err)
 		}
@@ -98,7 +132,7 @@ func LoadFromPath(localPath string, target TargetFilter) (*doris.Schema, error) 
 		return s, nil
 	}
 
-	var sqlFiles []string
+	var schemaFiles []string
 	err = filepath.WalkDir(localPath, func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -107,30 +141,30 @@ func LoadFromPath(localPath string, target TargetFilter) (*doris.Schema, error) 
 			return nil
 		}
 		name := strings.ToLower(d.Name())
-		if !strings.HasSuffix(name, ".sql") {
+		if !strings.HasSuffix(name, ".sql") && !strings.HasSuffix(name, ".hcl") {
 			return nil
 		}
 		if !matchesTargetFilter(name, target) {
 			return nil
 		}
-		sqlFiles = append(sqlFiles, p)
+		schemaFiles = append(schemaFiles, p)
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("scan SQL directory %q: %w", localPath, err)
+		return nil, fmt.Errorf("scan schema directory %q: %w", localPath, err)
 	}
-	sort.Strings(sqlFiles)
-	if len(sqlFiles) == 0 {
-		return nil, fmt.Errorf("no matching .sql files found in %q (target=%q)", localPath, target)
+	sort.Strings(schemaFiles)
+	if len(schemaFiles) == 0 {
+		return nil, fmt.Errorf("no matching .sql or .hcl files found in %q (target=%q)", localPath, target)
 	}
 
 	merged := doris.NewSchema()
-	for _, f := range sqlFiles {
+	for _, f := range schemaFiles {
 		data, err := os.ReadFile(f)
 		if err != nil {
 			return nil, fmt.Errorf("read %q: %w", f, err)
 		}
-		sub, err := doris.ParseSchema(string(data))
+		sub, err := doris.ParseSchemaAuto(string(data), f)
 		if err != nil {
 			return nil, fmt.Errorf("parse %q: %w", f, err)
 		}
@@ -179,6 +213,27 @@ func ExternalSchemaSQL(ctx context.Context, opts ExternalSchemaOptions) (string,
 		loadedAny = true
 	}
 
+	if opts.HCLDir != "" {
+		s, err := LoadFromPath(opts.HCLDir, opts.Target)
+		if err != nil {
+			return "", err
+		}
+		merged.Merge(s)
+		loadedAny = true
+	}
+
+	for _, f := range opts.HCLFiles {
+		if strings.TrimSpace(f) == "" {
+			continue
+		}
+		s, err := LoadFromPath(f, opts.Target)
+		if err != nil {
+			return "", err
+		}
+		merged.Merge(s)
+		loadedAny = true
+	}
+
 	if opts.ProtoPath != "" {
 		protoURL := opts.ProtoPath
 		if !strings.HasPrefix(protoURL, "proto://") {
@@ -197,10 +252,17 @@ func ExternalSchemaSQL(ctx context.Context, opts ExternalSchemaOptions) (string,
 	}
 
 	if !loadedAny {
-		return "", fmt.Errorf("external-schema requires at least one of --sql-dir, --sql-file, --proto, or --url")
+		return "", fmt.Errorf("external-schema requires at least one of --sql-dir, --sql-file, --hcl-dir, --hcl-file, --proto, or --url")
 	}
 
-	return doris.FormatSchema(merged), nil
+	switch strings.ToLower(strings.TrimSpace(opts.Format)) {
+	case "", "sql":
+		return doris.FormatSchema(merged), nil
+	case "hcl":
+		return doris.FormatHCL(merged), nil
+	default:
+		return "", fmt.Errorf("unsupported format %q (expected sql or hcl)", opts.Format)
+	}
 }
 
 func loadFromProtoURL(ctx context.Context, rawURL string, opts LoadOptions) (*doris.Schema, error) {
@@ -277,10 +339,18 @@ func loadFromProtoURL(ctx context.Context, rawURL string, opts LoadOptions) (*do
 	}
 	defer os.RemoveAll(tmpOut)
 
+	dorisMode := strings.ToLower(strings.TrimSpace(queryValues.Get("mode")))
+	if dorisMode == "" {
+		dorisMode = strings.ToLower(strings.TrimSpace(queryValues.Get("doris_mode")))
+	}
+	if dorisMode == "" {
+		dorisMode = "ddl"
+	}
+
 	var args []string
 	args = append(args, "--plugin=protoc-gen-proto2type="+resolvedPlugin)
 	args = append(args, "--proto2type_out="+tmpOut)
-	args = append(args, "--proto2type_opt=lang=go,backend=doris,doris_mode=ddl")
+	args = append(args, "--proto2type_opt=lang=go,backend=doris,doris_mode="+dorisMode)
 	seenInc := make(map[string]bool)
 	for _, inc := range append([]string{rootInclude}, includes...) {
 		cleanInc := filepath.Clean(inc)
@@ -316,12 +386,23 @@ func resolveProto2TypePlugin(ctx context.Context, explicitPath string) (string, 
 	if p, err := exec.LookPath("protoc-gen-proto2type"); err == nil {
 		return p, noop, nil
 	}
-	// Check sibling proto2type repository if present in workspace
-	candidates := []string{
-		"/Users/ab/code/azra/proto2type",
-		filepath.Join("..", "proto2type"),
+	// Check PROTO2TYPE_DIR or sibling proto2type repository if present in workspace
+	var candidates []string
+	if envDir := strings.TrimSpace(os.Getenv("PROTO2TYPE_DIR")); envDir != "" {
+		candidates = append(candidates, envDir)
 	}
+	candidates = append(candidates,
+		filepath.Join("..", "proto2type"),
+		filepath.Join("..", "..", "proto2type"),
+		filepath.Join("..", "..", "..", "proto2type"),
+	)
 	for _, repoDir := range candidates {
+		prebuilt := filepath.Join(repoDir, "protoc-gen-proto2type")
+		if info, err := os.Stat(prebuilt); err == nil && !info.IsDir() {
+			if abs, err := filepath.Abs(prebuilt); err == nil {
+				return abs, noop, nil
+			}
+		}
 		if info, err := os.Stat(filepath.Join(repoDir, "go.mod")); err == nil && !info.IsDir() {
 			tmpBinDir, err := os.MkdirTemp("", "protoc-gen-proto2type-bin-*")
 			if err != nil {
@@ -342,9 +423,13 @@ func resolveProto2TypePlugin(ctx context.Context, explicitPath string) (string, 
 func matchesTargetFilter(lowerFileName string, target TargetFilter) bool {
 	switch target {
 	case TargetDoris:
-		return strings.HasSuffix(lowerFileName, "_doris.sql") || strings.Contains(lowerFileName, "doris")
+		return strings.HasSuffix(lowerFileName, "_doris.sql") ||
+			strings.HasSuffix(lowerFileName, "_doris.hcl") ||
+			strings.Contains(lowerFileName, "doris")
 	case TargetIceberg:
-		return strings.HasSuffix(lowerFileName, "_iceberg.sql") || strings.Contains(lowerFileName, "iceberg")
+		return strings.HasSuffix(lowerFileName, "_iceberg.sql") ||
+			strings.HasSuffix(lowerFileName, "_iceberg.hcl") ||
+			strings.Contains(lowerFileName, "iceberg")
 	default:
 		return true
 	}

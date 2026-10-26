@@ -376,11 +376,12 @@ func runSchema(ctx context.Context, args []string, stdout, stderr io.Writer) int
 func runSchemaInspect(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("schema inspect", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	var targetURL, target, pluginPath string
+	var targetURL, target, format, pluginPath string
 	var includes multiStringFlag
 	fs.StringVar(&targetURL, "url", "", "schema URL (file://path or proto://path)")
 	fs.StringVar(&targetURL, "u", "", "schema URL shorthand")
 	fs.StringVar(&target, "target", "all", "target filter: all | doris | iceberg")
+	fs.StringVar(&format, "format", "sql", "output format: sql | hcl")
 	fs.StringVar(&pluginPath, "plugin", "", "path to protoc-gen-proto2type binary")
 	fs.Var(&includes, "include", "proto include directory (repeatable)")
 
@@ -401,7 +402,15 @@ func runSchemaInspect(ctx context.Context, args []string, stdout, stderr io.Writ
 		fmt.Fprintf(stderr, "schema inspect failed: %v\n", err)
 		return 1
 	}
-	fmt.Fprint(stdout, doris.FormatSchema(s))
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "", "sql":
+		fmt.Fprint(stdout, doris.FormatSchema(s))
+	case "hcl":
+		fmt.Fprint(stdout, doris.FormatHCL(s))
+	default:
+		fmt.Fprintf(stderr, "unsupported --format %q (expected sql or hcl)\n", format)
+		return 1
+	}
 	return 0
 }
 
@@ -465,13 +474,16 @@ func runSchemaDiff(ctx context.Context, args []string, stdout, stderr io.Writer)
 func runExternalSchema(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("external-schema", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	var sqlDir, protoPath, targetURL, target, pluginPath string
-	var sqlFiles, includes multiStringFlag
+	var sqlDir, hclDir, protoPath, targetURL, target, format, pluginPath string
+	var sqlFiles, hclFiles, includes multiStringFlag
 	fs.StringVar(&sqlDir, "sql-dir", "", "directory containing *_doris.sql / *_iceberg.sql files")
 	fs.Var(&sqlFiles, "sql-file", "path to SQL file (repeatable)")
+	fs.StringVar(&hclDir, "hcl-dir", "", "directory containing *_doris.hcl / *_iceberg.hcl files")
+	fs.Var(&hclFiles, "hcl-file", "path to HCL file (repeatable)")
 	fs.StringVar(&protoPath, "proto", "", "path to .proto file or directory")
 	fs.StringVar(&targetURL, "url", "", "schema URL (file:// or proto://)")
 	fs.StringVar(&target, "target", "all", "target filter: all | doris | iceberg")
+	fs.StringVar(&format, "format", "sql", "output format: sql | hcl")
 	fs.StringVar(&pluginPath, "plugin", "", "path to protoc-gen-proto2type binary")
 	fs.Var(&includes, "include", "proto include directory (repeatable)")
 
@@ -482,9 +494,12 @@ func runExternalSchema(ctx context.Context, args []string, stdout, stderr io.Wri
 	out, err := external.ExternalSchemaSQL(ctx, external.ExternalSchemaOptions{
 		SQLDir:        sqlDir,
 		SQLFiles:      sqlFiles,
+		HCLDir:        hclDir,
+		HCLFiles:      hclFiles,
 		ProtoPath:     protoPath,
 		URL:           targetURL,
 		Target:        external.TargetFilter(strings.ToLower(target)),
+		Format:        format,
 		ProtoIncludes: includes,
 		PluginPath:    pluginPath,
 	})
@@ -555,9 +570,9 @@ Usage:
   atlas-doris migrate lint --dir file://... [--to file://...]
   atlas-doris migrate status --dir file://... --url doris://...
   atlas-doris migrate apply --dir file://... --url doris://... [--var K=V] [--dry-run]
-  atlas-doris schema inspect --url file://...
+  atlas-doris schema inspect --url file://... [--format sql|hcl]
   atlas-doris schema diff --from file://... --to file://...
-  atlas-doris external-schema [--sql-dir ... | --sql-file ... | --proto ...]
+  atlas-doris external-schema [--sql-dir ... | --sql-file ... | --hcl-dir ... | --hcl-file ... | --proto ...]
   atlas-doris version
 `)
 }

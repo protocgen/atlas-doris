@@ -186,6 +186,11 @@ PROPERTIES (
 		after.Tables[0].Key.Columns = []string{"patient_id", "mrn"}
 		violations := doris.LintSchemaEvolution(baseSchema, after, doris.LintOptions{})
 		assertHasRule(t, violations, doris.DORIS001_IMMUTABLE_KEY)
+
+		// Static LintTable rejects FLOAT / DOUBLE key columns
+		floatKeyTbl := baseSchema.Tables[0].Clone()
+		floatKeyTbl.Key.Columns = []string{"score"}
+		assertHasRule(t, doris.LintTable(floatKeyTbl), doris.DORIS001_IMMUTABLE_KEY)
 	})
 
 	t.Run("DORIS002_IMMUTABLE_SEQUENCE", func(t *testing.T) {
@@ -200,6 +205,11 @@ PROPERTIES (
 		after.Tables[0].Distribution.Columns = []string{"mrn"}
 		violations := doris.LintSchemaEvolution(baseSchema, after, doris.LintOptions{})
 		assertHasRule(t, violations, doris.DORIS003_IMMUTABLE_DISTRIBUTION)
+
+		// Mutating colocate_with on an existing table is also blocked by DORIS003
+		afterColocate := baseSchema.Clone()
+		afterColocate.Tables[0].SetProperty("colocate_with", "other_group")
+		assertHasRule(t, doris.LintSchemaEvolution(baseSchema, afterColocate, doris.LintOptions{}), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
 	})
 
 	t.Run("DORIS004_NO_COLUMN_DROP", func(t *testing.T) {
@@ -248,14 +258,89 @@ PROPERTIES (
 		violations := doris.LintSchemaEvolution(baseSchema, afterNarrow, doris.LintOptions{})
 		assertHasRule(t, violations, doris.DORIS006_SAFE_TYPE_EVOLUTION)
 
-		// Widening VARCHAR(32)->VARCHAR(64), TINYINT->INT, FLOAT->DOUBLE is allowed
+		// Widening VARCHAR(32)->VARCHAR(64), TINYINT->LARGEINT, FLOAT->DOUBLE is allowed
 		afterWide := baseSchema.Clone()
 		afterWide.Tables[0].Columns[1].Type = "VARCHAR(64)"
-		afterWide.Tables[0].Columns[2].Type = "INT"
+		afterWide.Tables[0].Columns[2].Type = "LARGEINT"
 		afterWide.Tables[0].Columns[3].Type = "DOUBLE"
 		if v := doris.LintSchemaEvolution(baseSchema, afterWide, doris.LintOptions{}); len(v) != 0 {
 			t.Fatalf("expected 0 violations on safe widening, got %v", v)
 		}
+
+		// DECIMAL / DECIMALV3 precision widening with identical scale is safe; scale change or precision narrowing is rejected
+		if !doris.IsSafeTypeEvolution("DECIMAL(10, 2)", "DECIMAL(18, 2)") {
+			t.Errorf("expected DECIMAL(10, 2) -> DECIMAL(18, 2) to be safe")
+		}
+		if !doris.IsSafeTypeEvolution("DECIMALV3(12, 4)", "DECIMALV3(18, 4)") {
+			t.Errorf("expected DECIMALV3(12, 4) -> DECIMALV3(18, 4) to be safe")
+		}
+		if doris.IsSafeTypeEvolution("DECIMALV3(18, 4)", "DECIMALV3(12, 4)") {
+			t.Errorf("expected DECIMALV3(18, 4) -> DECIMALV3(12, 4) narrowing to be rejected")
+		}
+		if doris.IsSafeTypeEvolution("DECIMALV3(12, 2)", "DECIMALV3(18, 4)") {
+			t.Errorf("expected DECIMALV3(12, 2) -> DECIMALV3(18, 4) scale change to be rejected")
+		}
+		if !doris.IsSafeTypeEvolution("BIGINT", "LARGEINT") {
+			t.Errorf("expected BIGINT -> LARGEINT to be safe")
+		}
+
+		// ANN index invariants on LintTable
+		badANN := &doris.TableDef{
+			Name: "bad_ann",
+			Key:  &doris.KeyClause{Kind: doris.KeyUnique, Columns: []string{"id"}},
+			Columns: []*doris.ColumnDef{
+				{Name: "id", Type: "VARCHAR(64)", Nullable: false},
+				{Name: "embedding", Type: "ARRAY<DOUBLE>", Nullable: true},
+			},
+			Indexes: []*doris.IndexDef{
+				{
+					Name:    "idx_emb",
+					Columns: []string{"embedding"},
+					Using:   "ANN",
+					Properties: []doris.Property{
+						{Key: "index_type", Value: "flat"},
+						{Key: "dim", Value: "0"},
+					},
+				},
+			},
+		}
+		assertHasRule(t, doris.LintTable(badANN), doris.DORIS006_SAFE_TYPE_EVOLUTION)
+
+		// Valid ANN index on UNIQUE KEY table with merge-on-write enabled and IVF / HNSW
+		goodUniqueMoWANN := &doris.TableDef{
+			Name: "good_unique_mow_ann",
+			Key:  &doris.KeyClause{Kind: doris.KeyUnique, Columns: []string{"id"}},
+			Columns: []*doris.ColumnDef{
+				{Name: "id", Type: "VARCHAR(64)", Nullable: false},
+				{Name: "embedding", Type: "ARRAY<FLOAT>", Nullable: false},
+			},
+			Properties: []doris.Property{
+				{Key: "enable_unique_key_merge_on_write", Value: "true"},
+			},
+			Indexes: []*doris.IndexDef{
+				{
+					Name:    "idx_emb_ivf",
+					Columns: []string{"embedding"},
+					Using:   "ANN",
+					Properties: []doris.Property{
+						{Key: "index_type", Value: "ivf"},
+						{Key: "metric_type", Value: "inner_product"},
+						{Key: "dim", Value: "768"},
+					},
+				},
+			},
+		}
+		if v := doris.LintTable(goodUniqueMoWANN); len(v) != 0 {
+			t.Fatalf("expected 0 violations on UNIQUE KEY MoW table with valid IVF ANN index, got %v", v)
+		}
+
+		// Missing metric_type is rejected
+		missingMetricANN := goodUniqueMoWANN.Clone()
+		missingMetricANN.Indexes[0].Properties = []doris.Property{
+			{Key: "index_type", Value: "hnsw"},
+			{Key: "dim", Value: "768"},
+		}
+		assertHasRule(t, doris.LintTable(missingMetricANN), doris.DORIS006_SAFE_TYPE_EVOLUTION)
 	})
 
 	t.Run("DORIS007_FORBIDDEN_TYPE", func(t *testing.T) {
@@ -355,6 +440,58 @@ PROPERTIES (
 	}
 	if doris.FormatSchema(replayed) != doris.FormatSchema(s2) {
 		t.Fatalf("replayed schema mismatch:\nwant:\n%s\ngot:\n%s", doris.FormatSchema(s2), doris.FormatSchema(replayed))
+	}
+
+	// Verify Iceberg ALTER TABLE ADD COLUMN strips NOT NULL and DEFAULT
+	iceBefore, err := doris.ParseSchema(`
+CREATE TABLE IF NOT EXISTS azra_lake.tenant_duke.patients (
+    patient_id VARCHAR(64) NOT NULL
+)
+PROPERTIES (
+    "compression_codec" = "zstd"
+);`)
+	if err != nil {
+		t.Fatalf("parse iceBefore: %v", err)
+	}
+	iceAfter, err := doris.ParseSchema(`
+CREATE TABLE IF NOT EXISTS azra_lake.tenant_duke.patients (
+    patient_id VARCHAR(64) NOT NULL,
+    status VARCHAR(32) NOT NULL DEFAULT "ACTIVE"
+)
+PROPERTIES (
+    "compression_codec" = "zstd"
+);`)
+	if err != nil {
+		t.Fatalf("parse iceAfter: %v", err)
+	}
+	iceStmts, err := doris.Diff(iceBefore, iceAfter)
+	if err != nil {
+		t.Fatalf("Diff(iceBefore, iceAfter) failed: %v", err)
+	}
+	iceDiffSQL := doris.FormatStatements(iceStmts)
+	if !strings.Contains(iceDiffSQL, "ALTER TABLE azra_lake.tenant_duke.patients ADD COLUMN status VARCHAR(32);") {
+		t.Errorf("expected Iceberg ADD COLUMN without NOT NULL or DEFAULT, got:\n%s", iceDiffSQL)
+	}
+	iceInitStmts, err := doris.ParseStatements(`
+CREATE TABLE IF NOT EXISTS azra_lake.tenant_duke.patients (
+    patient_id VARCHAR(64) NOT NULL
+)
+PROPERTIES (
+    "compression_codec" = "zstd"
+);`)
+	if err != nil {
+		t.Fatalf("ParseStatements(iceBefore): %v", err)
+	}
+	iceReplayed, err := doris.ReplayStatements(append(iceInitStmts, iceStmts...))
+	if err != nil {
+		t.Fatalf("ReplayStatements(ice): %v", err)
+	}
+	iceFollowUp, err := doris.Diff(iceReplayed, iceAfter)
+	if err != nil {
+		t.Fatalf("Diff(iceReplayed, iceAfter): %v", err)
+	}
+	if len(iceFollowUp) != 0 {
+		t.Fatalf("expected 0 follow-up statements after Iceberg ADD COLUMN, got:\n%s", doris.FormatStatements(iceFollowUp))
 	}
 }
 

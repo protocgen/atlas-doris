@@ -368,6 +368,23 @@ table "proto_items" {
   }
 }
 EOF
+      cat << 'EOF' > "$out_dir/fake_starrocks.hcl"
+table "proto_items" {
+  schema = schema.tenant_proto
+  column "item_id" {
+    type = varchar(64)
+    null = false
+  }
+  primary_key {
+    columns = [column.item_id]
+    enable_persistent_index = true
+  }
+  distributed_by_hash {
+    columns = [column.item_id]
+    buckets = 4
+  }
+}
+EOF
       ;;
   esac
 done
@@ -398,12 +415,19 @@ exit 0
 	}
 
 	// Single proto file with PATH lookup for protoc-gen-proto2type
-	sSingle, err := external.LoadSchema(ctx, "proto://"+protoFile+"?doris_mode=both", external.LoadOptions{})
+	sSingle, err := external.LoadSchema(ctx, "proto://"+protoFile+"?doris_mode=both", external.LoadOptions{
+		Target: external.TargetDoris,
+	})
 	if err != nil {
 		t.Fatalf("LoadSchema(proto:// single file) failed: %v", err)
 	}
 	if len(sSingle.Tables) != 1 {
 		t.Errorf("expected 1 table from single proto file, got %d", len(sSingle.Tables))
+	}
+	for _, srQuery := range []string{"", "?mode=ddl", "?mode=hcl", "?mode=both"} {
+		if sSR, err := external.LoadSchema(ctx, "proto://"+protoFile+srQuery, external.LoadOptions{Target: external.TargetStarRocks}); err != nil || len(sSR.Tables) != 1 {
+			t.Errorf("LoadSchema(TargetStarRocks, %q) = (%+v, %v)", srQuery, sSR, err)
+		}
 	}
 
 	// Proto error paths: missing plugin, empty proto dir, nonexistent proto path
@@ -427,7 +451,9 @@ exit 0
 		t.Fatalf("write fake repo plugin: %v", err)
 	}
 	t.Setenv("PROTO2TYPE_DIR", fakeRepoDir)
-	sFromBuiltPlugin, err := external.LoadSchema(ctx, "proto://"+protoFile, external.LoadOptions{})
+	sFromBuiltPlugin, err := external.LoadSchema(ctx, "proto://"+protoFile, external.LoadOptions{
+		Target: external.TargetDoris,
+	})
 	if err != nil {
 		t.Fatalf("LoadSchema with PROTO2TYPE_DIR failed: %v", err)
 	}

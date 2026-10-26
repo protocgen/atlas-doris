@@ -255,3 +255,19 @@ func runCLI(ctx context.Context, args ...string) (string, string, int) {
 	code := Run(ctx, args, &stdout, &stderr)
 	return stdout.String(), stderr.String(), code
 }
+
+func TestMainEntrypoint(t *testing.T) {
+	origExit := exitFunc
+	origArgs := os.Args
+	defer func() {
+		exitFunc = origExit
+		os.Args = origArgs
+	}()
+	gotCode := -1
+	exitFunc = func(c int) { gotCode = c }
+	os.Args = []string{"atlas-doris", "version"}
+	main()
+	if gotCode != 0 {
+		t.Errorf("expected exit code 0 from main(), got %d", gotCode)
+	}
+}

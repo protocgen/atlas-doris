@@ -12,8 +12,10 @@ import (
 	"github.com/protocgen/atlas-doris/pkg/external"
 )
 
+var exitFunc = os.Exit
+
 func main() {
-	os.Exit(Run(context.Background(), os.Args[1:], os.Stdout, os.Stderr))
+	exitFunc(Run(context.Background(), os.Args[1:], os.Stdout, os.Stderr))
 }
 
 // Run executes the atlas-doris CLI with the given arguments and output writers.

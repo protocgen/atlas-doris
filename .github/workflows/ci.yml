@@ -25,7 +25,10 @@ jobs:
           go-version-file: go.mod
 
       - name: Build
-        run: go build -o atlas-doris ./cmd/atlas-doris
+        run: |
+          go build -o atlas-doris ./cmd/atlas-doris
+          go build -o atlas-olap ./cmd/atlas-olap
+          go build -o atlas-starrocks ./cmd/atlas-starrocks
 
       - name: Vet
         run: go vet ./...

@@ -30,4 +30,18 @@ func TestAtlasStarRocksMainRun(t *testing.T) {
 	if !strings.Contains(out.String(), "PRIMARY KEY(id)") || strings.Contains(out.String(), "UNIQUE KEY(id)") {
 		t.Errorf("expected atlas-starrocks to inspect only StarRocks target by default, got:\n%s", out.String())
 	}
+
+	origExit := exitFunc
+	origArgs := os.Args
+	defer func() {
+		exitFunc = origExit
+		os.Args = origArgs
+	}()
+	gotCode := -1
+	exitFunc = func(c int) { gotCode = c }
+	os.Args = []string{"atlas-starrocks", "version"}
+	main()
+	if gotCode != 0 {
+		t.Errorf("expected exit code 0 from main(), got %d", gotCode)
+	}
 }

@@ -100,7 +100,7 @@ PROPERTIES (
 	}
 
 	// 8. migrate diff v2
-	out, errOut, code = runCLI(ctx, "migrate", "diff", "widen_mrn_add_status", "--dir", "file://"+migDir, "--to", "file://"+v2File, "--version", "20261024100001")
+	_, errOut, code = runCLI(ctx, "migrate", "diff", "widen_mrn_add_status", "--dir", "file://"+migDir, "--to", "file://"+v2File, "--version", "20261024100001")
 	if code != 0 {
 		t.Fatalf("migrate diff v2 failed (code=%d): %s", code, errOut)
 	}
@@ -173,6 +173,37 @@ PROPERTIES (
 		t.Errorf("expected Schemas are identical, got code=%d out=%q err=%q", code, outDiffNoop, errOut)
 	}
 
+	// 14b. StarRocks (--target=starrocks) inspect, diff, and external-schema workflow
+	srV1File := filepath.Join(tmpDir, "schema_v1_starrocks.sql")
+	srV1SQL := `
+CREATE DATABASE IF NOT EXISTS internal.tenant_${TENANT_SLUG};
+
+CREATE TABLE IF NOT EXISTS internal.tenant_${TENANT_SLUG}.patients (
+    patient_id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(32) NOT NULL DEFAULT "",
+    publication_generation BIGINT NOT NULL DEFAULT "0",
+    INDEX idx_patients_mrn (mrn) USING GIN("parser" = "english")
+)
+PRIMARY KEY(patient_id)
+DISTRIBUTED BY HASH(patient_id) BUCKETS ${TENANT_BUCKETS}
+PROPERTIES (
+    "storage_volume" = "builtin_storage_volume",
+    "enable_persistent_index" = "true",
+    "datacache.enable" = "true",
+    "function_column.sequence_col" = "publication_generation"
+);`
+	if err := os.WriteFile(srV1File, []byte(srV1SQL), 0o644); err != nil {
+		t.Fatalf("write srV1File: %v", err)
+	}
+	outSR, errOut, code := runCLI(ctx, "external-schema", "--sql-dir", tmpDir, "--target", "starrocks")
+	if code != 0 || !strings.Contains(outSR, "PRIMARY KEY(patient_id)") {
+		t.Fatalf("external-schema --target=starrocks failed (code=%d): %s\nout:\n%s", code, errOut, outSR)
+	}
+	outSRHCL, errOut, code := runCLI(ctx, "schema", "inspect", "--url", "file://"+srV1File, "--target", "starrocks", "--format", "hcl")
+	if code != 0 || !strings.Contains(outSRHCL, "primary_key {") {
+		t.Fatalf("schema inspect --target=starrocks --format=hcl failed (code=%d): %s\nout:\n%s", code, errOut, outSRHCL)
+	}
+
 	// 15. CLI validation and error paths
 	errorCases := [][]string{
 		{},
@@ -223,4 +254,20 @@ func runCLI(ctx context.Context, args ...string) (string, string, int) {
 	var stdout, stderr bytes.Buffer
 	code := Run(ctx, args, &stdout, &stderr)
 	return stdout.String(), stderr.String(), code
+}
+
+func TestMainEntrypoint(t *testing.T) {
+	origExit := exitFunc
+	origArgs := os.Args
+	defer func() {
+		exitFunc = origExit
+		os.Args = origArgs
+	}()
+	gotCode := -1
+	exitFunc = func(c int) { gotCode = c }
+	os.Args = []string{"atlas-doris", "version"}
+	main()
+	if gotCode != 0 {
+		t.Errorf("expected exit code 0 from main(), got %d", gotCode)
+	}
 }

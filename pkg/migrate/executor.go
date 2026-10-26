@@ -41,6 +41,27 @@ PROPERTIES (
     "enable_unique_key_merge_on_write" = "true"
 );`
 
+// StarRocksRevisionsTableDDL is the canonical StarRocks 4.x PRIMARY KEY DDL for atlas_schema_revisions.
+const StarRocksRevisionsTableDDL = `CREATE TABLE IF NOT EXISTS atlas_schema_revisions (
+    version VARCHAR(255) NOT NULL,
+    description VARCHAR(255) NOT NULL,
+    type INT NOT NULL DEFAULT "2",
+    applied INT NOT NULL DEFAULT "0",
+    total INT NOT NULL DEFAULT "0",
+    executed_at DATETIME NOT NULL,
+    execution_time BIGINT NOT NULL DEFAULT "0",
+    error STRING NULL,
+    error_stmt STRING NULL,
+    hash VARCHAR(255) NOT NULL,
+    partial_hashes ARRAY<VARCHAR(255)> NOT NULL DEFAULT "[]",
+    operator_version VARCHAR(255) NOT NULL
+)
+PRIMARY KEY(version)
+DISTRIBUTED BY HASH(version) BUCKETS 1
+PROPERTIES (
+    "enable_persistent_index" = "true"
+);`
+
 // RevisionRecord represents a row in atlas_schema_revisions.
 type RevisionRecord struct {
 	Version         string
@@ -86,10 +107,11 @@ type ApplyResult struct {
 	TotalExecutionDur time.Duration
 }
 
-// Executor manages migration status and execution against an Apache Doris FE endpoint.
+// Executor manages migration status and execution against an Apache Doris or StarRocks FE endpoint.
 type Executor struct {
 	db              *sql.DB
 	revisionsSchema string
+	dialect         string
 	pollInterval    time.Duration
 	pollTimeout     time.Duration
 }
@@ -99,16 +121,24 @@ func NewExecutor(db *sql.DB, revisionsSchema string) *Executor {
 	return &Executor{
 		db:              db,
 		revisionsSchema: strings.TrimSpace(revisionsSchema),
+		dialect:         "doris",
 		pollInterval:    200 * time.Millisecond,
 		pollTimeout:     2 * time.Minute,
 	}
 }
 
+// NewStarRocksExecutor creates an Executor configured for StarRocks 4.x.
+func NewStarRocksExecutor(db *sql.DB, revisionsSchema string) *Executor {
+	e := NewExecutor(db, revisionsSchema)
+	e.dialect = "starrocks"
+	return e
+}
+
 // DefaultSQLDriver is the database/sql driver name used by DialExecutor and InspectLiveSchema.
 var DefaultSQLDriver = "mysql"
 
-// DialExecutor parses rawURL ("doris://user:pass@host:port/db" or "mysql://..."),
-// opens a MySQL wire-protocol connection to Apache Doris FE, and returns an Executor.
+// DialExecutor parses rawURL ("doris://user:pass@host:port/db", "starrocks://...", or "mysql://..."),
+// opens a MySQL wire-protocol connection to Apache Doris or StarRocks FE, and returns an Executor.
 func DialExecutor(rawURL, revisionsSchema string) (*Executor, error) {
 	dsn, _, err := ParseDorisDSN(rawURL)
 	if err != nil {
@@ -117,6 +147,9 @@ func DialExecutor(rawURL, revisionsSchema string) (*Executor, error) {
 	db, err := sql.Open(DefaultSQLDriver, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open doris connection: %w", err)
+	}
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(rawURL)), "starrocks://") {
+		return NewStarRocksExecutor(db, revisionsSchema), nil
 	}
 	return NewExecutor(db, revisionsSchema), nil
 }
@@ -153,8 +186,8 @@ func ParseDorisDSN(rawURL string) (dsn string, dbName string, err error) {
 		return "", "", fmt.Errorf("invalid Doris URL %q: %w", rawURL, err)
 	}
 	scheme := strings.ToLower(u.Scheme)
-	if scheme != "doris" && scheme != "mysql" {
-		return "", "", fmt.Errorf("unsupported URL scheme %q (expected doris:// or mysql://)", u.Scheme)
+	if scheme != "doris" && scheme != "starrocks" && scheme != "mysql" {
+		return "", "", fmt.Errorf("unsupported URL scheme %q (expected doris://, starrocks://, or mysql://)", u.Scheme)
 	}
 	if u.Host == "" {
 		return "", "", fmt.Errorf("missing host in Doris URL %q", rawURL)
@@ -203,11 +236,15 @@ func (e *Executor) RevisionsTableQualifiedName() string {
 
 // RevisionsTableCreateSQL returns the CREATE TABLE IF NOT EXISTS DDL for atlas_schema_revisions.
 func (e *Executor) RevisionsTableCreateSQL() string {
+	baseDDL := RevisionsTableDDL
+	if e != nil && strings.EqualFold(e.dialect, "starrocks") {
+		baseDDL = StarRocksRevisionsTableDDL
+	}
 	qName := e.RevisionsTableQualifiedName()
 	if qName == RevisionsTableName {
-		return RevisionsTableDDL
+		return baseDDL
 	}
-	return strings.Replace(RevisionsTableDDL, "CREATE TABLE IF NOT EXISTS "+RevisionsTableName, "CREATE TABLE IF NOT EXISTS "+qName, 1)
+	return strings.Replace(baseDDL, "CREATE TABLE IF NOT EXISTS "+RevisionsTableName, "CREATE TABLE IF NOT EXISTS "+qName, 1)
 }
 
 // EnsureRevisionsTable creates the revisions schema (if configured) and the
@@ -244,7 +281,7 @@ func (e *Executor) AppliedRevisions(ctx context.Context) ([]RevisionRecord, erro
 	if err != nil {
 		return nil, fmt.Errorf("query %s: %w", e.RevisionsTableQualifiedName(), err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var records []RevisionRecord
 	for rows.Next() {
@@ -561,7 +598,12 @@ func (e *Executor) waitForAsyncDorisJob(ctx context.Context, fullTableName, show
 	shortTable := parts[len(parts)-1]
 	dbPrefix := ""
 	if len(parts) >= 2 {
-		dbPrefix = " FROM " + strings.Join(parts[:len(parts)-1], ".")
+		dbParts := parts[:len(parts)-1]
+		if len(dbParts) == 2 && (e.dialect == "starrocks" || strings.EqualFold(dbParts[0], "default_catalog")) &&
+			(strings.EqualFold(dbParts[0], "internal") || strings.EqualFold(dbParts[0], "default_catalog")) {
+			dbParts = dbParts[1:]
+		}
+		dbPrefix = " FROM " + strings.Join(dbParts, ".")
 	}
 	query := fmt.Sprintf("%s%s WHERE TableName = '%s';", showPrefix, dbPrefix, shortTable)
 
@@ -588,7 +630,7 @@ func (e *Executor) waitForAsyncDorisJob(ctx context.Context, fullTableName, show
 		case "", "FINISHED":
 			return nil
 		case "CANCELLED", "CANCELED", "FAILED":
-			return fmt.Errorf("Doris async schema change job for table %q was %s", fullTableName, upperState)
+			return fmt.Errorf("doris async schema change job for table %q was %s", fullTableName, upperState)
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timed out waiting for Doris schema change job on %q (last state=%q)", fullTableName, state)
@@ -618,7 +660,7 @@ func (e *Executor) queryLatestAlterState(ctx context.Context, query string) (str
 	if err != nil {
 		return "", err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	cols, err := rows.Columns()
 	if err != nil {

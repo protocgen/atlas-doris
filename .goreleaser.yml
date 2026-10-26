@@ -1,10 +1,43 @@
 version: 2
 
 builds:
-  - main: ./cmd/atlas-doris
+  - id: atlas-doris
+    main: ./cmd/atlas-doris
     binary: atlas-doris
     env:
       - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X github.com/protocgen/atlas-doris/pkg/cli.Version=v{{ .Version }}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+  - id: atlas-olap
+    main: ./cmd/atlas-olap
+    binary: atlas-olap
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X github.com/protocgen/atlas-doris/pkg/cli.Version=v{{ .Version }}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+  - id: atlas-starrocks
+    main: ./cmd/atlas-starrocks
+    binary: atlas-starrocks
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X github.com/protocgen/atlas-doris/pkg/cli.Version=v{{ .Version }}
     goos:
       - linux
       - darwin

@@ -234,6 +234,103 @@ func TestParseDorisDSN(t *testing.T) {
 	if !strings.HasPrefix(dsn, "admin:secret@tcp(doris-fe.internal:9030)/tenant_duke?") {
 		t.Errorf("unexpected DSN: %q", dsn)
 	}
+
+	srDSN, srDB, err := migrate.ParseDorisDSN("starrocks://admin:secret@starrocks-fe.internal:9030/tenant_duke")
+	if err != nil {
+		t.Fatalf("ParseDorisDSN(starrocks://) failed: %v", err)
+	}
+	if srDB != "tenant_duke" {
+		t.Errorf("expected srDB=tenant_duke, got %q", srDB)
+	}
+	if !strings.HasPrefix(srDSN, "admin:secret@tcp(starrocks-fe.internal:9030)/tenant_duke?") {
+		t.Errorf("unexpected StarRocks DSN: %q", srDSN)
+	}
+}
+
+func TestStarRocksExecutor_RevisionsDDLAndDial(t *testing.T) {
+	ctx := context.Background()
+	db, mock := setupMockDB(t)
+
+	srExec := migrate.NewStarRocksExecutor(db, "internal.tenant_duke")
+	ddl := srExec.RevisionsTableCreateSQL()
+	if !strings.Contains(ddl, "PRIMARY KEY(version)") {
+		t.Errorf("expected StarRocks revisions DDL to use PRIMARY KEY(version), got:\n%s", ddl)
+	}
+	if !strings.Contains(ddl, `"enable_persistent_index" = "true"`) {
+		t.Errorf("expected StarRocks revisions DDL to enable persistent index, got:\n%s", ddl)
+	}
+	if strings.Contains(ddl, "UNIQUE KEY(version)") {
+		t.Errorf("expected StarRocks revisions DDL not to contain UNIQUE KEY(version), got:\n%s", ddl)
+	}
+	if err := srExec.EnsureRevisionsTable(ctx); err != nil {
+		t.Fatalf("EnsureRevisionsTable on StarRocksExecutor failed: %v", err)
+	}
+	if len(mock.executedSQL) == 0 || !strings.Contains(mock.executedSQL[len(mock.executedSQL)-1], "PRIMARY KEY(version)") {
+		t.Errorf("expected EnsureRevisionsTable to execute StarRocks PRIMARY KEY DDL, got: %v", mock.executedSQL)
+	}
+
+	origDriver := migrate.DefaultSQLDriver
+	migrate.DefaultSQLDriver = "mockdoris"
+	t.Cleanup(func() { migrate.DefaultSQLDriver = origDriver })
+
+	dialedSR, err := migrate.DialExecutor("starrocks://root:pass@localhost:9030/tenant_duke", "internal.tenant_duke")
+	if err != nil {
+		t.Fatalf("DialExecutor(starrocks://) failed: %v", err)
+	}
+	defer func() { _ = dialedSR.Close() }()
+	if !strings.Contains(dialedSR.RevisionsTableCreateSQL(), "PRIMARY KEY(version)") {
+		t.Errorf("expected DialExecutor(starrocks://) to configure StarRocks revisions DDL, got:\n%s", dialedSR.RevisionsTableCreateSQL())
+	}
+
+	// Verify StarRocksRevisionsTableDDL parses cleanly via doris.ParseSchema
+	parsedRev, err := doris.ParseSchema(migrate.StarRocksRevisionsTableDDL)
+	if err != nil || len(parsedRev.Tables) != 1 || parsedRev.Tables[0].Key.Kind != doris.KeyPrimary {
+		t.Fatalf("ParseSchema(StarRocksRevisionsTableDDL) failed: parsed=%+v err=%v", parsedRev, err)
+	}
+
+	// Verify StarRocksExecutor strips default catalog prefix (internal. / default_catalog.) in SHOW ALTER TABLE COLUMN polling
+	migDir := t.TempDir()
+	migSQL := strings.Join([]string{
+		"CREATE TABLE IF NOT EXISTS internal.tenant_acme.patients (patient_id VARCHAR(64) NOT NULL, mrn VARCHAR(32) NOT NULL DEFAULT \"\") PRIMARY KEY(patient_id) DISTRIBUTED BY HASH(patient_id) BUCKETS 4 PROPERTIES (\"enable_persistent_index\" = \"true\");",
+		"ALTER TABLE internal.tenant_acme.patients MODIFY COLUMN mrn VARCHAR(64) NOT NULL DEFAULT \"\";",
+		"ALTER TABLE default_catalog.tenant_acme.patients ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT \"ACTIVE\";",
+	}, "\n\n") + "\n"
+	if err := os.WriteFile(filepath.Join(migDir, "20261026000001_sr_alter.sql"), []byte(migSQL), 0o644); err != nil {
+		t.Fatalf("write sr_alter.sql: %v", err)
+	}
+	if err := migrate.HashDir(migDir); err != nil {
+		t.Fatalf("HashDir(migDir): %v", err)
+	}
+
+	mock.executedSQL = nil
+	if _, err := srExec.Apply(ctx, migrate.ApplyOptions{
+		DirPath:      migDir,
+		PollInterval: 5 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("srExec.Apply failed: %v", err)
+	}
+	foundStrippedPoll := false
+	for _, q := range mock.executedSQL {
+		if q == "SHOW ALTER TABLE COLUMN FROM tenant_acme WHERE TableName = 'patients';" {
+			foundStrippedPoll = true
+		}
+		if strings.Contains(q, "SHOW ALTER TABLE COLUMN FROM internal.") || strings.Contains(q, "SHOW ALTER TABLE COLUMN FROM default_catalog.") {
+			t.Errorf("unexpected catalog prefix in StarRocks SHOW ALTER TABLE COLUMN query: %q", q)
+		}
+	}
+	if !foundStrippedPoll {
+		t.Errorf("expected StarRocksExecutor to poll 'SHOW ALTER TABLE COLUMN FROM tenant_acme WHERE TableName = 'patients';', got: %v", mock.executedSQL)
+	}
+
+	// Verify InspectLiveSchema on starrocks:// stamps Dialect="starrocks" and InspectTableFromInfoSchema on default_catalog / PRI
+	sLiveSR, err := migrate.InspectLiveSchema(ctx, "starrocks://root@localhost:9030/default_catalog.tenant_duke")
+	if err != nil || len(sLiveSR.Tables) == 0 || !sLiveSR.Tables[0].IsStarRocksTable() {
+		t.Fatalf("InspectLiveSchema(starrocks://) failed to preserve StarRocks dialect: tables=%+v err=%v", sLiveSR, err)
+	}
+	tblPri, err := migrate.InspectTableFromInfoSchema(ctx, db, "default_catalog", "tenant_duke", "pri_tbl")
+	if err != nil || tblPri.Key == nil || tblPri.Key.Kind != doris.KeyPrimary || !tblPri.IsStarRocksTable() {
+		t.Fatalf("InspectTableFromInfoSchema(default_catalog, pri_tbl) = (%+v, %v)", tblPri, err)
+	}
 }
 
 // In-process mock SQL driver to test Executor end-to-end (revisions table, async polling, status, apply)
@@ -428,6 +525,14 @@ func (s *mockStmt) Query(args []driver.Value) (driver.Rows, error) {
 	}
 
 	if strings.Contains(q, "information_schema") && strings.Contains(q, "columns") {
+		if len(args) >= 2 && fmt.Sprint(args[1]) == "pri_tbl" {
+			return &mockRows{
+				cols: []string{"COLUMN_NAME", "COLUMN_TYPE", "IS_NULLABLE", "COLUMN_KEY", "COLUMN_DEFAULT", "COLUMN_COMMENT"},
+				rows: [][]driver.Value{
+					{"id", "VARCHAR(64)", "NO", "PRI", nil, "Primary key"},
+				},
+			}, nil
+		}
 		if len(args) >= 2 && fmt.Sprint(args[1]) == "dup_tbl" {
 			return &mockRows{
 				cols: []string{"COLUMN_NAME", "COLUMN_TYPE", "IS_NULLABLE", "COLUMN_KEY", "COLUMN_DEFAULT", "COLUMN_COMMENT"},
@@ -463,9 +568,10 @@ func (s *mockStmt) Query(args []driver.Value) (driver.Rows, error) {
 		var rows [][]driver.Value
 		for idx, r := range s.c.m.revisions {
 			var execVal any = r.ExecutedAt.Format("2006-01-02 15:04:05.000000")
-			if idx%3 == 1 {
+			switch idx % 3 {
+			case 1:
 				execVal = r.ExecutedAt
-			} else if idx%3 == 2 {
+			case 2:
 				execVal = []byte(r.ExecutedAt.Format(time.RFC3339Nano))
 			}
 			rows = append(rows, []driver.Value{

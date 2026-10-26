@@ -23,7 +23,7 @@ func IsReservedKeyword(colName string) bool {
 		"kill", "load", "export", "backup", "restore", "alter", "create", "drop",
 		"truncate", "rename", "replace", "insert", "update", "delete", "merge",
 		"into", "over", "window", "rows", "preceding", "following", "current",
-		"true", "false", "properties", "inverted", "ngram_bf", "ann", "bitmap":
+		"true", "false", "properties", "inverted", "ngram_bf", "ngrambf", "ann", "bitmap", "gin", "vector":
 		return true
 	default:
 		return false
@@ -250,6 +250,8 @@ func CanonicalSemanticType(raw string) string {
 		return "DATEV2"
 	case "DATETIME", "DATETIMEV2", "DATETIME(0)", "DATETIMEV2(0)":
 		return "DATETIMEV2"
+	case "TEXT", "STRING":
+		return "STRING"
 	}
 	if strings.HasPrefix(norm, "DATETIME(") && strings.HasSuffix(norm, ")") {
 		return "DATETIMEV2(" + strings.TrimPrefix(norm, "DATETIME(")
@@ -280,11 +282,11 @@ func FormatColumnDef(c *ColumnDef) string {
 		if strings.HasPrefix(NormalizeType(c.Type), "ARRAY<") && strings.TrimSpace(c.Default) == "[]" {
 			b.WriteString(" DEFAULT []")
 		} else {
-			b.WriteString(fmt.Sprintf(" DEFAULT %q", c.Default))
+			_, _ = fmt.Fprintf(&b, " DEFAULT %q", c.Default)
 		}
 	}
 	if c.Comment != "" {
-		b.WriteString(fmt.Sprintf(" COMMENT %q", c.Comment))
+		_, _ = fmt.Fprintf(&b, " COMMENT %q", c.Comment)
 	}
 	return b.String()
 }
@@ -300,18 +302,30 @@ func FormatIndexDefInline(idx *IndexDef) string {
 	b.WriteString(" (")
 	b.WriteString(FormatIdentList(idx.Columns))
 	b.WriteString(") USING ")
-	b.WriteString(strings.ToUpper(strings.TrimSpace(idx.Using)))
+	usingUpper := strings.ToUpper(strings.TrimSpace(idx.Using))
+	b.WriteString(usingUpper)
 	if len(idx.Properties) > 0 {
 		pairs := make([]string, len(idx.Properties))
 		for i, p := range idx.Properties {
 			pairs[i] = fmt.Sprintf("%q = %q", p.Key, p.Value)
 		}
-		b.WriteString(" PROPERTIES (")
-		b.WriteString(strings.Join(pairs, ", "))
-		b.WriteByte(')')
+		switch usingUpper {
+		case "GIN":
+			b.WriteByte('(')
+			b.WriteString(strings.Join(pairs, ", "))
+			b.WriteByte(')')
+		case "VECTOR", "NGRAMBF":
+			b.WriteString(" (")
+			b.WriteString(strings.Join(pairs, ", "))
+			b.WriteByte(')')
+		default:
+			b.WriteString(" PROPERTIES (")
+			b.WriteString(strings.Join(pairs, ", "))
+			b.WriteByte(')')
+		}
 	}
 	if idx.Comment != "" {
-		b.WriteString(fmt.Sprintf(" COMMENT %q", idx.Comment))
+		_, _ = fmt.Fprintf(&b, " COMMENT %q", idx.Comment)
 	}
 	return b.String()
 }
@@ -364,7 +378,7 @@ func FormatCreateTable(t *TableDef) string {
 
 	if t.Comment != "" {
 		b.WriteByte('\n')
-		b.WriteString(fmt.Sprintf("COMMENT %q", t.Comment))
+		_, _ = fmt.Fprintf(&b, "COMMENT %q", t.Comment)
 	}
 
 	if t.Partition != nil {
@@ -472,14 +486,16 @@ func FormatPlatformObject(p *PlatformObject) string {
 	switch p.Kind {
 	case "SET_DEFAULT_STORAGE_VAULT":
 		return fmt.Sprintf("SET %s AS DEFAULT STORAGE VAULT;", p.Name)
-	case "STORAGE_VAULT", "WORKLOAD_GROUP", "CATALOG", "RESOURCE":
+	case "SET_DEFAULT_STORAGE_VOLUME":
+		return fmt.Sprintf("SET %s AS DEFAULT STORAGE VOLUME;", p.Name)
+	case "STORAGE_VAULT", "STORAGE_VOLUME", "WORKLOAD_GROUP", "CATALOG", "EXTERNAL_CATALOG", "RESOURCE":
 		kw := strings.ReplaceAll(p.Kind, "_", " ")
 		ine := ""
 		if p.IfNotExists {
 			ine = "IF NOT EXISTS "
 		}
 		var b strings.Builder
-		b.WriteString(fmt.Sprintf("CREATE %s %s%s", kw, ine, p.Name))
+		_, _ = fmt.Fprintf(&b, "CREATE %s %s%s", kw, ine, p.Name)
 		if len(p.Properties) > 0 {
 			b.WriteString("\nPROPERTIES (\n")
 			lines := make([]string, len(p.Properties))
@@ -493,7 +509,7 @@ func FormatPlatformObject(p *PlatformObject) string {
 		return b.String()
 	case "ALTER_WORKLOAD_GROUP":
 		var b strings.Builder
-		b.WriteString(fmt.Sprintf("ALTER WORKLOAD GROUP %s", p.Name))
+		_, _ = fmt.Fprintf(&b, "ALTER WORKLOAD GROUP %s", p.Name)
 		if len(p.Properties) > 0 {
 			b.WriteString("\nPROPERTIES (\n")
 			lines := make([]string, len(p.Properties))

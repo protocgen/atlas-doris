@@ -7,7 +7,7 @@ import (
 )
 
 // ParseSchema parses a SQL or Atlas HCL document containing one or more Doris /
-// Iceberg DDL or table definitions and returns the resulting Schema state.
+// StarRocks / Iceberg DDL or table definitions and returns the resulting Schema state.
 func ParseSchema(sqlText string) (*Schema, error) {
 	if IsHCLContent(sqlText) {
 		return ParseHCL(sqlText)
@@ -16,7 +16,12 @@ func ParseSchema(sqlText string) (*Schema, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ReplayStatements(stmts)
+	s, err := ReplayStatements(stmts)
+	if err != nil {
+		return nil, err
+	}
+	applySchemaDialectHint(s, inferDialectHint(sqlText, ""))
+	return s, nil
 }
 
 // ReplayStatements replays a sequence of DDL statements in order to construct
@@ -51,7 +56,7 @@ func ApplyStatement(s *Schema, st Statement) error {
 			return fmt.Errorf("CREATE TABLE statement has nil TableDef")
 		}
 		for i, existing := range s.Tables {
-			if existing.LookupKey() == st.Table.LookupKey() {
+			if existing.DialectLookupKey() == st.Table.DialectLookupKey() {
 				if st.Table.IfNotExists {
 					return nil
 				}
@@ -387,10 +392,10 @@ func StripCommentsAndSplitStatements(sqlText string) ([]string, error) {
 		case '`':
 			inBacktick = true
 			cur.WriteByte(ch)
-		case '(':
+		case '(', '[':
 			parenDepth++
 			cur.WriteByte(ch)
-		case ')':
+		case ')', ']':
 			if parenDepth > 0 {
 				parenDepth--
 			}
@@ -482,6 +487,21 @@ func parseSingleStatement(raw string) (Statement, error) {
 				}
 				return Statement{Kind: StmtPlatformObject, Platform: po, RawSQL: trimmed}, nil
 			}
+			if w2 == "VOLUME" {
+				po, err := parsePlatformCreate(trimmed, "STORAGE_VOLUME", "CREATE STORAGE VOLUME")
+				if err != nil {
+					return Statement{}, err
+				}
+				return Statement{Kind: StmtPlatformObject, Platform: po, RawSQL: trimmed}, nil
+			}
+		case "EXTERNAL":
+			if w2 == "CATALOG" {
+				po, err := parsePlatformCreate(trimmed, "EXTERNAL_CATALOG", "CREATE EXTERNAL CATALOG")
+				if err != nil {
+					return Statement{}, err
+				}
+				return Statement{Kind: StmtPlatformObject, Platform: po, RawSQL: trimmed}, nil
+			}
 		case "WORKLOAD":
 			if w2 == "GROUP" {
 				po, err := parsePlatformCreate(trimmed, "WORKLOAD_GROUP", "CREATE WORKLOAD GROUP")
@@ -534,19 +554,29 @@ func parseSingleStatement(raw string) (Statement, error) {
 		}
 
 	case "SET":
-		// SET <vault> AS DEFAULT STORAGE VAULT
+		// SET <vault> AS DEFAULT STORAGE VAULT / SET <volume> AS DEFAULT STORAGE VOLUME
 		if len(tokens) >= 6 &&
 			strings.EqualFold(tokens[2], "AS") &&
 			strings.EqualFold(tokens[3], "DEFAULT") &&
-			strings.EqualFold(tokens[4], "STORAGE") &&
-			strings.EqualFold(tokens[5], "VAULT") {
-			vaultName := strings.Trim(tokens[1], "`")
-			po := &PlatformObject{
-				Kind:   "SET_DEFAULT_STORAGE_VAULT",
-				Name:   vaultName,
-				RawSQL: trimmed,
+			strings.EqualFold(tokens[4], "STORAGE") {
+			if strings.EqualFold(tokens[5], "VAULT") {
+				vaultName := strings.Trim(tokens[1], "`")
+				po := &PlatformObject{
+					Kind:   "SET_DEFAULT_STORAGE_VAULT",
+					Name:   vaultName,
+					RawSQL: trimmed,
+				}
+				return Statement{Kind: StmtPlatformObject, Platform: po, RawSQL: trimmed}, nil
 			}
-			return Statement{Kind: StmtPlatformObject, Platform: po, RawSQL: trimmed}, nil
+			if strings.EqualFold(tokens[5], "VOLUME") {
+				volName := strings.Trim(tokens[1], "`")
+				po := &PlatformObject{
+					Kind:   "SET_DEFAULT_STORAGE_VOLUME",
+					Name:   volName,
+					RawSQL: trimmed,
+				}
+				return Statement{Kind: StmtPlatformObject, Platform: po, RawSQL: trimmed}, nil
+			}
 		}
 	}
 
@@ -879,6 +909,19 @@ func parseIndexDef(item string) (*IndexDef, error) {
 			rest = strings.TrimSpace(afterProp[afterPropIdx:])
 			continue
 		}
+		if strings.HasPrefix(rest, "(") {
+			propInside, afterPropIdx, ok := extractBalancedParens(rest, 0)
+			if !ok {
+				return nil, fmt.Errorf("index %s: unbalanced properties parentheses", idxName)
+			}
+			parsedProps, err := parsePropertiesBody(propInside)
+			if err != nil {
+				return nil, fmt.Errorf("index %s properties: %w", idxName, err)
+			}
+			props = append(props, parsedProps...)
+			rest = strings.TrimSpace(rest[afterPropIdx:])
+			continue
+		}
 		if afterComment := consumeKeywordCI(rest, "COMMENT"); afterComment != rest {
 			val, rem, err := consumeQuotedOrToken(afterComment)
 			if err != nil {
@@ -1205,6 +1248,9 @@ func parseCreateTableTail(tbl *TableDef, tail string) error {
 }
 
 func consumeKeyClausePrefix(s string) (KeyKind, string, bool) {
+	if after := consumePhraseCI(s, "PRIMARY", "KEY"); after != s {
+		return KeyPrimary, after, true
+	}
 	if after := consumePhraseCI(s, "UNIQUE", "KEY"); after != s {
 		return KeyUnique, after, true
 	}
@@ -1560,7 +1606,7 @@ func consumeSQLType(s string) (string, string, error) {
 	}
 
 	// Read base type word
-	if !((s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z')) {
+	if (s[0] < 'a' || s[0] > 'z') && (s[0] < 'A' || s[0] > 'Z') {
 		return "", "", fmt.Errorf("invalid type start in %q", s)
 	}
 	i := 0
@@ -1572,7 +1618,7 @@ func consumeSQLType(s string) (string, string, error) {
 			break
 		}
 	}
-	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+	if i < len(s) && (s[i] == ' ' || s[i] == '\t') {
 		// Only consume whitespace if followed by '(' or '<'
 		j := i
 		for j < len(s) && (s[j] == ' ' || s[j] == '\t') {
@@ -1581,7 +1627,6 @@ func consumeSQLType(s string) (string, string, error) {
 		if j < len(s) && (s[j] == '(' || s[j] == '<') {
 			i = j
 		}
-		break
 	}
 
 	if i < len(s) && s[i] == '(' {
@@ -1642,9 +1687,9 @@ func extractBalancedParens(s string, openIdx int) (string, int, bool) {
 			inDouble = true
 		case '`':
 			inBacktick = true
-		case '(':
+		case '(', '[':
 			depth++
-		case ')':
+		case ')', ']':
 			depth--
 			if depth == 0 {
 				return s[openIdx+1 : i], i + 1, true
@@ -1660,10 +1705,10 @@ func extractBalancedAngles(s string, openIdx int) (string, int, bool) {
 	}
 	depth := 0
 	for i := openIdx; i < len(s); i++ {
-		ch := s[i]
-		if ch == '<' {
+		switch s[i] {
+		case '<':
 			depth++
-		} else if ch == '>' {
+		case '>':
 			depth--
 			if depth == 0 {
 				return s[openIdx+1 : i], i + 1, true
@@ -1724,10 +1769,10 @@ func splitTopLevelComma(s string) []string {
 		case '`':
 			inBacktick = true
 			cur.WriteByte(ch)
-		case '(':
+		case '(', '[':
 			parenDepth++
 			cur.WriteByte(ch)
-		case ')':
+		case ')', ']':
 			if parenDepth > 0 {
 				parenDepth--
 			}

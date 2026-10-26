@@ -9,8 +9,8 @@ import (
 	"github.com/protocgen/atlas-doris/pkg/doris"
 )
 
-// InspectLiveSchema connects to a live Doris / MySQL-protocol database URL
-// (doris://... or mysql://...) and inspects its schema into a *doris.Schema.
+// InspectLiveSchema connects to a live Doris / StarRocks / MySQL-protocol database URL
+// (doris://..., starrocks://..., or mysql://...) and inspects its schema into a *doris.Schema.
 func InspectLiveSchema(ctx context.Context, rawURL string) (*doris.Schema, error) {
 	dsn, dbName, err := ParseDorisDSN(rawURL)
 	if err != nil {
@@ -20,8 +20,19 @@ func InspectLiveSchema(ctx context.Context, rawURL string) (*doris.Schema, error
 	if err != nil {
 		return nil, fmt.Errorf("open doris connection: %w", err)
 	}
-	defer db.Close()
-	return InspectSchemaFromDB(ctx, db, dbName)
+	defer func() { _ = db.Close() }()
+	s, err := InspectSchemaFromDB(ctx, db, dbName)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(rawURL)), "starrocks://") {
+		for _, t := range s.Tables {
+			if !t.IsIcebergTable() && t.Dialect == "" {
+				t.Dialect = "starrocks"
+			}
+		}
+	}
+	return s, nil
 }
 
 // InspectSchemaFromDB inspects the tables and views in defaultDB from an open *sql.DB
@@ -55,7 +66,7 @@ func InspectSchemaFromDB(ctx context.Context, db *sql.DB, defaultDB string) (*do
 
 	showTablesQuery := "SHOW FULL TABLES;"
 	if shortDB != "" {
-		if catalog != "" && !strings.EqualFold(catalog, "internal") {
+		if catalog != "" && !strings.EqualFold(catalog, "internal") && !strings.EqualFold(catalog, "default_catalog") {
 			showTablesQuery = fmt.Sprintf("SHOW FULL TABLES FROM %s.%s;", catalog, shortDB)
 		} else {
 			showTablesQuery = fmt.Sprintf("SHOW FULL TABLES FROM %s;", shortDB)
@@ -66,7 +77,7 @@ func InspectSchemaFromDB(ctx context.Context, db *sql.DB, defaultDB string) (*do
 	if err != nil {
 		return nil, fmt.Errorf("query tables (%s): %w", showTablesQuery, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	cols, err := rows.Columns()
 	if err != nil {
@@ -152,6 +163,9 @@ func InspectSchemaFromDB(ctx context.Context, db *sql.DB, defaultDB string) (*do
 					if t.Catalog == "" && catalog != "" {
 						t.Catalog = catalog
 					}
+					if strings.EqualFold(catalog, "default_catalog") && !t.IsIcebergTable() && t.Dialect == "" {
+						t.Dialect = "starrocks"
+					}
 					t.FullName = t.CanonicalName()
 					t.IfNotExists = true
 					s.Tables = append(s.Tables, t)
@@ -179,7 +193,7 @@ func queryCreateStatement(ctx context.Context, db *sql.DB, query string) (string
 	if err != nil {
 		return "", err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	cols, err := rows.Columns()
 	if err != nil {
@@ -220,6 +234,9 @@ func InspectTableFromInfoSchema(ctx context.Context, db *sql.DB, catalog, schema
 		Name:        tableName,
 		IfNotExists: true,
 	}
+	if strings.EqualFold(catalog, "default_catalog") {
+		tbl.Dialect = "starrocks"
+	}
 	tbl.FullName = tbl.CanonicalName()
 
 	colQuery := fmt.Sprintf(
@@ -233,7 +250,7 @@ func InspectTableFromInfoSchema(ctx context.Context, db *sql.DB, catalog, schema
 	if err != nil {
 		return nil, fmt.Errorf("inspect columns for %s: %w", tbl.FullName, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var keyCols []string
 	var keyKind doris.KeyKind
@@ -258,7 +275,13 @@ func InspectTableFromInfoSchema(ctx context.Context, db *sql.DB, catalog, schema
 		tbl.Columns = append(tbl.Columns, col)
 
 		switch strings.ToUpper(strings.TrimSpace(colKey)) {
-		case "UNI", "PRI":
+		case "PRI":
+			keyKind = doris.KeyPrimary
+			if tbl.Dialect == "" {
+				tbl.Dialect = "starrocks"
+			}
+			keyCols = append(keyCols, name)
+		case "UNI":
 			keyKind = doris.KeyUnique
 			keyCols = append(keyCols, name)
 		case "DUP":

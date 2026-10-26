@@ -130,11 +130,11 @@ func lintTableKeyAndANN(t *TableDef, colByName map[string]*ColumnDef) []Violatio
 		if !strings.EqualFold(strings.TrimSpace(idx.Using), "ANN") {
 			continue
 		}
-		if t.Key != nil && t.Key.Kind != KeyDuplicate {
+		if t.Key != nil && t.Key.Kind != KeyDuplicate && (t.Key.Kind != KeyUnique || !t.HasUniqueKeyMergeOnWrite()) {
 			violations = append(violations, Violation{
 				Rule:      DORIS006_SAFE_TYPE_EVOLUTION,
 				TableName: tblName,
-				Message:   fmt.Sprintf("ANN index %q is only supported on DUPLICATE KEY tables in Doris 4.x (found %s KEY)", idx.Name, t.Key.Kind),
+				Message:   fmt.Sprintf("ANN index %q is only supported on DUPLICATE KEY tables or UNIQUE KEY tables with merge-on-write enabled in Doris 4.x (found %s KEY)", idx.Name, t.Key.Kind),
 			})
 		}
 		if len(idx.Columns) != 1 {
@@ -159,11 +159,24 @@ func lintTableKeyAndANN(t *TableDef, colByName map[string]*ColumnDef) []Violatio
 			})
 		}
 		idxProps := propertiesToMap(idx.Properties)
-		if !strings.EqualFold(strings.TrimSpace(idxProps["index_type"]), "hnsw") {
+		indexType := strings.ToLower(strings.TrimSpace(idxProps["index_type"]))
+		switch indexType {
+		case "hnsw", "ivf", "ivf_on_disk":
+		default:
 			violations = append(violations, Violation{
 				Rule:      DORIS006_SAFE_TYPE_EVOLUTION,
 				TableName: tblName,
-				Message:   fmt.Sprintf("ANN index %q must set \"index_type\" = \"hnsw\"", idx.Name),
+				Message:   fmt.Sprintf("ANN index %q must set \"index_type\" to \"hnsw\", \"ivf\", or \"ivf_on_disk\" (got %q)", idx.Name, idxProps["index_type"]),
+			})
+		}
+		metricType := strings.ToLower(strings.TrimSpace(idxProps["metric_type"]))
+		switch metricType {
+		case "l2_distance", "inner_product", "cosine_distance":
+		default:
+			violations = append(violations, Violation{
+				Rule:      DORIS006_SAFE_TYPE_EVOLUTION,
+				TableName: tblName,
+				Message:   fmt.Sprintf("ANN index %q must set \"metric_type\" to \"l2_distance\", \"inner_product\", or \"cosine_distance\" (got %q)", idx.Name, idxProps["metric_type"]),
 			})
 		}
 		if dim, err := strconv.Atoi(strings.TrimSpace(idxProps["dim"])); err != nil || dim <= 0 {

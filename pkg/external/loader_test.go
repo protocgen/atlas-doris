@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/protocgen/atlas-doris/pkg/external"
+	"github.com/protocgen/atlas-doris/pkg/migrate"
 )
 
 func TestExternalSchema_SQLDirAndTargetFilters(t *testing.T) {
@@ -160,6 +161,15 @@ table "patients" {
 	if len(schemaAllMode.Tables) != 2 {
 		t.Fatalf("expected 2 deduplicated tables from doris_mode=all dir, got %d", len(schemaAllMode.Tables))
 	}
+	if len(external.FilterSchemaByTarget(schemaAllMode, external.TargetDoris).Tables) != 1 {
+		t.Errorf("expected FilterSchemaByTarget(TargetDoris) to keep 1 table")
+	}
+	if len(external.FilterSchemaByTarget(schemaAllMode, external.TargetIceberg).Tables) != 1 {
+		t.Errorf("expected FilterSchemaByTarget(TargetIceberg) to keep 1 table")
+	}
+	if len(external.FilterSchemaByTarget(schemaAllMode, external.TargetAll).Tables) != 2 {
+		t.Errorf("expected FilterSchemaByTarget(TargetAll) to keep 2 tables")
+	}
 
 	// Test --hcl-file and Format="hcl"
 	hclRendered, err := external.ExternalSchemaSQL(ctx, external.ExternalSchemaOptions{
@@ -171,5 +181,170 @@ table "patients" {
 	}
 	if !strings.Contains(hclRendered, `table "patients"`) || !strings.Contains(hclRendered, `unique_key`) {
 		t.Errorf("unexpected HCL output:\n%s", hclRendered)
+	}
+
+	// Test --hcl-dir, --sql-file, --url, and invalid Format rejection
+	hclDirRendered, err := external.ExternalSchemaSQL(ctx, external.ExternalSchemaOptions{
+		HCLDir:   tmpDir,
+		SQLFiles: []string{filepath.Join(tmpDir, "patient_profile_doris.sql"), ""},
+		HCLFiles: []string{""},
+		URL:      "file://" + tmpDir + "?target=doris",
+		Target:   external.TargetDoris,
+		Format:   "sql",
+	})
+	if err != nil {
+		t.Fatalf("ExternalSchemaSQL(HCLDir+SQLFiles+URL) failed: %v", err)
+	}
+	if !strings.Contains(hclDirRendered, "internal.tenant_${TENANT_SLUG}.patients") {
+		t.Errorf("unexpected HCLDir+URL output:\n%s", hclDirRendered)
+	}
+
+	if _, err := external.ExternalSchemaSQL(ctx, external.ExternalSchemaOptions{
+		SQLDir: tmpDir,
+		Format: "invalid_format",
+	}); err == nil {
+		t.Errorf("expected error for unsupported Format")
+	}
+
+	if _, err := external.ExternalSchemaSQL(ctx, external.ExternalSchemaOptions{}); err == nil {
+		t.Errorf("expected error for empty ExternalSchemaOptions")
+	}
+	if _, err := external.LoadSchema(ctx, "", external.LoadOptions{}); err == nil {
+		t.Errorf("expected error for empty LoadSchema URL")
+	}
+}
+
+func TestLoadFromPath_MigrationDirAndProtoURL(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Directory containing atlas.sum replays migrations
+	migDir := t.TempDir()
+	migSQL := "CREATE TABLE IF NOT EXISTS internal.tenant_test.encounters (encounter_id VARCHAR(64) NOT NULL) UNIQUE KEY(encounter_id) DISTRIBUTED BY HASH(encounter_id) BUCKETS 4;\n"
+	if err := os.WriteFile(filepath.Join(migDir, "20261025000001_init.sql"), []byte(migSQL), 0o644); err != nil {
+		t.Fatalf("write migration file: %v", err)
+	}
+	if err := migrate.HashDir(migDir); err != nil {
+		t.Fatalf("HashDir: %v", err)
+	}
+	replayedMig, err := external.LoadFromPath(migDir, external.TargetAll)
+	if err != nil {
+		t.Fatalf("LoadFromPath(migDir with atlas.sum): %v", err)
+	}
+	if len(replayedMig.Tables) != 1 {
+		t.Errorf("expected 1 table from migDir replay, got %d", len(replayedMig.Tables))
+	}
+
+	// Nonexistent path / empty dir / invalid SQL file errors
+	if _, err := external.LoadFromPath(filepath.Join(migDir, "does_not_exist"), external.TargetAll); err == nil {
+		t.Errorf("expected error for nonexistent path")
+	}
+	emptyDir := t.TempDir()
+	if _, err := external.LoadFromPath(emptyDir, external.TargetAll); err == nil {
+		t.Errorf("expected error on directory with no .sql/.hcl files")
+	}
+	badSQLFile := filepath.Join(emptyDir, "bad.sql")
+	if err := os.WriteFile(badSQLFile, []byte("CREATE TABLE broken ("), 0o644); err != nil {
+		t.Fatalf("write bad.sql: %v", err)
+	}
+	if _, err := external.LoadFromPath(badSQLFile, external.TargetAll); err == nil {
+		t.Errorf("expected error on invalid SQL file")
+	}
+	if _, err := external.LoadFromPath(emptyDir, external.TargetAll); err == nil {
+		t.Errorf("expected error on directory containing invalid SQL file")
+	}
+
+	// 2. Test proto:// URL loading using a fake protoc binary in PATH + fake plugin binary
+	binDir := t.TempDir()
+	fakePlugin := filepath.Join(binDir, "protoc-gen-proto2type")
+	if err := os.WriteFile(fakePlugin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write fake plugin: %v", err)
+	}
+	fakeProtoc := filepath.Join(binDir, "protoc")
+	fakeProtocScript := `#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in
+    --proto2type_out=*)
+      out_dir="${arg#--proto2type_out=}"
+      cat << 'EOF' > "$out_dir/fake_doris.hcl"
+table "proto_items" {
+  schema = schema.tenant_proto
+  column "item_id" {
+    type = varchar(64)
+    null = false
+  }
+  unique_key {
+    columns = [column.item_id]
+  }
+  distributed_by_hash {
+    columns = [column.item_id]
+    buckets = 4
+  }
+}
+EOF
+      ;;
+  esac
+done
+exit 0
+`
+	if err := os.WriteFile(fakeProtoc, []byte(fakeProtocScript), 0o755); err != nil {
+		t.Fatalf("write fake protoc: %v", err)
+	}
+
+	protoDir := t.TempDir()
+	protoFile := filepath.Join(protoDir, "item.proto")
+	if err := os.WriteFile(protoFile, []byte("syntax = \"proto3\";\npackage test;\n"), 0o644); err != nil {
+		t.Fatalf("write proto file: %v", err)
+	}
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	protoRendered, err := external.ExternalSchemaSQL(ctx, external.ExternalSchemaOptions{
+		ProtoPath:     protoDir + "?mode=hcl&target=doris&include=" + protoDir + "&plugin=" + fakePlugin,
+		ProtoIncludes: []string{protoDir},
+		Format:        "hcl",
+	})
+	if err != nil {
+		t.Fatalf("ExternalSchemaSQL(proto:// dir) failed: %v", err)
+	}
+	if !strings.Contains(protoRendered, `table "proto_items"`) {
+		t.Errorf("expected table proto_items from proto:// loader, got:\n%s", protoRendered)
+	}
+
+	// Single proto file with PATH lookup for protoc-gen-proto2type
+	sSingle, err := external.LoadSchema(ctx, "proto://"+protoFile+"?doris_mode=both", external.LoadOptions{})
+	if err != nil {
+		t.Fatalf("LoadSchema(proto:// single file) failed: %v", err)
+	}
+	if len(sSingle.Tables) != 1 {
+		t.Errorf("expected 1 table from single proto file, got %d", len(sSingle.Tables))
+	}
+
+	// Proto error paths: missing plugin, empty proto dir, nonexistent proto path
+	if _, err := external.LoadSchema(ctx, "proto://"+protoFile+"?plugin=/nonexistent/plugin", external.LoadOptions{}); err == nil {
+		t.Errorf("expected error for nonexistent explicit plugin")
+	}
+	if _, err := external.LoadSchema(ctx, "proto://"+t.TempDir(), external.LoadOptions{}); err == nil {
+		t.Errorf("expected error for directory with no .proto files")
+	}
+	if _, err := external.LoadSchema(ctx, "proto:///nonexistent/proto/dir", external.LoadOptions{}); err == nil {
+		t.Errorf("expected error for nonexistent proto path")
+	}
+	if _, err := external.LoadSchema(ctx, "doris://invalid_url_missing_host", external.LoadOptions{}); err == nil {
+		t.Errorf("expected error for invalid doris:// URL")
+	}
+
+	// Test PROTO2TYPE_DIR fallback when protoc-gen-proto2type is not in binDir
+	_ = os.Remove(fakePlugin)
+	fakeRepoDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeRepoDir, "protoc-gen-proto2type"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write fake repo plugin: %v", err)
+	}
+	t.Setenv("PROTO2TYPE_DIR", fakeRepoDir)
+	sFromBuiltPlugin, err := external.LoadSchema(ctx, "proto://"+protoFile, external.LoadOptions{})
+	if err != nil {
+		t.Fatalf("LoadSchema with PROTO2TYPE_DIR failed: %v", err)
+	}
+	if len(sFromBuiltPlugin.Tables) != 1 {
+		t.Errorf("expected 1 table from PROTO2TYPE_DIR, got %d", len(sFromBuiltPlugin.Tables))
 	}
 }

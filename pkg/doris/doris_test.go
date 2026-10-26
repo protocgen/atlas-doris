@@ -298,13 +298,49 @@ PROPERTIES (
 					Columns: []string{"embedding"},
 					Using:   "ANN",
 					Properties: []doris.Property{
-						{Key: "index_type", Value: "ivf"},
+						{Key: "index_type", Value: "flat"},
 						{Key: "dim", Value: "0"},
 					},
 				},
 			},
 		}
 		assertHasRule(t, doris.LintTable(badANN), doris.DORIS006_SAFE_TYPE_EVOLUTION)
+
+		// Valid ANN index on UNIQUE KEY table with merge-on-write enabled and IVF / HNSW
+		goodUniqueMoWANN := &doris.TableDef{
+			Name: "good_unique_mow_ann",
+			Key:  &doris.KeyClause{Kind: doris.KeyUnique, Columns: []string{"id"}},
+			Columns: []*doris.ColumnDef{
+				{Name: "id", Type: "VARCHAR(64)", Nullable: false},
+				{Name: "embedding", Type: "ARRAY<FLOAT>", Nullable: false},
+			},
+			Properties: []doris.Property{
+				{Key: "enable_unique_key_merge_on_write", Value: "true"},
+			},
+			Indexes: []*doris.IndexDef{
+				{
+					Name:    "idx_emb_ivf",
+					Columns: []string{"embedding"},
+					Using:   "ANN",
+					Properties: []doris.Property{
+						{Key: "index_type", Value: "ivf"},
+						{Key: "metric_type", Value: "inner_product"},
+						{Key: "dim", Value: "768"},
+					},
+				},
+			},
+		}
+		if v := doris.LintTable(goodUniqueMoWANN); len(v) != 0 {
+			t.Fatalf("expected 0 violations on UNIQUE KEY MoW table with valid IVF ANN index, got %v", v)
+		}
+
+		// Missing metric_type is rejected
+		missingMetricANN := goodUniqueMoWANN.Clone()
+		missingMetricANN.Indexes[0].Properties = []doris.Property{
+			{Key: "index_type", Value: "hnsw"},
+			{Key: "dim", Value: "768"},
+		}
+		assertHasRule(t, doris.LintTable(missingMetricANN), doris.DORIS006_SAFE_TYPE_EVOLUTION)
 	})
 
 	t.Run("DORIS007_FORBIDDEN_TYPE", func(t *testing.T) {
@@ -435,6 +471,27 @@ PROPERTIES (
 	iceDiffSQL := doris.FormatStatements(iceStmts)
 	if !strings.Contains(iceDiffSQL, "ALTER TABLE azra_lake.tenant_duke.patients ADD COLUMN status VARCHAR(32);") {
 		t.Errorf("expected Iceberg ADD COLUMN without NOT NULL or DEFAULT, got:\n%s", iceDiffSQL)
+	}
+	iceInitStmts, err := doris.ParseStatements(`
+CREATE TABLE IF NOT EXISTS azra_lake.tenant_duke.patients (
+    patient_id VARCHAR(64) NOT NULL
+)
+PROPERTIES (
+    "compression_codec" = "zstd"
+);`)
+	if err != nil {
+		t.Fatalf("ParseStatements(iceBefore): %v", err)
+	}
+	iceReplayed, err := doris.ReplayStatements(append(iceInitStmts, iceStmts...))
+	if err != nil {
+		t.Fatalf("ReplayStatements(ice): %v", err)
+	}
+	iceFollowUp, err := doris.Diff(iceReplayed, iceAfter)
+	if err != nil {
+		t.Fatalf("Diff(iceReplayed, iceAfter): %v", err)
+	}
+	if len(iceFollowUp) != 0 {
+		t.Fatalf("expected 0 follow-up statements after Iceberg ADD COLUMN, got:\n%s", doris.FormatStatements(iceFollowUp))
 	}
 }
 

@@ -371,3 +371,382 @@ DISTRIBUTED BY HASH(item_id) BUCKETS 4;`
 		t.Fatalf("round-trip mismatch on DEFAULT []")
 	}
 }
+
+func TestHCL_ViewsPlatformObjectsAndEngineRoundTrip(t *testing.T) {
+	sqlText := `
+CREATE STORAGE VAULT IF NOT EXISTS azra_vault
+PROPERTIES (
+    "type" = "S3",
+    "s3.bucket" = "azra-bucket"
+);
+
+SET azra_vault AS DEFAULT STORAGE VAULT;
+
+CREATE DATABASE IF NOT EXISTS internal.tenant_duke;
+
+CREATE TABLE IF NOT EXISTS internal.tenant_duke.events (
+    event_id VARCHAR(64) NOT NULL,
+    payload TEXT
+)
+ENGINE = OLAP
+UNIQUE KEY(event_id)
+DISTRIBUTED BY HASH(event_id) BUCKETS 4;
+
+CREATE OR REPLACE VIEW internal.tenant_duke.vw_events AS
+SELECT event_id, payload FROM internal.tenant_duke.events;
+`
+	s1, err := doris.ParseSchema(sqlText)
+	if err != nil {
+		t.Fatalf("ParseSchema failed: %v", err)
+	}
+	hclText := doris.FormatHCL(s1)
+	if !strings.Contains(hclText, `platform_object "STORAGE_VAULT" "azra_vault"`) ||
+		!strings.Contains(hclText, `view "vw_events"`) ||
+		!strings.Contains(hclText, `engine = "OLAP"`) {
+		t.Fatalf("FormatHCL missing expected blocks/attributes:\n%s", hclText)
+	}
+
+	s2, err := doris.ParseHCL(hclText)
+	if err != nil {
+		t.Fatalf("ParseHCL failed: %v\n%s", err, hclText)
+	}
+	if len(s2.PlatformObjects) != 2 || len(s2.Views) != 1 || len(s2.Tables) != 1 {
+		t.Fatalf("unexpected counts after HCL round-trip: platform=%d views=%d tables=%d", len(s2.PlatformObjects), len(s2.Views), len(s2.Tables))
+	}
+	if s2.Tables[0].Engine != "OLAP" {
+		t.Errorf("expected Engine=OLAP after HCL round-trip, got %q", s2.Tables[0].Engine)
+	}
+	if doris.FormatHCL(s2) != hclText {
+		t.Fatalf("FormatHCL not idempotent with views & platform objects:\n--- 1 ---\n%s\n--- 2 ---\n%s", hclText, doris.FormatHCL(s2))
+	}
+}
+
+func TestAlterTable_AddAndModifyColumn_FirstAndAfter(t *testing.T) {
+	stmts, err := doris.ParseStatements(`
+CREATE TABLE IF NOT EXISTS internal.tenant_duke.patients (
+    patient_id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(32) NOT NULL DEFAULT ""
+)
+UNIQUE KEY(patient_id)
+DISTRIBUTED BY HASH(patient_id) BUCKETS 4;
+
+ALTER TABLE internal.tenant_duke.patients ADD COLUMN tenant_id VARCHAR(64) NOT NULL DEFAULT "" FIRST;
+ALTER TABLE internal.tenant_duke.patients ADD COLUMN middle_name VARCHAR(64) AFTER patient_id;
+ALTER TABLE internal.tenant_duke.patients MODIFY COLUMN mrn VARCHAR(64) NOT NULL DEFAULT "" AFTER tenant_id;
+`)
+	if err != nil {
+		t.Fatalf("ParseStatements failed: %v", err)
+	}
+	if !strings.HasSuffix(stmts[1].SQL(), "FIRST;") {
+		t.Errorf("expected FIRST in stmts[1].SQL(), got %s", stmts[1].SQL())
+	}
+	if !strings.HasSuffix(stmts[2].SQL(), "AFTER patient_id;") {
+		t.Errorf("expected AFTER patient_id in stmts[2].SQL(), got %s", stmts[2].SQL())
+	}
+	if !strings.HasSuffix(stmts[3].SQL(), "AFTER tenant_id;") {
+		t.Errorf("expected AFTER tenant_id in stmts[3].SQL(), got %s", stmts[3].SQL())
+	}
+
+	replayed, err := doris.ReplayStatements(stmts)
+	if err != nil {
+		t.Fatalf("ReplayStatements failed: %v", err)
+	}
+	tbl := replayed.Tables[0]
+	var gotOrder []string
+	for _, c := range tbl.Columns {
+		gotOrder = append(gotOrder, c.Name)
+	}
+	wantOrder := "tenant_id,mrn,patient_id,middle_name"
+	if strings.Join(gotOrder, ",") != wantOrder {
+		t.Fatalf("column order = %q, want %q", strings.Join(gotOrder, ","), wantOrder)
+	}
+}
+
+func TestDoris_AdditionalParserDifferFormatterLinterAndHCLBranches(t *testing.T) {
+	// 1. Test ExpandEnv (${VAR:-default}, ${VAR}, $VAR) and HCL rollup + explicit partition definitions
+	t.Setenv("TEST_DORIS_BUCKETS", "12")
+	hclWithEnv := doris.ExpandEnv(`
+schema "analytics" {
+  catalog = "internal"
+}
+
+table "events_summary" {
+  schema = schema.analytics
+  column "event_date" {
+    type = datev2
+    null = false
+  }
+  column "tenant_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "total_count" {
+    type = bigint
+    null = false
+    aggregate = "SUM"
+    default = "0"
+  }
+  aggregate_key {
+    columns = [column.event_date, column.tenant_id]
+  }
+  distributed_by_random {
+    buckets = "${TEST_DORIS_BUCKETS}"
+  }
+  partition_by_list {
+    columns = [column.tenant_id]
+    partitions = "(PARTITION p_default VALUES IN (\"default\"))"
+  }
+  rollup "r_by_date" {
+    columns = [column.event_date, column.total_count]
+  }
+  properties = {
+    replication_num = "${UNSET_VAR:-1}"
+  }
+}
+`, nil)
+	sEnv, err := doris.ParseHCL(hclWithEnv)
+	if err != nil {
+		t.Fatalf("ParseHCL(hclWithEnv) failed: %v", err)
+	}
+	if len(sEnv.Tables) != 1 || sEnv.Tables[0].Distribution.Buckets != "12" {
+		t.Errorf("unexpected distribution buckets: %+v", sEnv.Tables[0].Distribution)
+	}
+	formattedEnvHCL := doris.FormatHCL(sEnv)
+	if !strings.Contains(formattedEnvHCL, "partition_by_list") {
+		t.Errorf("expected partition_by_list in formatted HCL:\n%s", formattedEnvHCL)
+	}
+
+	// 2. Test PlatformObject formatting & diffing for WORKLOAD_GROUP, ALTER_WORKLOAD_GROUP, CATALOG, RESOURCE, DROP TABLE
+	platformSQL := `
+CREATE WORKLOAD GROUP IF NOT EXISTS wg_etl
+PROPERTIES (
+    "cpu_share" = "10"
+);
+
+ALTER WORKLOAD GROUP wg_etl
+PROPERTIES (
+    "cpu_share" = "20"
+);
+
+CREATE CATALOG IF NOT EXISTS azra_lake
+PROPERTIES (
+    "type" = "iceberg"
+);
+
+CREATE RESOURCE IF NOT EXISTS s3_res
+PROPERTIES (
+    "type" = "s3"
+);
+`
+	sPlat1, err := doris.ParseSchema(platformSQL)
+	if err != nil {
+		t.Fatalf("ParseSchema(platformSQL) failed: %v", err)
+	}
+	for _, po := range sPlat1.PlatformObjects {
+		po.RawSQL = ""
+		if doris.FormatPlatformObject(po) == "" {
+			t.Errorf("FormatPlatformObject(%s) returned empty", po.Kind)
+		}
+	}
+
+	// 3. Test Diff with AllowDestructive (DROP TABLE and DROP COLUMN), view diffing, and platform object diffing
+	sFrom, err := doris.ParseSchema(`
+CREATE DATABASE IF NOT EXISTS internal.tenant_duke;
+CREATE TABLE IF NOT EXISTS internal.tenant_duke.old_tbl (id VARCHAR(64) NOT NULL) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;
+CREATE TABLE IF NOT EXISTS internal.tenant_duke.keep_tbl (id VARCHAR(64) NOT NULL, dropped_col INT, kept_col VARCHAR(32)) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;
+`)
+	if err != nil {
+		t.Fatalf("ParseSchema(sFrom): %v", err)
+	}
+	sTo, err := doris.ParseSchema(`
+CREATE DATABASE IF NOT EXISTS internal.tenant_duke;
+CREATE TABLE IF NOT EXISTS internal.tenant_duke.keep_tbl (id VARCHAR(64) NOT NULL, kept_col VARCHAR(64)) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;
+CREATE OR REPLACE VIEW internal.tenant_duke.vw_keep AS SELECT id, kept_col FROM internal.tenant_duke.keep_tbl;
+`)
+	if err != nil {
+		t.Fatalf("ParseSchema(sTo): %v", err)
+	}
+	destructiveStmts, err := doris.DiffWithOptions(sFrom, sTo, doris.DiffOptions{
+		LintOptions: doris.LintOptions{AllowDestructive: true},
+	})
+	if err != nil {
+		t.Fatalf("DiffWithOptions(AllowDestructive=true) failed: %v", err)
+	}
+	diffOut := doris.FormatStatements(destructiveStmts)
+	if !strings.Contains(diffOut, "DROP TABLE IF EXISTS internal.tenant_duke.old_tbl;") ||
+		!strings.Contains(diffOut, "ALTER TABLE internal.tenant_duke.keep_tbl DROP COLUMN dropped_col;") ||
+		!strings.Contains(diffOut, "CREATE OR REPLACE VIEW") {
+		t.Errorf("unexpected destructive diff output:\n%s", diffOut)
+	}
+
+	// Replay destructive statements
+	fromInitStmts, err := doris.ParseStatements(doris.FormatSchema(sFrom))
+	if err != nil {
+		t.Fatalf("ParseStatements(sFrom): %v", err)
+	}
+	afterDestructive, err := doris.ReplayStatements(append(fromInitStmts, destructiveStmts...))
+	if err != nil {
+		t.Fatalf("ReplayStatements(destructive): %v", err)
+	}
+	if _, ok := afterDestructive.TableByName("internal.tenant_duke.old_tbl"); ok {
+		t.Errorf("expected old_tbl to be dropped after replay")
+	}
+
+	// 4. Test AST Equal/Clone helpers, partition_by_range with partitions in HCL, and additional HCL/SQL branches
+	rangeHCL := `
+table "range_events" {
+  schema = schema.analytics
+  column "event_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "event_day" {
+    type = datev2
+    null = false
+  }
+  duplicate_key {
+    columns = [column.event_id, column.event_day]
+  }
+  distributed_by_hash {
+    columns = [column.event_id]
+    buckets = "auto"
+  }
+  partition_by_range {
+    columns = [column.event_day]
+    partitions = "(PARTITION p2026 VALUES LESS THAN (\"2027-01-01\"))"
+  }
+}
+`
+	sRange, err := doris.ParseHCL(rangeHCL)
+	if err != nil {
+		t.Fatalf("ParseHCL(rangeHCL) failed: %v", err)
+	}
+	hclRangeOut := doris.FormatHCL(sRange)
+	if !strings.Contains(hclRangeOut, "partition_by_range") || !strings.Contains(hclRangeOut, "partitions = ") {
+		t.Errorf("expected partition_by_range with partitions in formatted HCL:\n%s", hclRangeOut)
+	}
+	sRange2, err := doris.ParseHCL(hclRangeOut)
+	if err != nil {
+		t.Fatalf("re-parse hclRangeOut failed: %v", err)
+	}
+	if !sRange.Tables[0].Columns[0].Equal(sRange2.Tables[0].Columns[0]) ||
+		!sRange.Tables[0].Partition.Equal(sRange2.Tables[0].Partition) ||
+		!sRange.Tables[0].Distribution.Equal(sRange2.Tables[0].Distribution) {
+		t.Errorf("expected Column, Partition, and Distribution Equal to return true on round-tripped range table")
+	}
+
+	// 5. Exercise additional parser/linter/AST edge cases
+	moreSQL := `
+CREATE SCHEMA IF NOT EXISTS azra_lake.analytics;
+
+CREATE TABLE azra_lake.analytics.items (
+    id VARCHAR(64) NOT NULL,
+    amount DECIMAL(10, 2) NOT NULL DEFAULT "0.00",
+    score DOUBLE,
+    created_at DATETIME NOT NULL
+)
+DUPLICATE KEY(id)
+COMMENT "Analytics items"
+PARTITION BY (day(created_at))
+ORDER BY (id, created_at)
+DISTRIBUTED BY RANDOM BUCKETS AUTO
+PROPERTIES (
+    "engine" = "iceberg",
+    "format-version" = "3"
+);
+
+ALTER TABLE azra_lake.analytics.items ADD COLUMN IF NOT EXISTS extra VARCHAR(32) NULL DEFAULT "x" COMMENT "extra col";
+ALTER TABLE azra_lake.analytics.items ADD INDEX idx_extra (extra) USING INVERTED PROPERTIES("parser" = "english") COMMENT "idx";
+BUILD INDEX idx_extra ON azra_lake.analytics.items;
+ALTER TABLE azra_lake.analytics.items DROP INDEX idx_extra;
+ALTER TABLE azra_lake.analytics.items SET ("compression" = "zstd");
+CREATE VIEW azra_lake.analytics.vw_items AS SELECT id, amount FROM azra_lake.analytics.items;
+DROP TABLE IF EXISTS azra_lake.analytics.nonexistent_tbl;
+`
+	moreStmts, err := doris.ParseStatements(moreSQL)
+	if err != nil {
+		t.Fatalf("ParseStatements(moreSQL) failed: %v", err)
+	}
+	for _, st := range moreStmts {
+		if st.SQL() == "" {
+			t.Errorf("expected non-empty SQL() for statement kind %s", st.Kind)
+		}
+	}
+	replayedMore, err := doris.ReplayStatements(moreStmts)
+	if err != nil {
+		t.Fatalf("ReplayStatements(moreStmts) failed: %v", err)
+	}
+	if len(replayedMore.Tables) != 1 || len(replayedMore.Views) != 1 {
+		t.Errorf("unexpected replayedMore counts: tables=%d views=%d", len(replayedMore.Tables), len(replayedMore.Views))
+	}
+
+	// Nil safety and Violation formatting
+	var nilSchema *doris.Schema
+	if nilSchema.Clone() != nil || doris.FormatSchema(nilSchema) != "" || doris.FormatHCL(nilSchema) != "" {
+		t.Errorf("expected nil schema helpers to return empty/nil")
+	}
+	v := doris.Violation{Rule: doris.DORIS001_IMMUTABLE_KEY, TableName: "t", ColumnName: "c", Message: "msg"}
+	if !strings.Contains(v.String(), "DORIS001_IMMUTABLE_KEY") || doris.ViolationsToError([]doris.Violation{v}) == nil {
+		t.Errorf("unexpected violation formatting: %s", v.String())
+	}
+	if doris.ViolationsToError(nil) != nil {
+		t.Errorf("expected nil error for empty violations")
+	}
+
+	// 6. Test diffPlatformObjects, IndexDef.Equal, LintTableEvolution nil cases, and HCL view/platform_object variants
+	sPlatEmpty := doris.NewSchema()
+	platDiffStmts, err := doris.Diff(sPlatEmpty, sPlat1)
+	if err != nil || len(platDiffStmts) != len(sPlat1.PlatformObjects) {
+		t.Errorf("expected %d platform diff stmts, got %d (err=%v)", len(sPlat1.PlatformObjects), len(platDiffStmts), err)
+	}
+	sPlatMod := sPlat1.Clone()
+	sPlatMod.PlatformObjects[0].Properties[0].Value = "HDFS"
+	platModStmts, err := doris.Diff(sPlat1, sPlatMod)
+	if err != nil || len(platModStmts) == 0 {
+		t.Errorf("expected platform diff stmt when property changed, got %d (err=%v)", len(platModStmts), err)
+	}
+
+	idxA := &doris.IndexDef{Name: "idx1", Columns: []string{"a"}, Using: "INVERTED", Properties: []doris.Property{{Key: "parser", Value: "english"}}}
+	idxB := idxA.Clone()
+	if !idxA.Equal(idxB) {
+		t.Errorf("expected cloned IndexDef to be Equal")
+	}
+	idxB.Properties[0].Value = "standard"
+	if idxA.Equal(idxB) || idxA.Equal(nil) {
+		t.Errorf("expected modified/nil IndexDef not to be Equal")
+	}
+
+	if len(doris.LintTableEvolution(nil, nil, doris.LintOptions{})) != 0 {
+		t.Errorf("expected 0 violations on LintTableEvolution(nil, nil)")
+	}
+	if len(doris.LintTableEvolution(sRange.Tables[0], nil, doris.LintOptions{AllowDestructive: false})) == 0 {
+		t.Errorf("expected violation on LintTableEvolution(tbl, nil) when AllowDestructive=false")
+	}
+	if len(doris.LintTableEvolution(sRange.Tables[0], nil, doris.LintOptions{AllowDestructive: true})) != 0 {
+		t.Errorf("expected 0 violations on LintTableEvolution(tbl, nil) when AllowDestructive=true")
+	}
+
+	hclViewAndPlat := `
+platform_object "WORKLOAD_GROUP" "wg_test" {
+  if_not_exists = true
+  raw_sql = "CREATE WORKLOAD GROUP IF NOT EXISTS wg_test PROPERTIES (\"cpu_share\" = \"10\");"
+  properties = {
+    cpu_share = "10"
+  }
+}
+
+view "analytics.vw_summary" {
+  catalog = "azra_lake"
+  or_replace = true
+  as = "SELECT 1"
+  raw_sql = "CREATE OR REPLACE VIEW azra_lake.analytics.vw_summary AS SELECT 1;"
+}
+`
+	sVP, err := doris.ParseSchemaAuto(hclViewAndPlat, "vp.hcl")
+	if err != nil || len(sVP.PlatformObjects) != 1 || len(sVP.Views) != 1 {
+		t.Fatalf("ParseSchemaAuto(hclViewAndPlat) failed: err=%v plat=%d views=%d", err, len(sVP.PlatformObjects), len(sVP.Views))
+	}
+	if doris.FormatHCL(sVP) == "" {
+		t.Errorf("expected non-empty FormatHCL(sVP)")
+	}
+}

@@ -2,19 +2,22 @@ package doris
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 )
 
 // IsHCLContent reports whether raw text appears to be an Atlas HCL schema document
-// (starting with a top-level `schema` or `table` block after stripping comments).
+// (starting with a top-level `schema`, `table`, `view`, or `platform_object` block after stripping comments).
 func IsHCLContent(raw string) bool {
 	s := skipLeadingCommentsAndSpace(raw)
 	if s == "" {
 		return false
 	}
 	tok, rest := readLeadingWord(s)
-	if tok != "schema" && tok != "table" {
+	switch tok {
+	case "schema", "table", "view", "platform_object":
+	default:
 		return false
 	}
 	rest = strings.TrimSpace(rest)
@@ -30,8 +33,9 @@ func ParseSchemaAuto(content, filename string) (*Schema, error) {
 	return ParseSchema(content)
 }
 
-// ParseHCL parses an Atlas HCL schema document (`schema "<name>"` and `table "<name>"` blocks,
-// including proto2type-generated *_doris.hcl and *_iceberg.hcl files) into a *Schema.
+// ParseHCL parses an Atlas HCL schema document (`schema "<name>"`, `table "<name>"`,
+// `view "<name>"`, and `platform_object "<kind>" "<name>"` blocks, including
+// proto2type-generated *_doris.hcl and *_iceberg.hcl files) into a *Schema.
 func ParseHCL(hclText string) (*Schema, error) {
 	cleaned, err := stripAtlasHCLComments(hclText)
 	if err != nil {
@@ -113,8 +117,36 @@ func ParseHCL(hclText string) (*Schema, error) {
 			tbl.IfNotExists = true
 			s.Tables = append(s.Tables, tbl)
 
+		case "view":
+			vw, err := parseHCLViewBlock(labels, body)
+			if err != nil {
+				return nil, err
+			}
+			if vw.Database == "" && defaultSchema != nil {
+				vw.Database = defaultSchema.Name
+				if vw.Catalog == "" && defaultSchema.Catalog != "" {
+					vw.Catalog = defaultSchema.Catalog
+				}
+			}
+			if vw.Database != "" && vw.Catalog == "" {
+				if sd, ok := schemaByName[vw.Database]; ok && sd.Catalog != "" {
+					vw.Catalog = sd.Catalog
+				} else {
+					vw.Catalog = "internal"
+				}
+			}
+			vw.FullName = vw.CanonicalName()
+			s.Views = append(s.Views, vw)
+
+		case "platform_object":
+			po, err := parseHCLPlatformObjectBlock(labels, body)
+			if err != nil {
+				return nil, err
+			}
+			s.PlatformObjects = append(s.PlatformObjects, po)
+
 		default:
-			return nil, fmt.Errorf("unexpected top-level HCL block %q (expected schema or table)", header)
+			return nil, fmt.Errorf("unexpected top-level HCL block %q (expected schema, table, view, or platform_object)", header)
 		}
 	}
 
@@ -134,6 +166,11 @@ func FormatHCL(s *Schema) string {
 		return ""
 	}
 	var blocks []string
+	for _, p := range s.PlatformObjects {
+		if blk := FormatPlatformObjectHCL(p); blk != "" {
+			blocks = append(blocks, blk)
+		}
+	}
 	for _, d := range s.Databases {
 		if blk := FormatDatabaseHCL(d); blk != "" {
 			blocks = append(blocks, blk)
@@ -141,6 +178,11 @@ func FormatHCL(s *Schema) string {
 	}
 	for _, t := range s.Tables {
 		if blk := FormatTableHCL(t); blk != "" {
+			blocks = append(blocks, blk)
+		}
+	}
+	for _, v := range s.Views {
+		if blk := FormatViewHCL(v); blk != "" {
 			blocks = append(blocks, blk)
 		}
 	}
@@ -159,6 +201,64 @@ func FormatDatabaseHCL(d *DatabaseDef) string {
 	fmt.Fprintf(&b, "schema %q {\n", d.Name)
 	if d.Catalog != "" {
 		fmt.Fprintf(&b, "  catalog = %q\n", d.Catalog)
+	}
+	b.WriteString("}")
+	return b.String()
+}
+
+// FormatViewHCL renders a single ViewDef as an Atlas HCL `view "<name>"` block.
+func FormatViewHCL(v *ViewDef) string {
+	if v == nil || (v.Name == "" && v.FullName == "") {
+		return ""
+	}
+	name := v.Name
+	if name == "" {
+		name = v.FullName
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "view %q {\n", name)
+	if v.Catalog != "" && !strings.EqualFold(v.Catalog, "internal") {
+		fmt.Fprintf(&b, "  catalog = %q\n", v.Catalog)
+	}
+	if v.Database != "" {
+		if strings.Contains(v.Database, "${") || !isValidHCLIdent(v.Database) {
+			fmt.Fprintf(&b, "  schema = %q\n", "schema."+v.Database)
+		} else {
+			fmt.Fprintf(&b, "  schema = schema.%s\n", v.Database)
+		}
+	}
+	if v.OrReplace {
+		b.WriteString("  or_replace = true\n")
+	}
+	if v.AsSQL != "" {
+		fmt.Fprintf(&b, "  as = %q\n", v.AsSQL)
+	}
+	if v.RawSQL != "" {
+		fmt.Fprintf(&b, "  raw_sql = %q\n", v.RawSQL)
+	}
+	b.WriteString("}")
+	return b.String()
+}
+
+// FormatPlatformObjectHCL renders a single PlatformObject as an Atlas HCL `platform_object "<kind>" "<name>"` block.
+func FormatPlatformObjectHCL(p *PlatformObject) string {
+	if p == nil || p.Kind == "" {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "platform_object %q %q {\n", p.Kind, p.Name)
+	if p.IfNotExists {
+		b.WriteString("  if_not_exists = true\n")
+	}
+	if p.RawSQL != "" {
+		fmt.Fprintf(&b, "  raw_sql = %q\n", p.RawSQL)
+	}
+	if len(p.Properties) > 0 {
+		b.WriteString("  properties = {\n")
+		for _, prop := range p.Properties {
+			fmt.Fprintf(&b, "    %s = %q\n", formatHCLPropKey(prop.Key), prop.Value)
+		}
+		b.WriteString("  }\n")
 	}
 	b.WriteString("}")
 	return b.String()
@@ -185,6 +285,9 @@ func FormatTableHCL(t *TableDef) string {
 	}
 	if t.Comment != "" {
 		fmt.Fprintf(&b, "  comment = %q\n", t.Comment)
+	}
+	if t.Engine != "" {
+		fmt.Fprintf(&b, "  engine = %q\n", t.Engine)
 	}
 
 	for _, c := range t.Columns {
@@ -354,6 +457,110 @@ func parseHCLSchemaBlock(labels []string, body string) (*DatabaseDef, error) {
 	return dbDef, nil
 }
 
+func parseHCLViewBlock(labels []string, body string) (*ViewDef, error) {
+	if len(labels) == 0 || strings.TrimSpace(labels[len(labels)-1]) == "" {
+		return nil, fmt.Errorf("view block missing view name label")
+	}
+	rawViewName := strings.TrimSpace(labels[len(labels)-1])
+	_, catalog, db, shortName := splitQualifiedName(rawViewName)
+	if len(labels) == 2 && db == "" {
+		db = strings.TrimPrefix(strings.TrimSpace(labels[0]), "schema.")
+	}
+	if !isValidHCLIdent(shortName) {
+		return nil, fmt.Errorf("invalid view name %q in Atlas HCL", shortName)
+	}
+	vw := &ViewDef{
+		Catalog:  catalog,
+		Database: db,
+		Name:     shortName,
+	}
+	items, err := parseHCLBodyItems(body)
+	if err != nil {
+		return nil, fmt.Errorf("view %q: %w", shortName, err)
+	}
+	for _, it := range items {
+		if it.IsBlock {
+			return nil, fmt.Errorf("view %q: unexpected nested block %q", shortName, it.BlockHeader)
+		}
+		switch it.Key {
+		case "schema":
+			rawSchema := strings.TrimPrefix(unquoteHCLString(it.Value), "schema.")
+			_, sCat, sDB, sShort := splitQualifiedName(rawSchema)
+			if sDB != "" && sCat == "" {
+				sCat = sDB
+			}
+			if sCat != "" && vw.Catalog == "" {
+				vw.Catalog = sCat
+			}
+			vw.Database = sShort
+		case "catalog":
+			vw.Catalog = unquoteHCLString(it.Value)
+		case "or_replace":
+			bVal, err := strconv.ParseBool(unquoteHCLString(it.Value))
+			if err != nil {
+				return nil, fmt.Errorf("view %q or_replace: %w", shortName, err)
+			}
+			vw.OrReplace = bVal
+		case "as":
+			vw.AsSQL = unquoteHCLString(it.Value)
+		case "raw_sql":
+			vw.RawSQL = unquoteHCLString(it.Value)
+		default:
+			return nil, fmt.Errorf("view %q: unsupported attribute %q", shortName, it.Key)
+		}
+	}
+	if vw.AsSQL == "" && vw.RawSQL == "" {
+		return nil, fmt.Errorf("view %q: requires as or raw_sql attribute", shortName)
+	}
+	return vw, nil
+}
+
+func parseHCLPlatformObjectBlock(labels []string, body string) (*PlatformObject, error) {
+	if len(labels) < 2 || strings.TrimSpace(labels[0]) == "" || strings.TrimSpace(labels[1]) == "" {
+		return nil, fmt.Errorf("platform_object block requires <kind> and <name> labels")
+	}
+	po := &PlatformObject{
+		Kind: strings.TrimSpace(labels[0]),
+		Name: strings.TrimSpace(labels[1]),
+	}
+	items, err := parseHCLBodyItems(body)
+	if err != nil {
+		return nil, fmt.Errorf("platform_object %q %q: %w", po.Kind, po.Name, err)
+	}
+	for _, it := range items {
+		if it.IsBlock {
+			bKind, _, err := parseHCLBlockHeader(it.BlockHeader)
+			if err != nil {
+				return nil, fmt.Errorf("platform_object %q %q: %w", po.Kind, po.Name, err)
+			}
+			if bKind != "properties" {
+				return nil, fmt.Errorf("platform_object %q %q: unsupported nested block %q", po.Kind, po.Name, bKind)
+			}
+			kvs, err := parseHCLKeyValueSlice(it.BlockBody)
+			if err != nil {
+				return nil, fmt.Errorf("platform_object %q %q properties: %w", po.Kind, po.Name, err)
+			}
+			for _, kv := range kvs {
+				po.Properties = append(po.Properties, Property{Key: kv.Key, Value: unquoteHCLString(kv.Value)})
+			}
+			continue
+		}
+		switch it.Key {
+		case "if_not_exists":
+			bVal, err := strconv.ParseBool(unquoteHCLString(it.Value))
+			if err != nil {
+				return nil, fmt.Errorf("platform_object %q %q if_not_exists: %w", po.Kind, po.Name, err)
+			}
+			po.IfNotExists = bVal
+		case "raw_sql":
+			po.RawSQL = unquoteHCLString(it.Value)
+		default:
+			return nil, fmt.Errorf("platform_object %q %q: unsupported attribute %q", po.Kind, po.Name, it.Key)
+		}
+	}
+	return po, nil
+}
+
 func parseHCLTableBlock(labels []string, body string) (*TableDef, error) {
 	if len(labels) == 0 || strings.TrimSpace(labels[len(labels)-1]) == "" {
 		return nil, fmt.Errorf("table block missing table name label")
@@ -494,6 +701,14 @@ func parseHCLTableBlock(labels []string, body string) (*TableDef, error) {
 			}
 			for _, kv := range kvs {
 				tbl.SetProperty(kv.Key, unquoteHCLString(kv.Value))
+			}
+
+		case "rollup":
+			if len(bLabels) != 1 || bLabels[0] == "" {
+				return nil, fmt.Errorf("table %q: rollup block requires a name label", shortName)
+			}
+			if _, err := parseHCLOrderByBlock(it.BlockBody); err != nil {
+				return nil, fmt.Errorf("table %q rollup %q: %w", shortName, bLabels[0], err)
 			}
 
 		default:
@@ -1300,4 +1515,51 @@ func readLeadingWord(s string) (string, string) {
 		}
 	}
 	return s[:i], s[i:]
+}
+
+// ExpandEnv expands ${VAR:-default}, ${VAR}, and $VAR placeholders using vars
+// first and os.Getenv as a fallback. Unresolved ${VAR} placeholders without a
+// default are preserved as-is so template variables like ${TENANT_SLUG} survive
+// when not explicitly overridden.
+func ExpandEnv(raw string, vars map[string]string) string {
+	lookup := func(key string) (string, bool) {
+		if vars != nil {
+			if v, ok := vars[key]; ok {
+				return v, true
+			}
+		}
+		if v, ok := os.LookupEnv(key); ok {
+			return v, true
+		}
+		return "", false
+	}
+
+	var b strings.Builder
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '$' && i+1 < len(raw) && raw[i+1] == '{' {
+			end := strings.IndexByte(raw[i+2:], '}')
+			if end >= 0 {
+				expr := raw[i+2 : i+2+end]
+				key := expr
+				defVal := ""
+				hasDef := false
+				if idx := strings.Index(expr, ":-"); idx >= 0 {
+					key = expr[:idx]
+					defVal = expr[idx+2:]
+					hasDef = true
+				}
+				if val, ok := lookup(key); ok && val != "" {
+					b.WriteString(val)
+				} else if hasDef {
+					b.WriteString(defVal)
+				} else {
+					b.WriteString(raw[i : i+2+end+1])
+				}
+				i += 2 + end
+				continue
+			}
+		}
+		b.WriteByte(raw[i])
+	}
+	return b.String()
 }

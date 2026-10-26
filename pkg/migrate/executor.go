@@ -104,6 +104,9 @@ func NewExecutor(db *sql.DB, revisionsSchema string) *Executor {
 	}
 }
 
+// DefaultSQLDriver is the database/sql driver name used by DialExecutor and InspectLiveSchema.
+var DefaultSQLDriver = "mysql"
+
 // DialExecutor parses rawURL ("doris://user:pass@host:port/db" or "mysql://..."),
 // opens a MySQL wire-protocol connection to Apache Doris FE, and returns an Executor.
 func DialExecutor(rawURL, revisionsSchema string) (*Executor, error) {
@@ -111,7 +114,7 @@ func DialExecutor(rawURL, revisionsSchema string) (*Executor, error) {
 	if err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open(DefaultSQLDriver, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open doris connection: %w", err)
 	}
@@ -409,11 +412,17 @@ func (e *Executor) Apply(ctx context.Context, opts ApplyOptions) (*ApplyResult, 
 	startAll := time.Now()
 
 	for _, f := range files {
-		if rev, ok := appliedByVersion[f.Version]; ok && rev.Error == "" {
+		resumeOffset := 0
+		if rev, ok := appliedByVersion[f.Version]; ok {
 			if rev.Hash != "" && f.Hash != "" && rev.Hash != f.Hash {
 				return nil, fmt.Errorf("applied migration %s (%s) checksum mismatch: db has %s, atlas.sum has %s", f.Version, f.Name, rev.Hash, f.Hash)
 			}
-			continue
+			if rev.Error == "" {
+				continue
+			}
+			if rev.Applied > 0 {
+				resumeOffset = rev.Applied
+			}
 		}
 
 		// Handle --baseline (or empty 00000000000000_* baseline file)
@@ -445,18 +454,21 @@ func (e *Executor) Apply(ctx context.Context, opts ApplyOptions) (*ApplyResult, 
 		if err != nil {
 			return nil, fmt.Errorf("migration %s rendered SQL parse error: %w", f.Name, err)
 		}
+		if resumeOffset > len(stmts) {
+			resumeOffset = len(stmts)
+		}
 
 		if opts.DryRun {
 			res.AppliedFiles = append(res.AppliedFiles, f.Name)
-			for _, st := range stmts {
+			for _, st := range stmts[resumeOffset:] {
 				res.ExecutedSQL = append(res.ExecutedSQL, st.SQL())
 			}
 			continue
 		}
 
 		fileStart := time.Now()
-		appliedCount := 0
-		for _, st := range stmts {
+		appliedCount := resumeOffset
+		for _, st := range stmts[resumeOffset:] {
 			stmtSQL := st.SQL()
 			if stmtSQL == "" {
 				continue
@@ -482,6 +494,19 @@ func (e *Executor) Apply(ctx context.Context, opts ApplyOptions) (*ApplyResult, 
 
 			if requiresAsyncJobWait(st) {
 				if err := e.waitForStatementJobCompletion(ctx, st); err != nil {
+					_ = e.RecordRevision(ctx, RevisionRecord{
+						Version:         f.Version,
+						Description:     f.Description,
+						Type:            2,
+						Applied:         appliedCount - 1,
+						Total:           len(stmts),
+						ExecutedAt:      time.Now().UTC(),
+						ExecutionTimeNs: time.Since(fileStart).Nanoseconds(),
+						Error:           err.Error(),
+						ErrorStmt:       stmtSQL,
+						Hash:            f.Hash,
+						OperatorVersion: OperatorVersion,
+					})
 					return nil, fmt.Errorf("migration %s async schema change on %s: %w", f.Name, st.TargetTable, err)
 				}
 			}
@@ -553,8 +578,10 @@ func (e *Executor) waitForAsyncDorisJob(ctx context.Context, fullTableName, show
 	for {
 		state, err := e.queryLatestAlterState(ctx, query)
 		if err != nil {
-			// If the mock/driver doesn't support SHOW ALTER TABLE COLUMN / SHOW BUILD INDEX or returns no rows, treat as complete.
-			return nil
+			if isUnsupportedShowQueryError(err) {
+				return nil
+			}
+			return err
 		}
 		upperState := strings.ToUpper(strings.TrimSpace(state))
 		switch upperState {
@@ -574,6 +601,18 @@ func (e *Executor) waitForAsyncDorisJob(ctx context.Context, fullTableName, show
 	}
 }
 
+func isUnsupportedShowQueryError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unsupported") ||
+		strings.Contains(msg, "not supported") ||
+		strings.Contains(msg, "syntax error") ||
+		strings.Contains(msg, "unknown command") ||
+		strings.Contains(msg, "unrecognized")
+}
+
 func (e *Executor) queryLatestAlterState(ctx context.Context, query string) (string, error) {
 	rows, err := e.db.QueryContext(ctx, query)
 	if err != nil {
@@ -586,17 +625,24 @@ func (e *Executor) queryLatestAlterState(ctx context.Context, query string) (str
 		return "", err
 	}
 	stateIdx := -1
+	jobIDIdx := -1
 	for i, c := range cols {
-		if strings.EqualFold(c, "State") {
+		switch {
+		case strings.EqualFold(c, "State"):
 			stateIdx = i
-			break
+		case strings.EqualFold(c, "JobId"):
+			jobIDIdx = i
 		}
 	}
 	if stateIdx < 0 {
 		return "FINISHED", nil
 	}
 
-	latestState := ""
+	type jobRow struct {
+		jobID string
+		state string
+	}
+	var allRows []jobRow
 	vals := make([]sql.RawBytes, len(cols))
 	scanArgs := make([]any, len(cols))
 	for i := range vals {
@@ -606,9 +652,59 @@ func (e *Executor) queryLatestAlterState(ctx context.Context, query string) (str
 		if err := rows.Scan(scanArgs...); err != nil {
 			return "", err
 		}
-		latestState = string(vals[stateIdx])
+		jid := ""
+		if jobIDIdx >= 0 {
+			jid = strings.TrimSpace(string(vals[jobIDIdx]))
+		}
+		allRows = append(allRows, jobRow{
+			jobID: jid,
+			state: strings.TrimSpace(string(vals[stateIdx])),
+		})
 	}
-	return latestState, rows.Err()
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if len(allRows) == 0 {
+		return "", nil
+	}
+
+	targetJobID := allRows[len(allRows)-1].jobID
+	if jobIDIdx >= 0 {
+		var maxJobNum int64 = -1
+		for _, r := range allRows {
+			if n, err := strconv.ParseInt(r.jobID, 10, 64); err == nil {
+				if n >= maxJobNum {
+					maxJobNum = n
+					targetJobID = r.jobID
+				}
+			} else if maxJobNum < 0 && r.jobID != "" {
+				targetJobID = r.jobID
+			}
+		}
+	}
+
+	var nonFinishedState string
+	latestState := ""
+	for _, r := range allRows {
+		if jobIDIdx >= 0 && targetJobID != "" && r.jobID != targetJobID {
+			continue
+		}
+		latestState = r.state
+		upper := strings.ToUpper(r.state)
+		switch upper {
+		case "CANCELLED", "CANCELED", "FAILED":
+			return r.state, nil
+		case "FINISHED":
+		default:
+			if nonFinishedState == "" {
+				nonFinishedState = r.state
+			}
+		}
+	}
+	if nonFinishedState != "" {
+		return nonFinishedState, nil
+	}
+	return latestState, nil
 }
 
 var templateVarPlaceholderRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)

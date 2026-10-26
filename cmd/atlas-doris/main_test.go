@@ -154,6 +154,69 @@ PROPERTIES (
 	if code != 0 || !strings.Contains(outVer, "atlas-doris") {
 		t.Errorf("unexpected version output: %q (code=%d)", outVer, code)
 	}
+
+	// 12. help command
+	outHelp, _, code := runCLI(ctx, "help")
+	if code != 0 || !strings.Contains(outHelp, "Usage:") {
+		t.Errorf("unexpected help output: %q (code=%d)", outHelp, code)
+	}
+
+	// 13. migrate diff no-op when already synced
+	outNoop, errOut, code := runCLI(ctx, "migrate", "diff", "noop_sync", "--dir", "file://"+migDir, "--to", "file://"+v2File)
+	if code != 0 || !strings.Contains(outNoop, "no changes to be made") {
+		t.Errorf("expected no changes output on synced migrate diff, got code=%d out=%q err=%q", code, outNoop, errOut)
+	}
+
+	// 14. schema diff no-op when identical
+	outDiffNoop, errOut, code := runCLI(ctx, "schema", "diff", "--from", "file://"+v2File, "--to", "file://"+v2File)
+	if code != 0 || !strings.Contains(outDiffNoop, "Schemas are identical") {
+		t.Errorf("expected Schemas are identical, got code=%d out=%q err=%q", code, outDiffNoop, errOut)
+	}
+
+	// 15. CLI validation and error paths
+	errorCases := [][]string{
+		{},
+		{"unknown-cmd"},
+		{"migrate"},
+		{"migrate", "unknown-sub"},
+		{"migrate", "diff"},
+		{"migrate", "diff", "--unknown-flag"},
+		{"migrate", "diff", "bad", "--dir", "file://" + migDir, "--to", "file:///nonexistent.sql", "--", "extra"},
+		{"migrate", "validate"},
+		{"migrate", "validate", "--unknown-flag"},
+		{"migrate", "validate", "--dir", "file:///nonexistent_dir"},
+		{"migrate", "hash"},
+		{"migrate", "hash", "--unknown-flag"},
+		{"migrate", "hash", "--dir", "file:///nonexistent_dir"},
+		{"migrate", "lint"},
+		{"migrate", "lint", "--unknown-flag"},
+		{"migrate", "lint", "--dir", "file://" + migDir, "--to", "file:///nonexistent.sql"},
+		{"migrate", "status"},
+		{"migrate", "status", "--unknown-flag"},
+		{"migrate", "status", "--dir", "file://" + migDir, "--url", "invalid://url"},
+		{"migrate", "apply"},
+		{"migrate", "apply", "--unknown-flag"},
+		{"migrate", "apply", "--dir", "file://" + migDir},
+		{"migrate", "apply", "--dir", "file://" + migDir, "--url", "invalid://url"},
+		{"migrate", "apply", "--dir", "file://" + migDir, "--dry-run", "--var", "BAD_VAR_NO_EQUALS"},
+		{"schema"},
+		{"schema", "unknown-sub"},
+		{"schema", "inspect"},
+		{"schema", "inspect", "--unknown-flag"},
+		{"schema", "inspect", "--url", "file:///nonexistent.sql"},
+		{"schema", "inspect", "--url", "file://" + v2File, "--format", "invalid"},
+		{"schema", "diff"},
+		{"schema", "diff", "--unknown-flag"},
+		{"schema", "diff", "--from", "file:///nonexistent.sql", "--to", "file://" + v2File},
+		{"schema", "diff", "--from", "file://" + v2File, "--to", "file:///nonexistent.sql"},
+		{"external-schema"},
+		{"external-schema", "--unknown-flag"},
+	}
+	for _, tc := range errorCases {
+		if _, _, c := runCLI(ctx, tc...); c == 0 {
+			t.Errorf("expected non-zero exit code for args %v", tc)
+		}
+	}
 }
 
 func runCLI(ctx context.Context, args ...string) (string, string, int) {

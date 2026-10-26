@@ -85,7 +85,30 @@ func ApplyStatement(s *Schema, st Statement) error {
 		if _, exists := tbl.ColumnByName(st.Column.Name); exists {
 			return fmt.Errorf("column %q already exists on table %q", st.Column.Name, tbl.CanonicalName())
 		}
-		tbl.Columns = append(tbl.Columns, st.Column.Clone())
+		newCol := st.Column.Clone()
+		if st.First {
+			tbl.Columns = append([]*ColumnDef{newCol}, tbl.Columns...)
+			return nil
+		}
+		if st.AfterColumn != "" {
+			afterIdx := -1
+			for i, c := range tbl.Columns {
+				if c.Name == st.AfterColumn {
+					afterIdx = i
+					break
+				}
+			}
+			if afterIdx < 0 {
+				return fmt.Errorf("AFTER column %q does not exist on table %q", st.AfterColumn, tbl.CanonicalName())
+			}
+			updated := make([]*ColumnDef, 0, len(tbl.Columns)+1)
+			updated = append(updated, tbl.Columns[:afterIdx+1]...)
+			updated = append(updated, newCol)
+			updated = append(updated, tbl.Columns[afterIdx+1:]...)
+			tbl.Columns = updated
+			return nil
+		}
+		tbl.Columns = append(tbl.Columns, newCol)
 		return nil
 
 	case StmtAlterTableDropColumn:
@@ -109,13 +132,44 @@ func ApplyStatement(s *Schema, st Statement) error {
 		if st.Column == nil {
 			return fmt.Errorf("ALTER TABLE MODIFY COLUMN has nil ColumnDef")
 		}
+		colIdx := -1
 		for i, c := range tbl.Columns {
 			if c.Name == st.Column.Name {
-				tbl.Columns[i] = st.Column.Clone()
-				return nil
+				colIdx = i
+				break
 			}
 		}
-		return fmt.Errorf("column %q does not exist on table %q", st.Column.Name, tbl.CanonicalName())
+		if colIdx < 0 {
+			return fmt.Errorf("column %q does not exist on table %q", st.Column.Name, tbl.CanonicalName())
+		}
+		modCol := st.Column.Clone()
+		tbl.Columns[colIdx] = modCol
+		if st.First {
+			without := append([]*ColumnDef(nil), tbl.Columns[:colIdx]...)
+			without = append(without, tbl.Columns[colIdx+1:]...)
+			tbl.Columns = append([]*ColumnDef{modCol}, without...)
+			return nil
+		}
+		if st.AfterColumn != "" {
+			without := append([]*ColumnDef(nil), tbl.Columns[:colIdx]...)
+			without = append(without, tbl.Columns[colIdx+1:]...)
+			afterIdx := -1
+			for i, c := range without {
+				if c.Name == st.AfterColumn {
+					afterIdx = i
+					break
+				}
+			}
+			if afterIdx < 0 {
+				return fmt.Errorf("AFTER column %q does not exist on table %q", st.AfterColumn, tbl.CanonicalName())
+			}
+			reordered := make([]*ColumnDef, 0, len(without)+1)
+			reordered = append(reordered, without[:afterIdx+1]...)
+			reordered = append(reordered, modCol)
+			reordered = append(reordered, without[afterIdx+1:]...)
+			tbl.Columns = reordered
+		}
+		return nil
 
 	case StmtAlterTableAddIndex:
 		tbl, ok := s.TableByName(st.TargetTable)
@@ -589,7 +643,7 @@ func parseAlterTable(stmt string) (Statement, error) {
 
 	if after := consumePhraseCI(afterTbl, "ADD", "COLUMN"); after != afterTbl {
 		after = consumePhraseCI(after, "IF", "NOT", "EXISTS")
-		col, err := parseColumnDef(strings.TrimSpace(after))
+		col, isFirst, afterCol, err := parseColumnDefWithPosition(strings.TrimSpace(after))
 		if err != nil {
 			return Statement{}, fmt.Errorf("ALTER TABLE %s ADD COLUMN: %w", targetTable, err)
 		}
@@ -597,6 +651,8 @@ func parseAlterTable(stmt string) (Statement, error) {
 			Kind:        StmtAlterTableAddColumn,
 			TargetTable: targetTable,
 			Column:      col,
+			First:       isFirst,
+			AfterColumn: afterCol,
 			RawSQL:      stmt,
 		}, nil
 	}
@@ -616,7 +672,7 @@ func parseAlterTable(stmt string) (Statement, error) {
 	}
 
 	if after := consumePhraseCI(afterTbl, "MODIFY", "COLUMN"); after != afterTbl {
-		col, err := parseColumnDef(strings.TrimSpace(after))
+		col, isFirst, afterCol, err := parseColumnDefWithPosition(strings.TrimSpace(after))
 		if err != nil {
 			return Statement{}, fmt.Errorf("ALTER TABLE %s MODIFY COLUMN: %w", targetTable, err)
 		}
@@ -624,6 +680,8 @@ func parseAlterTable(stmt string) (Statement, error) {
 			Kind:        StmtAlterTableModifyColumn,
 			TargetTable: targetTable,
 			Column:      col,
+			First:       isFirst,
+			AfterColumn: afterCol,
 			RawSQL:      stmt,
 		}, nil
 	}
@@ -837,14 +895,19 @@ func parseIndexDef(item string) (*IndexDef, error) {
 }
 
 func parseColumnDef(item string) (*ColumnDef, error) {
+	col, _, _, err := parseColumnDefWithPosition(item)
+	return col, err
+}
+
+func parseColumnDefWithPosition(item string) (*ColumnDef, bool, string, error) {
 	colName, rest, err := consumeIdent(item)
 	if err != nil || colName == "" {
-		return nil, fmt.Errorf("invalid column name in %q", item)
+		return nil, false, "", fmt.Errorf("invalid column name in %q", item)
 	}
 
 	sqlType, rest, err := consumeSQLType(rest)
 	if err != nil || sqlType == "" {
-		return nil, fmt.Errorf("column %s: invalid SQL type in %q: %v", colName, item, err)
+		return nil, false, "", fmt.Errorf("column %s: invalid SQL type in %q: %v", colName, item, err)
 	}
 
 	col := &ColumnDef{
@@ -852,6 +915,8 @@ func parseColumnDef(item string) (*ColumnDef, error) {
 		Type:     NormalizeType(sqlType),
 		Nullable: true,
 	}
+	var isFirst bool
+	var afterColumn string
 
 	rest = strings.TrimSpace(rest)
 	for rest != "" {
@@ -868,7 +933,7 @@ func parseColumnDef(item string) (*ColumnDef, error) {
 		if after := consumeKeywordCI(rest, "DEFAULT"); after != rest {
 			val, rem, err := consumeQuotedOrToken(after)
 			if err != nil {
-				return nil, fmt.Errorf("column %s DEFAULT: %w", colName, err)
+				return nil, false, "", fmt.Errorf("column %s DEFAULT: %w", colName, err)
 			}
 			col.HasDefault = true
 			col.Default = val
@@ -878,7 +943,7 @@ func parseColumnDef(item string) (*ColumnDef, error) {
 		if after := consumeKeywordCI(rest, "COMMENT"); after != rest {
 			val, rem, err := consumeQuotedOrToken(after)
 			if err != nil {
-				return nil, fmt.Errorf("column %s COMMENT: %w", colName, err)
+				return nil, false, "", fmt.Errorf("column %s COMMENT: %w", colName, err)
 			}
 			col.Comment = val
 			rest = strings.TrimSpace(rem)
@@ -886,6 +951,20 @@ func parseColumnDef(item string) (*ColumnDef, error) {
 		}
 		if after := consumeKeywordCI(rest, "AUTO_INCREMENT"); after != rest {
 			rest = strings.TrimSpace(after)
+			continue
+		}
+		if after := consumeKeywordCI(rest, "FIRST"); after != rest {
+			isFirst = true
+			rest = strings.TrimSpace(after)
+			continue
+		}
+		if after := consumeKeywordCI(rest, "AFTER"); after != rest {
+			refCol, rem, err := consumeIdent(after)
+			if err != nil || refCol == "" {
+				return nil, false, "", fmt.Errorf("column %s AFTER: invalid column name in %q", colName, after)
+			}
+			afterColumn = refCol
+			rest = strings.TrimSpace(rem)
 			continue
 		}
 		// Check aggregate keywords for AGGREGATE KEY tables
@@ -896,10 +975,10 @@ func parseColumnDef(item string) (*ColumnDef, error) {
 			rest = strings.TrimSpace(rem)
 			continue
 		}
-		return nil, fmt.Errorf("column %s: unexpected token %q in %q", colName, tok, item)
+		return nil, false, "", fmt.Errorf("column %s: unexpected token %q in %q", colName, tok, item)
 	}
 
-	return col, nil
+	return col, isFirst, afterColumn, nil
 }
 
 func parseCreateTableTail(tbl *TableDef, tail string) error {

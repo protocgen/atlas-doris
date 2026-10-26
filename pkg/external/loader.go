@@ -49,7 +49,7 @@ type ExternalSchemaOptions struct {
 }
 
 // LoadSchema loads a doris.Schema from a file:// URL, local file/directory path,
-// or proto:// URL (which invokes protoc + protoc-gen-proto2type with backend=doris,doris_mode=ddl).
+// doris:// or mysql:// live database URL, or proto:// URL.
 func LoadSchema(ctx context.Context, targetURL string, opts LoadOptions) (*doris.Schema, error) {
 	raw := strings.TrimSpace(targetURL)
 	if raw == "" {
@@ -57,6 +57,13 @@ func LoadSchema(ctx context.Context, targetURL string, opts LoadOptions) (*doris
 	}
 	if strings.HasPrefix(raw, "proto://") {
 		return loadFromProtoURL(ctx, raw, opts)
+	}
+	if strings.HasPrefix(raw, "doris://") || strings.HasPrefix(raw, "mysql://") {
+		s, err := migrate.InspectLiveSchema(ctx, raw)
+		if err != nil {
+			return nil, err
+		}
+		return FilterSchemaByTarget(s, opts.Target), nil
 	}
 	target := opts.Target
 	if strings.HasPrefix(raw, "file://") {
@@ -71,6 +78,30 @@ func LoadSchema(ctx context.Context, targetURL string, opts LoadOptions) (*doris
 		return nil, err
 	}
 	return LoadFromPath(localPath, target)
+}
+
+// FilterSchemaByTarget returns a copy of s retaining only tables that match target.
+func FilterSchemaByTarget(s *doris.Schema, target TargetFilter) *doris.Schema {
+	if s == nil || target == "" || target == TargetAll {
+		return s
+	}
+	out := s.Clone()
+	out.Tables = nil
+	for _, t := range s.Tables {
+		switch target {
+		case TargetDoris:
+			if t.IsDorisInternalTable() {
+				out.Tables = append(out.Tables, t)
+			}
+		case TargetIceberg:
+			if t.IsIcebergTable() {
+				out.Tables = append(out.Tables, t)
+			}
+		default:
+			out.Tables = append(out.Tables, t)
+		}
+	}
+	return out
 }
 
 // LoadFromPath loads a doris.Schema from a single .sql or .hcl file, a directory of
@@ -224,10 +255,14 @@ func ExternalSchemaSQL(ctx context.Context, opts ExternalSchemaOptions) (string,
 		return "", fmt.Errorf("external-schema requires at least one of --sql-dir, --sql-file, --hcl-dir, --hcl-file, --proto, or --url")
 	}
 
-	if strings.EqualFold(strings.TrimSpace(opts.Format), "hcl") {
+	switch strings.ToLower(strings.TrimSpace(opts.Format)) {
+	case "", "sql":
+		return doris.FormatSchema(merged), nil
+	case "hcl":
 		return doris.FormatHCL(merged), nil
+	default:
+		return "", fmt.Errorf("unsupported format %q (expected sql or hcl)", opts.Format)
 	}
-	return doris.FormatSchema(merged), nil
 }
 
 func loadFromProtoURL(ctx context.Context, rawURL string, opts LoadOptions) (*doris.Schema, error) {
@@ -304,10 +339,18 @@ func loadFromProtoURL(ctx context.Context, rawURL string, opts LoadOptions) (*do
 	}
 	defer os.RemoveAll(tmpOut)
 
+	dorisMode := strings.ToLower(strings.TrimSpace(queryValues.Get("mode")))
+	if dorisMode == "" {
+		dorisMode = strings.ToLower(strings.TrimSpace(queryValues.Get("doris_mode")))
+	}
+	if dorisMode == "" {
+		dorisMode = "ddl"
+	}
+
 	var args []string
 	args = append(args, "--plugin=protoc-gen-proto2type="+resolvedPlugin)
 	args = append(args, "--proto2type_out="+tmpOut)
-	args = append(args, "--proto2type_opt=lang=go,backend=doris,doris_mode=ddl")
+	args = append(args, "--proto2type_opt=lang=go,backend=doris,doris_mode="+dorisMode)
 	seenInc := make(map[string]bool)
 	for _, inc := range append([]string{rootInclude}, includes...) {
 		cleanInc := filepath.Clean(inc)
@@ -343,12 +386,23 @@ func resolveProto2TypePlugin(ctx context.Context, explicitPath string) (string, 
 	if p, err := exec.LookPath("protoc-gen-proto2type"); err == nil {
 		return p, noop, nil
 	}
-	// Check sibling proto2type repository if present in workspace
-	candidates := []string{
-		"/Users/ab/code/azra/proto2type",
-		filepath.Join("..", "proto2type"),
+	// Check PROTO2TYPE_DIR or sibling proto2type repository if present in workspace
+	var candidates []string
+	if envDir := strings.TrimSpace(os.Getenv("PROTO2TYPE_DIR")); envDir != "" {
+		candidates = append(candidates, envDir)
 	}
+	candidates = append(candidates,
+		filepath.Join("..", "proto2type"),
+		filepath.Join("..", "..", "proto2type"),
+		filepath.Join("..", "..", "..", "proto2type"),
+	)
 	for _, repoDir := range candidates {
+		prebuilt := filepath.Join(repoDir, "protoc-gen-proto2type")
+		if info, err := os.Stat(prebuilt); err == nil && !info.IsDir() {
+			if abs, err := filepath.Abs(prebuilt); err == nil {
+				return abs, noop, nil
+			}
+		}
 		if info, err := os.Stat(filepath.Join(repoDir, "go.mod")); err == nil && !info.IsDir() {
 			tmpBinDir, err := os.MkdirTemp("", "protoc-gen-proto2type-bin-*")
 			if err != nil {

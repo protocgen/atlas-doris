@@ -217,7 +217,7 @@ func diffTable(current, desired *TableDef, opts DiffOptions) []Statement {
 				TargetTable: targetName,
 				Index:       dIdx.Clone(),
 			})
-			if desired.IsDorisInternalTable() && shouldBuildIndexOnline(dIdx.Using) {
+			if desired.IsDorisInternalTable() && !desired.IsStarRocksTable() && shouldBuildIndexOnline(dIdx.Using) {
 				stmts = append(stmts, Statement{
 					Kind:          StmtBuildIndex,
 					TargetTable:   targetName,
@@ -326,7 +326,7 @@ func replicationCountFromAllocation(alloc string) (string, bool) {
 
 func shouldBuildIndexOnline(using string) bool {
 	switch strings.ToUpper(strings.TrimSpace(using)) {
-	case "INVERTED", "NGRAM_BF", "ANN", "GIN", "BITMAP", "VECTOR":
+	case "INVERTED", "NGRAM_BF", "ANN":
 		return true
 	default:
 		return false

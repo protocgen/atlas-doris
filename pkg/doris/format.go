@@ -23,7 +23,7 @@ func IsReservedKeyword(colName string) bool {
 		"kill", "load", "export", "backup", "restore", "alter", "create", "drop",
 		"truncate", "rename", "replace", "insert", "update", "delete", "merge",
 		"into", "over", "window", "rows", "preceding", "following", "current",
-		"true", "false", "properties", "inverted", "ngram_bf", "ann", "bitmap":
+		"true", "false", "properties", "inverted", "ngram_bf", "ngrambf", "ann", "bitmap", "gin", "vector":
 		return true
 	default:
 		return false
@@ -314,7 +314,7 @@ func FormatIndexDefInline(idx *IndexDef) string {
 			b.WriteByte('(')
 			b.WriteString(strings.Join(pairs, ", "))
 			b.WriteByte(')')
-		case "VECTOR":
+		case "VECTOR", "NGRAMBF":
 			b.WriteString(" (")
 			b.WriteString(strings.Join(pairs, ", "))
 			b.WriteByte(')')

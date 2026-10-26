@@ -6,6 +6,8 @@ builds:
     binary: atlas-doris
     env:
       - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X github.com/protocgen/atlas-doris/pkg/cli.Version=v{{ .Version }}
     goos:
       - linux
       - darwin
@@ -19,6 +21,8 @@ builds:
     binary: atlas-olap
     env:
       - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X github.com/protocgen/atlas-doris/pkg/cli.Version=v{{ .Version }}
     goos:
       - linux
       - darwin
@@ -32,6 +36,8 @@ builds:
     binary: atlas-starrocks
     env:
       - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X github.com/protocgen/atlas-doris/pkg/cli.Version=v{{ .Version }}
     goos:
       - linux
       - darwin

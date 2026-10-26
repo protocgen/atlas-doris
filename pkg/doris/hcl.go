@@ -407,9 +407,17 @@ func FormatTableHCL(t *TableDef) string {
 		fmt.Fprintf(&b, "  index %q {\n", idx.Name)
 		fmt.Fprintf(&b, "    columns = %s\n", formatHCLColRefList(idx.Columns))
 		fmt.Fprintf(&b, "    using = %q\n", using)
-		if len(idx.Properties) > 0 {
+		var remProps []Property
+		for _, p := range idx.Properties {
+			if using == "NGRAMBF" && (p.Key == "gram_num" || p.Key == "bloom_filter_fpp") {
+				fmt.Fprintf(&b, "    %s = %q\n", p.Key, p.Value)
+				continue
+			}
+			remProps = append(remProps, p)
+		}
+		if len(remProps) > 0 {
 			b.WriteString("    properties = {\n")
-			for _, p := range idx.Properties {
+			for _, p := range remProps {
 				fmt.Fprintf(&b, "      %s = %q\n", formatHCLPropKey(p.Key), p.Value)
 			}
 			b.WriteString("    }\n")
@@ -1142,6 +1150,8 @@ func parseHCLIndexBlock(idxName, body string) (*IndexDef, error) {
 			idx.Columns = cols
 		case "using", "type":
 			idx.Using = strings.ToUpper(strings.TrimSpace(unquoteHCLString(it.Value)))
+		case "gram_num", "bloom_filter_fpp":
+			idx.Properties = setOrAppendProperty(idx.Properties, it.Key, unquoteHCLString(it.Value))
 		case "comment":
 			idx.Comment = unquoteHCLString(it.Value)
 		default:
@@ -1149,10 +1159,49 @@ func parseHCLIndexBlock(idxName, body string) (*IndexDef, error) {
 		}
 	}
 
+	if len(idx.Properties) > 1 {
+		var gramProp, fppProp *Property
+		var others []Property
+		for i := range idx.Properties {
+			p := idx.Properties[i]
+			switch p.Key {
+			case "gram_num":
+				cp := p
+				gramProp = &cp
+			case "bloom_filter_fpp":
+				cp := p
+				fppProp = &cp
+			default:
+				others = append(others, p)
+			}
+		}
+		if gramProp != nil || fppProp != nil {
+			var ordered []Property
+			if gramProp != nil {
+				ordered = append(ordered, *gramProp)
+			}
+			if fppProp != nil {
+				ordered = append(ordered, *fppProp)
+			}
+			ordered = append(ordered, others...)
+			idx.Properties = ordered
+		}
+	}
+
 	if len(idx.Columns) == 0 {
 		return nil, fmt.Errorf("index %q: missing columns attribute", idxName)
 	}
 	return idx, nil
+}
+
+func setOrAppendProperty(props []Property, key, val string) []Property {
+	for i := range props {
+		if props[i].Key == key {
+			props[i].Value = val
+			return props
+		}
+	}
+	return append(props, Property{Key: key, Value: val})
 }
 
 // parseHCLBodyItems scans a block body into ordered key=value attributes and nested {...} blocks.

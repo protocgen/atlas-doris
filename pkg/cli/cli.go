@@ -15,7 +15,7 @@ import (
 )
 
 // Version is the semantic version reported by the CLI binaries.
-const Version = "v0.1.0"
+var Version = "v0.1.0"
 
 // Config configures the binary name and default target filter for the CLI.
 type Config struct {
@@ -139,7 +139,7 @@ func runMigrateDiff(ctx context.Context, cfg Config, args []string, stdout, stde
 		return 1
 	}
 	if len(stmts) == 0 {
-		_, _ = fmt.Fprintln(stdout, "The migration directory issynced with the desired state, no changes to be made.")
+		_, _ = fmt.Fprintln(stdout, "The migration directory is synced with the desired state, no changes to be made.")
 		return 0
 	}
 	_, _ = fmt.Fprintf(stdout, "Created migration %s (%d statement(s))\n", fileName, len(stmts))
@@ -548,7 +548,7 @@ func runSchemaParity(ctx context.Context, args []string, stdout, stderr io.Write
 			PluginPath:    pluginPath,
 		})
 		if err != nil {
-			if explicitIceberg {
+			if explicitIceberg || !strings.Contains(err.Error(), "no matching .sql or .hcl files found") {
 				_, _ = fmt.Fprintf(stderr, "load Iceberg schema: %v\n", err)
 				return 1
 			}

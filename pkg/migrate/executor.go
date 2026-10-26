@@ -53,7 +53,7 @@ const StarRocksRevisionsTableDDL = `CREATE TABLE IF NOT EXISTS atlas_schema_revi
     error STRING NULL,
     error_stmt STRING NULL,
     hash VARCHAR(255) NOT NULL,
-    partial_hashes ARRAY<VARCHAR(255)> NOT NULL DEFAULT [],
+    partial_hashes ARRAY<VARCHAR(255)> NOT NULL DEFAULT "[]",
     operator_version VARCHAR(255) NOT NULL
 )
 PRIMARY KEY(version)
@@ -598,7 +598,12 @@ func (e *Executor) waitForAsyncDorisJob(ctx context.Context, fullTableName, show
 	shortTable := parts[len(parts)-1]
 	dbPrefix := ""
 	if len(parts) >= 2 {
-		dbPrefix = " FROM " + strings.Join(parts[:len(parts)-1], ".")
+		dbParts := parts[:len(parts)-1]
+		if len(dbParts) == 2 && (e.dialect == "starrocks" || strings.EqualFold(dbParts[0], "default_catalog")) &&
+			(strings.EqualFold(dbParts[0], "internal") || strings.EqualFold(dbParts[0], "default_catalog")) {
+			dbParts = dbParts[1:]
+		}
+		dbPrefix = " FROM " + strings.Join(dbParts, ".")
 	}
 	query := fmt.Sprintf("%s%s WHERE TableName = '%s';", showPrefix, dbPrefix, shortTable)
 

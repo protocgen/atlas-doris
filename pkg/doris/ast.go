@@ -5,6 +5,7 @@ package doris
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -340,7 +341,7 @@ func (t *TableDef) IsStarRocksTable() bool {
 	}
 	for _, idx := range t.Indexes {
 		u := strings.ToUpper(strings.TrimSpace(idx.Using))
-		if u == "GIN" || u == "VECTOR" {
+		if u == "GIN" || u == "VECTOR" || u == "NGRAMBF" {
 			return true
 		}
 	}
@@ -769,14 +770,17 @@ func pairSchemaTables(current, desired []*TableDef) (map[*TableDef]*TableDef, ma
 }
 
 func inferDialectHint(content, filename string) string {
-	lowerFile := strings.ToLower(strings.TrimSpace(filename))
-	switch {
-	case strings.Contains(lowerFile, "starrocks"):
-		return "starrocks"
-	case strings.Contains(lowerFile, "iceberg"):
-		return "iceberg"
-	case strings.Contains(lowerFile, "doris"):
-		return "doris"
+	trimmed := strings.TrimSpace(filename)
+	if trimmed != "" {
+		lowerBase := strings.ToLower(filepath.Base(trimmed))
+		switch {
+		case strings.Contains(lowerBase, "starrocks"):
+			return "starrocks"
+		case strings.Contains(lowerBase, "iceberg"):
+			return "iceberg"
+		case strings.Contains(lowerBase, "doris"):
+			return "doris"
+		}
 	}
 	lowerContent := strings.ToLower(content)
 	switch {

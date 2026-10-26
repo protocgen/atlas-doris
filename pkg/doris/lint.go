@@ -297,7 +297,7 @@ func LintTableEvolution(before, after *TableDef, opts LintOptions) []Violation {
 			Message:   fmt.Sprintf("colocate_with group cannot be mutated on existing table (before=%q, after=%q)", beforeColocate, afterColocate),
 		})
 	}
-	if before.Partition != nil && after.Partition != nil && !before.Partition.Equal(after.Partition) {
+	if before.Partition != nil && after.Partition != nil && !partitionStrategyEqual(before.Partition, after.Partition) {
 		violations = append(violations, Violation{
 			Rule:      DORIS003_IMMUTABLE_DISTRIBUTION,
 			TableName: tblName,
@@ -487,6 +487,13 @@ func IsSafeTypeEvolution(beforeType, afterType string) bool {
 		return false
 	}
 
+	if pBefore, okB := parseDatetimePrecision(bt); okB {
+		if pAfter, okA := parseDatetimePrecision(at); okA {
+			return pAfter >= pBefore
+		}
+		return false
+	}
+
 	switch bt {
 	case "TINYINT":
 		return at == "SMALLINT" || at == "INT" || at == "BIGINT" || at == "LARGEINT"
@@ -499,12 +506,52 @@ func IsSafeTypeEvolution(beforeType, afterType string) bool {
 	case "FLOAT":
 		return at == "DOUBLE"
 	case "DATE", "DATEV2":
-		return at == "DATETIME" || at == "DATETIMEV2" ||
-			(strings.HasPrefix(at, "DATETIME(") && strings.HasSuffix(at, ")")) ||
-			(strings.HasPrefix(at, "DATETIMEV2(") && strings.HasSuffix(at, ")"))
+		_, okA := parseDatetimePrecision(at)
+		return okA
 	default:
 		return false
 	}
+}
+
+func parseDatetimePrecision(t string) (int, bool) {
+	switch t {
+	case "DATETIME", "DATETIMEV2":
+		return 0, true
+	}
+	var inner string
+	switch {
+	case strings.HasPrefix(t, "DATETIME(") && strings.HasSuffix(t, ")"):
+		inner = strings.TrimSpace(t[len("DATETIME(") : len(t)-1])
+	case strings.HasPrefix(t, "DATETIMEV2(") && strings.HasSuffix(t, ")"):
+		inner = strings.TrimSpace(t[len("DATETIMEV2(") : len(t)-1])
+	default:
+		return 0, false
+	}
+	p, err := strconv.Atoi(inner)
+	if err != nil || p < 0 || p > 6 {
+		return 0, false
+	}
+	return p, true
+}
+
+func partitionStrategyEqual(a, b *PartitionClause) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	if !strings.EqualFold(a.Kind, b.Kind) ||
+		!stringSlicesEqual(a.Columns, b.Columns) ||
+		strings.TrimSpace(a.RawExpr) != strings.TrimSpace(b.RawExpr) {
+		return false
+	}
+	rawA := strings.TrimSpace(a.PartitionsRaw)
+	rawB := strings.TrimSpace(b.PartitionsRaw)
+	if rawA != "" && rawA != "()" && rawB != "" && rawB != "()" {
+		return rawA == rawB
+	}
+	return true
 }
 
 // IsForbiddenColumnType reports whether rawType is or contains JSONB or VARIANT.

@@ -1525,12 +1525,14 @@ PROPERTIES (
 		`ALTER TABLE internal.tenant_${TENANT_SLUG}.patient_notes MODIFY COLUMN status STRING NOT NULL DEFAULT "DRAFT";`,
 		`ALTER TABLE internal.tenant_${TENANT_SLUG}.patient_notes MODIFY COLUMN event_date DATETIME NOT NULL;`,
 		`ALTER TABLE internal.tenant_${TENANT_SLUG}.patient_notes ADD INDEX idx_summary_gin (summary) USING GIN("parser" = "standard");`,
-		`BUILD INDEX idx_summary_gin ON internal.tenant_${TENANT_SLUG}.patient_notes;`,
 		`ALTER TABLE internal.tenant_${TENANT_SLUG}.patient_notes SET ("datacache.partition_duration" = "7 DAY");`,
 	} {
 		if !strings.Contains(diffSQL, want) {
 			t.Errorf("StarRocks diff SQL missing %q in:\n%s", want, diffSQL)
 		}
+	}
+	if strings.Contains(diffSQL, "BUILD INDEX") {
+		t.Errorf("expected StarRocks diff SQL not to emit BUILD INDEX, got:\n%s", diffSQL)
 	}
 
 	// Replay initial + diff statements and verify exact schema match
@@ -1593,5 +1595,148 @@ PROPERTIES (
 	}
 	if doris.IsSafeTypeEvolution("DATETIME", "DATE") || doris.IsSafeTypeEvolution("STRING", "VARCHAR(64)") {
 		t.Errorf("expected DATETIME -> DATE and STRING -> VARCHAR(64) narrowing to be rejected")
+	}
+
+	// Verify DATETIME / DATETIMEV2 precision widening vs narrowing
+	for _, okPair := range [][2]string{
+		{"DATETIME", "DATETIMEV2(6)"},
+		{"DATETIMEV2(3)", "DATETIMEV2(6)"},
+		{"DATETIME(0)", "DATETIME(6)"},
+		{"DATETIME", "DATETIME(0)"},
+	} {
+		if !doris.IsSafeTypeEvolution(okPair[0], okPair[1]) {
+			t.Errorf("expected %s -> %s to be safe precision widening", okPair[0], okPair[1])
+		}
+	}
+	for _, badPair := range [][2]string{
+		{"DATETIMEV2(6)", "DATETIME"},
+		{"DATETIMEV2(6)", "DATETIMEV2(0)"},
+		{"DATETIMEV2(6)", "DATETIMEV2(3)"},
+		{"DATETIME(3)", "DATETIME(1)"},
+		{"DATETIME(6)", "VARCHAR(64)"},
+	} {
+		if doris.IsSafeTypeEvolution(badPair[0], badPair[1]) {
+			t.Errorf("expected %s -> %s precision narrowing to be rejected", badPair[0], badPair[1])
+		}
+	}
+
+	// Verify NGRAMBF SQL + HCL round-trip and no BUILD INDEX on GIN, BITMAP, VECTOR, NGRAMBF
+	ngramSQL := `
+CREATE TABLE IF NOT EXISTS internal.tenant_a.patients (
+    patient_id VARCHAR(64) NOT NULL,
+    full_name VARCHAR(128) NOT NULL DEFAULT "",
+    tags ARRAY<VARCHAR(255)> NOT NULL DEFAULT [],
+    INDEX idx_ngram_patients_full_name (full_name) USING NGRAMBF ("gram_num" = "3", "bloom_filter_fpp" = "0.05")
+)
+PRIMARY KEY(patient_id)
+DISTRIBUTED BY HASH(patient_id) BUCKETS 8
+PROPERTIES (
+    "enable_persistent_index" = "true"
+);`
+	sNgram, err := doris.ParseSchema(ngramSQL)
+	if err != nil {
+		t.Fatalf("ParseSchema(ngramSQL) failed: %v", err)
+	}
+	formattedNgramSQL := doris.FormatSchema(sNgram)
+	if !strings.Contains(formattedNgramSQL, `INDEX idx_ngram_patients_full_name (full_name) USING NGRAMBF ("gram_num" = "3", "bloom_filter_fpp" = "0.05")`) {
+		t.Errorf("unexpected NGRAMBF SQL formatting:\n%s", formattedNgramSQL)
+	}
+	if !strings.Contains(formattedNgramSQL, "tags ARRAY<VARCHAR(255)> NOT NULL DEFAULT []") {
+		t.Errorf("expected unquoted DEFAULT [] on ARRAY column, got:\n%s", formattedNgramSQL)
+	}
+	ngramHCL := doris.FormatHCL(sNgram)
+	if !strings.Contains(ngramHCL, `using = "NGRAMBF"`) || !strings.Contains(ngramHCL, `gram_num = "3"`) || !strings.Contains(ngramHCL, `bloom_filter_fpp = "0.05"`) {
+		t.Errorf("expected top-level gram_num and bloom_filter_fpp in NGRAMBF HCL, got:\n%s", ngramHCL)
+	}
+	sNgramFromHCL, err := doris.ParseHCL(ngramHCL)
+	if err != nil {
+		t.Fatalf("ParseHCL(ngramHCL) failed: %v", err)
+	}
+	if doris.FormatSchema(sNgramFromHCL) != formattedNgramSQL {
+		t.Errorf("NGRAMBF HCL -> SQL mismatch:\nwant:\n%s\ngot:\n%s", formattedNgramSQL, doris.FormatSchema(sNgramFromHCL))
+	}
+
+	// Verify adding GIN, BITMAP, VECTOR, and NGRAMBF indexes on StarRocks never emits BUILD INDEX
+	sBaseNoIdx, err := doris.ParseSchema(`
+CREATE TABLE IF NOT EXISTS internal.tenant_a.patients (
+    patient_id VARCHAR(64) NOT NULL,
+    full_name VARCHAR(128) NOT NULL DEFAULT "",
+    tags ARRAY<VARCHAR(255)> NOT NULL DEFAULT []
+)
+PRIMARY KEY(patient_id)
+DISTRIBUTED BY HASH(patient_id) BUCKETS 8
+PROPERTIES (
+    "enable_persistent_index" = "true"
+);`)
+	if err != nil {
+		t.Fatalf("ParseSchema(sBaseNoIdx): %v", err)
+	}
+	idxDiffStmts, err := doris.Diff(sBaseNoIdx, sNgram)
+	if err != nil {
+		t.Fatalf("Diff(sBaseNoIdx, sNgram) failed: %v", err)
+	}
+	idxDiffSQL := doris.FormatStatements(idxDiffStmts)
+	if !strings.Contains(idxDiffSQL, `ADD INDEX idx_ngram_patients_full_name (full_name) USING NGRAMBF ("gram_num" = "3", "bloom_filter_fpp" = "0.05");`) {
+		t.Errorf("expected ADD INDEX USING NGRAMBF, got:\n%s", idxDiffSQL)
+	}
+	if strings.Contains(idxDiffSQL, "BUILD INDEX") {
+		t.Errorf("expected no BUILD INDEX for StarRocks NGRAMBF index, got:\n%s", idxDiffSQL)
+	}
+
+	// Verify basename-only dialect detection in ParseSchemaAuto
+	dupSQL := `CREATE TABLE t (id BIGINT NOT NULL) DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;`
+	sDorisInSRDir, err := doris.ParseSchemaAuto(dupSQL, "/work/starrocks-migrations/patients_doris.sql")
+	if err != nil {
+		t.Fatalf("ParseSchemaAuto(patients_doris.sql): %v", err)
+	}
+	if sDorisInSRDir.Tables[0].IsStarRocksTable() || sDorisInSRDir.Tables[0].Dialect != "doris" {
+		t.Errorf("expected /work/starrocks-migrations/patients_doris.sql to have Dialect=doris, got %q", sDorisInSRDir.Tables[0].Dialect)
+	}
+	sSRInDorisDir, err := doris.ParseSchemaAuto(dupSQL, "/work/doris-migrations/patients_starrocks.sql")
+	if err != nil {
+		t.Fatalf("ParseSchemaAuto(patients_starrocks.sql): %v", err)
+	}
+	if !sSRInDorisDir.Tables[0].IsStarRocksTable() || sSRInDorisDir.Tables[0].Dialect != "starrocks" {
+		t.Errorf("expected /work/doris-migrations/patients_starrocks.sql to have Dialect=starrocks, got %q", sSRInDorisDir.Tables[0].Dialect)
+	}
+
+	// Verify partitionStrategyEqual in LintTableEvolution does not false-positive when HCL PartitionsRaw is "()"
+	liveShowCreate, err := doris.ParseSchema(`
+CREATE TABLE events (
+    dt DATE NOT NULL,
+    id BIGINT NOT NULL
+)
+DUPLICATE KEY(dt, id)
+PARTITION BY RANGE (dt) (PARTITION p2026 VALUES [("2026-01-01"), ("2027-01-01")))
+DISTRIBUTED BY HASH(id) BUCKETS 4;`)
+	if err != nil {
+		t.Fatalf("ParseSchema(liveShowCreate): %v", err)
+	}
+	desiredFromHCL, err := doris.ParseHCL(`
+table "events" {
+  column "dt" {
+    type = date
+    null = false
+  }
+  column "id" {
+    type = bigint
+    null = false
+  }
+  duplicate_key {
+    columns = [column.dt, column.id]
+  }
+  partition_by_range {
+    columns = [column.dt]
+  }
+  distributed_by_hash {
+    columns = [column.id]
+    buckets = 4
+  }
+}`)
+	if err != nil {
+		t.Fatalf("ParseHCL(desiredFromHCL): %v", err)
+	}
+	if v := doris.LintSchemaEvolution(liveShowCreate, desiredFromHCL, doris.LintOptions{}); len(v) != 0 {
+		t.Errorf("expected 0 violations when comparing live range partitions against HCL empty partitions, got %v", v)
 	}
 }

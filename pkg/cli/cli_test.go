@@ -172,6 +172,20 @@ PROPERTIES (
 		t.Fatalf("schema parity without iceberg failed (code=%d): %s", code, errBuf.String())
 	}
 
+	// 3b. Failing parity check via --dir when a malformed *_iceberg.sql file is present in --dir
+	badIceDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(badIceDir, "patients_doris.sql"), []byte(dorisSQL), 0o644)
+	_ = os.WriteFile(filepath.Join(badIceDir, "patients_starrocks.sql"), []byte(starrocksSQL), 0o644)
+	_ = os.WriteFile(filepath.Join(badIceDir, "bad_iceberg.sql"), []byte("CREATE TABLE broken (\n"), 0o644)
+	out.Reset()
+	errBuf.Reset()
+	if code := cli.Run(ctx, olapCfg, []string{"schema", "parity", "--dir", badIceDir}, &out, &errBuf); code == 0 {
+		t.Fatalf("expected schema parity --dir to fail when malformed bad_iceberg.sql is present in directory")
+	}
+	if !strings.Contains(errBuf.String(), "load Iceberg schema") {
+		t.Errorf("expected 'load Iceberg schema' error message, got: %s", errBuf.String())
+	}
+
 	// 4. Failing parity checks: column type mismatch, nullability mismatch, key column mismatch, sequence_col mismatch, missing table
 	badSRFile := filepath.Join(t.TempDir(), "bad_starrocks.sql")
 	badSRSQL := `

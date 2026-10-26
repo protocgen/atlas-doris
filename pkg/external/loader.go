@@ -64,6 +64,13 @@ func LoadSchema(ctx context.Context, targetURL string, opts LoadOptions) (*doris
 		if err != nil {
 			return nil, err
 		}
+		if strings.HasPrefix(strings.ToLower(raw), "starrocks://") {
+			for _, t := range s.Tables {
+				if !t.IsIcebergTable() && t.Dialect == "" {
+					t.Dialect = "starrocks"
+				}
+			}
+		}
 		return FilterSchemaByTarget(s, opts.Target), nil
 	}
 	target := opts.Target

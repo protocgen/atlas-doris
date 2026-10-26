@@ -392,10 +392,10 @@ func StripCommentsAndSplitStatements(sqlText string) ([]string, error) {
 		case '`':
 			inBacktick = true
 			cur.WriteByte(ch)
-		case '(':
+		case '(', '[':
 			parenDepth++
 			cur.WriteByte(ch)
-		case ')':
+		case ')', ']':
 			if parenDepth > 0 {
 				parenDepth--
 			}
@@ -1687,9 +1687,9 @@ func extractBalancedParens(s string, openIdx int) (string, int, bool) {
 			inDouble = true
 		case '`':
 			inBacktick = true
-		case '(':
+		case '(', '[':
 			depth++
-		case ')':
+		case ')', ']':
 			depth--
 			if depth == 0 {
 				return s[openIdx+1 : i], i + 1, true
@@ -1769,10 +1769,10 @@ func splitTopLevelComma(s string) []string {
 		case '`':
 			inBacktick = true
 			cur.WriteByte(ch)
-		case '(':
+		case '(', '[':
 			parenDepth++
 			cur.WriteByte(ch)
-		case ')':
+		case ')', ']':
 			if parenDepth > 0 {
 				parenDepth--
 			}

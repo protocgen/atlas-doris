@@ -136,12 +136,40 @@ func (c *ColumnDef) Equal(other *ColumnDef) bool {
 		return false
 	}
 	return c.Name == other.Name &&
-		NormalizeType(c.Type) == NormalizeType(other.Type) &&
+		TypesSemanticallyEqual(c.Type, other.Type) &&
 		c.AggType == other.AggType &&
 		c.Nullable == other.Nullable &&
 		c.HasDefault == other.HasDefault &&
 		c.Default == other.Default &&
 		c.Comment == other.Comment
+}
+
+// RollupDef describes a Doris rollup index definition on a table.
+type RollupDef struct {
+	Name    string
+	Columns []string
+}
+
+// Clone returns a deep copy of RollupDef.
+func (r *RollupDef) Clone() *RollupDef {
+	if r == nil {
+		return nil
+	}
+	return &RollupDef{
+		Name:    r.Name,
+		Columns: append([]string(nil), r.Columns...),
+	}
+}
+
+// Equal reports whether two RollupDef values are semantically equal.
+func (r *RollupDef) Equal(other *RollupDef) bool {
+	if r == nil && other == nil {
+		return true
+	}
+	if r == nil || other == nil {
+		return false
+	}
+	return r.Name == other.Name && stringSlicesEqual(r.Columns, other.Columns)
 }
 
 // IndexDef describes an inline Doris index (USING INVERTED, NGRAM_BF, ANN, or BITMAP).
@@ -204,6 +232,7 @@ type TableDef struct {
 	IfNotExists  bool
 	Columns      []*ColumnDef
 	Indexes      []*IndexDef
+	Rollups      []*RollupDef
 	Engine       string
 	Key          *KeyClause
 	Comment      string
@@ -357,6 +386,10 @@ func (t *TableDef) Clone() *TableDef {
 	for i, idx := range t.Indexes {
 		idxs[i] = idx.Clone()
 	}
+	rollups := make([]*RollupDef, len(t.Rollups))
+	for i, r := range t.Rollups {
+		rollups[i] = r.Clone()
+	}
 	return &TableDef{
 		FullName:     t.FullName,
 		Catalog:      t.Catalog,
@@ -365,6 +398,7 @@ func (t *TableDef) Clone() *TableDef {
 		IfNotExists:  t.IfNotExists,
 		Columns:      cols,
 		Indexes:      idxs,
+		Rollups:      rollups,
 		Engine:       t.Engine,
 		Key:          t.Key.Clone(),
 		Comment:      t.Comment,

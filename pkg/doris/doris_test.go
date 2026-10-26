@@ -968,3 +968,219 @@ func TestParserAndAST_ErrorAndEdgeBranches(t *testing.T) {
 		t.Errorf("expected empty string from Format* on nil/empty inputs")
 	}
 }
+
+func TestCriticalReviews_IcebergV2_TypeAliases_ComplexEvolution_Rollups_TwoPartDiff(t *testing.T) {
+	// [CRITICAL-1]: Iceberg v2 ADD COLUMN where desired has NOT NULL without DEFAULT must pass LintSchemaEvolution
+	iceBefore, err := doris.ParseSchema(`
+CREATE TABLE IF NOT EXISTS azra_lake.tenant_duke.encounters (
+    encounter_id VARCHAR(64) NOT NULL
+)
+PROPERTIES (
+    "compression_codec" = "zstd"
+);`)
+	if err != nil {
+		t.Fatalf("ParseSchema(iceBefore): %v", err)
+	}
+	iceAfter, err := doris.ParseSchema(`
+CREATE TABLE IF NOT EXISTS azra_lake.tenant_duke.encounters (
+    encounter_id VARCHAR(64) NOT NULL,
+    visit_type VARCHAR(32) NOT NULL
+)
+PROPERTIES (
+    "compression_codec" = "zstd"
+);`)
+	if err != nil {
+		t.Fatalf("ParseSchema(iceAfter): %v", err)
+	}
+	iceStmts, err := doris.Diff(iceBefore, iceAfter)
+	if err != nil {
+		t.Fatalf("Diff(iceBefore, iceAfter) with NOT NULL no-default column failed: %v", err)
+	}
+	if len(iceStmts) != 1 || iceStmts[0].SQL() != "ALTER TABLE azra_lake.tenant_duke.encounters ADD COLUMN visit_type VARCHAR(32);" {
+		t.Fatalf("unexpected Iceberg v2 ADD COLUMN diff: %v", doris.FormatStatements(iceStmts))
+	}
+	iceInit, _ := doris.ParseStatements(doris.FormatSchema(iceBefore))
+	iceReplayed, err := doris.ReplayStatements(append(iceInit, iceStmts...))
+	if err != nil {
+		t.Fatalf("ReplayStatements(ice): %v", err)
+	}
+	iceFollowUp, err := doris.Diff(iceReplayed, iceAfter)
+	if err != nil || len(iceFollowUp) != 0 {
+		t.Fatalf("expected 0 follow-up statements on Iceberg v2, got %v (err=%v)", doris.FormatStatements(iceFollowUp), err)
+	}
+
+	// [CRITICAL-2]: Doris 4.x SHOW CREATE TABLE type aliases (DATE vs DATEV2, DATETIME(6) vs DATETIMEV2(6), DECIMAL vs DECIMALV3)
+	// and complex type evolution (ARRAY, MAP, STRUCT)
+	liveAliasSQL := `
+CREATE TABLE IF NOT EXISTS internal.tenant_duke.claims (
+    claim_id VARCHAR(64) NOT NULL,
+    service_date DATE NOT NULL,
+    admitted_at DATETIME NOT NULL,
+    updated_at DATETIME(6) NOT NULL,
+    billed_amount DECIMAL(18, 4) NOT NULL DEFAULT "0.0000"
+)
+UNIQUE KEY(claim_id)
+DISTRIBUTED BY HASH(claim_id) BUCKETS 4;`
+
+	canonicalAliasSQL := `
+CREATE TABLE IF NOT EXISTS internal.tenant_duke.claims (
+    claim_id VARCHAR(64) NOT NULL,
+    service_date DATEV2 NOT NULL,
+    admitted_at DATETIMEV2(0) NOT NULL,
+    updated_at DATETIMEV2(6) NOT NULL,
+    billed_amount DECIMALV3(18, 4) NOT NULL DEFAULT "0.0000"
+)
+UNIQUE KEY(claim_id)
+DISTRIBUTED BY HASH(claim_id) BUCKETS 4;`
+
+	sAlias1, err := doris.ParseSchema(liveAliasSQL)
+	if err != nil {
+		t.Fatalf("ParseSchema(liveAliasSQL): %v", err)
+	}
+	sAlias2, err := doris.ParseSchema(canonicalAliasSQL)
+	if err != nil {
+		t.Fatalf("ParseSchema(canonicalAliasSQL): %v", err)
+	}
+	aliasDiff, err := doris.Diff(sAlias1, sAlias2)
+	if err != nil || len(aliasDiff) != 0 {
+		t.Fatalf("expected 0 diff statements between Doris 4.x alias types and V2/V3 canonical types, got %v (err=%v)", doris.FormatStatements(aliasDiff), err)
+	}
+
+	// Complex type evolution: ARRAY, MAP, STRUCT widening & struct field appending
+	if !doris.IsSafeTypeEvolution("ARRAY<VARCHAR(32)>", "ARRAY<VARCHAR(64)>") {
+		t.Errorf("expected ARRAY<VARCHAR(32)> -> ARRAY<VARCHAR(64)> to be safe")
+	}
+	if doris.IsSafeTypeEvolution("ARRAY<VARCHAR(64)>", "ARRAY<VARCHAR(32)>") {
+		t.Errorf("expected ARRAY<VARCHAR(64)> -> ARRAY<VARCHAR(32)> narrowing to be rejected")
+	}
+	if !doris.IsSafeTypeEvolution("MAP<VARCHAR(32), INT>", "MAP<VARCHAR(32), BIGINT>") {
+		t.Errorf("expected MAP<VARCHAR(32), INT> -> MAP<VARCHAR(32), BIGINT> to be safe")
+	}
+	if doris.IsSafeTypeEvolution("MAP<VARCHAR(32), INT>", "MAP<VARCHAR(64), INT>") {
+		t.Errorf("expected MAP key type mutation to be rejected")
+	}
+	if !doris.IsSafeTypeEvolution("STRUCT<a:INT, b:VARCHAR(32)>", "STRUCT<a:BIGINT, b:VARCHAR(64), c:BOOLEAN>") {
+		t.Errorf("expected STRUCT field widening + field append to be safe")
+	}
+	if doris.IsSafeTypeEvolution("STRUCT<a:INT, b:VARCHAR(32)>", "STRUCT<a:INT>") {
+		t.Errorf("expected STRUCT field drop to be rejected")
+	}
+	if doris.IsSafeTypeEvolution("STRUCT<a:INT, b:VARCHAR(32)>", "STRUCT<a:INT, b:VARCHAR(32), bad:JSONB>") {
+		t.Errorf("expected STRUCT with forbidden JSONB field to be rejected")
+	}
+	if !doris.IsForbiddenColumnType("MAP<VARCHAR(32), VARIANT>") || !doris.IsForbiddenColumnType("STRUCT<a:JSONB>") {
+		t.Errorf("expected MAP/STRUCT containing VARIANT/JSONB to be flagged by IsForbiddenColumnType")
+	}
+
+	// [CRITICAL-3]: Rollup blocks preserved across HCL and SQL round-trips
+	rollupHCL := `
+schema "analytics" {
+  catalog = "internal"
+}
+
+table "events_rollup" {
+  schema = schema.analytics
+  column "event_date" {
+    type = datev2
+    null = false
+  }
+  column "tenant_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "total_count" {
+    type = bigint
+    null = false
+    agg_type = "SUM"
+    default = "0"
+  }
+  aggregate_key {
+    columns = [column.event_date, column.tenant_id]
+  }
+  distributed_by_hash {
+    columns = [column.tenant_id]
+    buckets = 8
+  }
+  rollup "r_by_date" {
+    columns = [column.event_date, column.total_count]
+  }
+}
+`
+	sRollup, err := doris.ParseHCL(rollupHCL)
+	if err != nil {
+		t.Fatalf("ParseHCL(rollupHCL): %v", err)
+	}
+	if len(sRollup.Tables[0].Rollups) != 1 || sRollup.Tables[0].Rollups[0].Name != "r_by_date" {
+		t.Fatalf("expected 1 rollup r_by_date on parsed HCL table, got %+v", sRollup.Tables[0].Rollups)
+	}
+	formattedRollupHCL := doris.FormatHCL(sRollup)
+	if !strings.Contains(formattedRollupHCL, `rollup "r_by_date"`) {
+		t.Fatalf("FormatHCL missing rollup block:\n%s", formattedRollupHCL)
+	}
+	formattedRollupSQL := doris.FormatSchema(sRollup)
+	if !strings.Contains(formattedRollupSQL, "ROLLUP (r_by_date (event_date, total_count))") {
+		t.Fatalf("FormatSchema missing ROLLUP clause:\n%s", formattedRollupSQL)
+	}
+	sRollupFromSQL, err := doris.ParseSchema(formattedRollupSQL)
+	if err != nil {
+		t.Fatalf("ParseSchema(formattedRollupSQL): %v", err)
+	}
+	if len(sRollupFromSQL.Tables[0].Rollups) != 1 || !sRollupFromSQL.Tables[0].Rollups[0].Equal(sRollup.Tables[0].Rollups[0]) {
+		t.Fatalf("Rollup lost after SQL round-trip: %+v", sRollupFromSQL.Tables[0].Rollups)
+	}
+	var nilRollup *doris.RollupDef
+	if nilRollup.Clone() != nil || !nilRollup.Equal(nil) || nilRollup.Equal(sRollup.Tables[0].Rollups[0]) {
+		t.Errorf("unexpected nil RollupDef behavior")
+	}
+
+	// [CRITICAL-4]: Diffing 2-part SQL migration without explicit CREATE DATABASE against HCL
+	// must NOT emit spurious CREATE DATABASE internal.<db> and must preserve 2-part table name on ALTER TABLE
+	twoPartCurrent, err := doris.ParseSchema(`
+CREATE TABLE IF NOT EXISTS terminology.concepts (
+    concept_id VARCHAR(64) NOT NULL,
+    code VARCHAR(32) NOT NULL DEFAULT ""
+)
+UNIQUE KEY(concept_id)
+DISTRIBUTED BY HASH(concept_id) BUCKETS 8;`)
+	if err != nil {
+		t.Fatalf("ParseSchema(twoPartCurrent): %v", err)
+	}
+	hclDesired, err := doris.ParseHCL(`
+schema "terminology" {
+  catalog = "internal"
+}
+
+table "concepts" {
+  schema = schema.terminology
+  column "concept_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "code" {
+    type = varchar(64)
+    null = false
+    default = ""
+  }
+  unique_key {
+    columns = [column.concept_id]
+  }
+  distributed_by_hash {
+    columns = [column.concept_id]
+    buckets = 8
+  }
+}`)
+	if err != nil {
+		t.Fatalf("ParseHCL(hclDesired): %v", err)
+	}
+	twoPartDiff, err := doris.Diff(twoPartCurrent, hclDesired)
+	if err != nil {
+		t.Fatalf("Diff(twoPartCurrent, hclDesired): %v", err)
+	}
+	if len(twoPartDiff) != 1 {
+		t.Fatalf("expected exactly 1 ALTER TABLE statement (no spurious CREATE DATABASE), got %d:\n%s", len(twoPartDiff), doris.FormatStatements(twoPartDiff))
+	}
+	wantAlter := `ALTER TABLE terminology.concepts MODIFY COLUMN code VARCHAR(64) NOT NULL DEFAULT "";`
+	if twoPartDiff[0].SQL() != wantAlter {
+		t.Fatalf("expected 2-part ALTER TABLE %q, got %q", wantAlter, twoPartDiff[0].SQL())
+	}
+}

@@ -396,6 +396,15 @@ func FormatTableHCL(t *TableDef) string {
 		b.WriteString("  }\n")
 	}
 
+	for _, r := range t.Rollups {
+		if r == nil || r.Name == "" || len(r.Columns) == 0 {
+			continue
+		}
+		fmt.Fprintf(&b, "  rollup %q {\n", r.Name)
+		fmt.Fprintf(&b, "    columns = %s\n", formatHCLColRefList(r.Columns))
+		b.WriteString("  }\n")
+	}
+
 	if len(t.Properties) > 0 {
 		b.WriteString("  properties = {\n")
 		for _, p := range t.Properties {
@@ -709,9 +718,14 @@ func parseHCLTableBlock(labels []string, body string) (*TableDef, error) {
 			if len(bLabels) != 1 || bLabels[0] == "" {
 				return nil, fmt.Errorf("table %q: rollup block requires a name label", shortName)
 			}
-			if _, err := parseHCLOrderByBlock(it.BlockBody); err != nil {
+			rCols, err := parseHCLOrderByBlock(it.BlockBody)
+			if err != nil {
 				return nil, fmt.Errorf("table %q rollup %q: %w", shortName, bLabels[0], err)
 			}
+			tbl.Rollups = append(tbl.Rollups, &RollupDef{
+				Name:    bLabels[0],
+				Columns: rCols,
+			})
 
 		default:
 			return nil, fmt.Errorf("table %q: unsupported HCL block %q", shortName, it.BlockHeader)

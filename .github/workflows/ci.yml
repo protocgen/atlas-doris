@@ -32,8 +32,8 @@ jobs:
 
       - name: Test & Coverage Gate (>= 88%)
         run: |
-          OUTPUT=$(go test -race -cover ./...)
-          echo "$OUTPUT"
+          OUTPUT=$(go test -race -cover ./... 2>&1) || { printf '%s\n' "$OUTPUT"; exit 1; }
+          printf '%s\n' "$OUTPUT"
           echo "$OUTPUT" | awk -F'coverage: |% of statements' '
             /coverage:/ {
               pkg = $1

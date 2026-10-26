@@ -1136,6 +1136,45 @@ func parseCreateTableTail(tbl *TableDef, tail string) error {
 			return fmt.Errorf("unsupported DISTRIBUTED BY clause: %q", after)
 		}
 
+		// ROLLUP (r1 (c1, c2), r2 (c1))
+		if after := consumeKeywordCI(rest, "ROLLUP"); after != rest {
+			after = strings.TrimSpace(after)
+			if !strings.HasPrefix(after, "(") {
+				return fmt.Errorf("expected '(' after ROLLUP")
+			}
+			inside, afterIdx, ok := extractBalancedParens(after, 0)
+			if !ok {
+				return fmt.Errorf("unbalanced parentheses in ROLLUP")
+			}
+			items := splitTopLevelComma(inside)
+			for _, item := range items {
+				item = strings.TrimSpace(item)
+				if item == "" {
+					continue
+				}
+				rName, rem := nextToken(item)
+				rName = strings.Trim(rName, "`")
+				rem = strings.TrimSpace(rem)
+				if rName == "" || !strings.HasPrefix(rem, "(") {
+					return fmt.Errorf("invalid ROLLUP entry %q", item)
+				}
+				colsInside, _, ok := extractBalancedParens(rem, 0)
+				if !ok {
+					return fmt.Errorf("unbalanced parentheses in ROLLUP %s", rName)
+				}
+				rCols := parseIdentList(colsInside)
+				if len(rCols) == 0 {
+					return fmt.Errorf("empty column list in ROLLUP %s", rName)
+				}
+				tbl.Rollups = append(tbl.Rollups, &RollupDef{
+					Name:    rName,
+					Columns: rCols,
+				})
+			}
+			rest = strings.TrimSpace(after[afterIdx:])
+			continue
+		}
+
 		// PROPERTIES (...)
 		if after := consumeKeywordCI(rest, "PROPERTIES"); after != rest {
 			after = strings.TrimSpace(after)

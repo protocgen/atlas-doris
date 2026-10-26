@@ -41,7 +41,7 @@ func DiffWithOptions(current, desired *Schema, opts DiffOptions) ([]Statement, e
 
 	// 2. Missing databases.
 	for _, db := range desired.Databases {
-		if _, exists := current.DatabaseByName(db.CanonicalName()); !exists {
+		if _, exists := current.DatabaseByName(db.CanonicalName()); !exists && !schemaHasDatabaseObjects(current, db) {
 			dbCopy := db.Clone()
 			dbCopy.IfNotExists = true
 			stmts = append(stmts, Statement{
@@ -106,6 +106,9 @@ func DiffWithOptions(current, desired *Schema, opts DiffOptions) ([]Statement, e
 func diffTable(current, desired *TableDef, opts DiffOptions) []Statement {
 	var stmts []Statement
 	targetName := desired.CanonicalName()
+	if current != nil && current.Database != "" && isDefaultDorisCatalog(current.Catalog) && isDefaultDorisCatalog(desired.Catalog) {
+		targetName = current.CanonicalName()
+	}
 
 	currentColByName := make(map[string]*ColumnDef, len(current.Columns))
 	for _, c := range current.Columns {
@@ -261,6 +264,33 @@ func insertAfterCol(cols []string, afterName, newName string) []string {
 		}
 	}
 	return append(cols, newName)
+}
+
+func schemaHasDatabaseObjects(s *Schema, db *DatabaseDef) bool {
+	if s == nil || db == nil {
+		return false
+	}
+	targetKey := db.LookupKey()
+	if targetKey == "" {
+		return false
+	}
+	for _, t := range s.Tables {
+		if t != nil && t.Database != "" {
+			tblDB := DatabaseDef{Catalog: t.Catalog, Name: t.Database}
+			if tblDB.LookupKey() == targetKey {
+				return true
+			}
+		}
+	}
+	for _, v := range s.Views {
+		if v != nil && v.Database != "" {
+			vwDB := DatabaseDef{Catalog: v.Catalog, Name: v.Database}
+			if vwDB.LookupKey() == targetKey {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func tablePropertyMatches(curProps map[string]string, key, desiredVal string) bool {

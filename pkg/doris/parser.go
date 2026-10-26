@@ -50,7 +50,7 @@ func ApplyStatement(s *Schema, st Statement) error {
 			return fmt.Errorf("CREATE TABLE statement has nil TableDef")
 		}
 		for i, existing := range s.Tables {
-			if existing.CanonicalName() == st.Table.CanonicalName() {
+			if existing.LookupKey() == st.Table.LookupKey() {
 				if st.Table.IfNotExists {
 					return nil
 				}
@@ -63,8 +63,9 @@ func ApplyStatement(s *Schema, st Statement) error {
 
 	case StmtDropTable:
 		target := normalizeQualifiedName(st.TargetTable)
+		lookup := normalizeTableLookupKey(st.TargetTable)
 		for i, existing := range s.Tables {
-			if existing.CanonicalName() == target || existing.Name == target {
+			if existing.CanonicalName() == target || existing.Name == target || (lookup != "" && existing.LookupKey() == lookup) {
 				s.Tables = append(s.Tables[:i], s.Tables[i+1:]...)
 				return nil
 			}
@@ -226,7 +227,7 @@ func ApplyStatement(s *Schema, st Statement) error {
 			return fmt.Errorf("CREATE VIEW statement has nil ViewDef")
 		}
 		for i, v := range s.Views {
-			if v.CanonicalName() == st.View.CanonicalName() {
+			if v.LookupKey() == st.View.LookupKey() {
 				s.Views[i] = st.View.Clone()
 				return nil
 			}
@@ -1434,6 +1435,22 @@ func consumeSQLType(s string) (string, string, error) {
 	if s == "" {
 		return "", "", fmt.Errorf("missing SQL type")
 	}
+	// Check multi-word SQL types first (e.g. DOUBLE PRECISION, CHARACTER VARYING(...))
+	if after := consumePhraseCI(s, "DOUBLE", "PRECISION"); after != s {
+		return "DOUBLE PRECISION", strings.TrimSpace(after), nil
+	}
+	if after := consumePhraseCI(s, "CHARACTER", "VARYING"); after != s {
+		afterTrim := strings.TrimSpace(after)
+		if strings.HasPrefix(afterTrim, "(") {
+			inside, afterIdx, ok := extractBalancedParens(afterTrim, 0)
+			if !ok {
+				return "", "", fmt.Errorf("unbalanced '(' in type %q", s)
+			}
+			return "VARCHAR(" + inside + ")", strings.TrimSpace(afterTrim[afterIdx:]), nil
+		}
+		return "VARCHAR", afterTrim, nil
+	}
+
 	// Read base type word
 	i := 0
 	for i < len(s) {

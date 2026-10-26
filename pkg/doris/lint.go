@@ -342,17 +342,17 @@ func LintSchemaEvolution(current, desired *Schema, opts LintOptions) []Violation
 	var violations []Violation
 	currentByName := make(map[string]*TableDef, len(current.Tables))
 	for _, t := range current.Tables {
-		currentByName[t.CanonicalName()] = t
+		currentByName[t.LookupKey()] = t
 	}
 	desiredByName := make(map[string]*TableDef, len(desired.Tables))
 	for _, t := range desired.Tables {
-		desiredByName[t.CanonicalName()] = t
+		desiredByName[t.LookupKey()] = t
 	}
 
 	// Check dropped tables if destructive changes are disallowed.
 	if !opts.AllowDestructive {
 		for _, ct := range current.Tables {
-			if _, ok := desiredByName[ct.CanonicalName()]; !ok {
+			if _, ok := desiredByName[ct.LookupKey()]; !ok {
 				violations = append(violations, Violation{
 					Rule:      DORIS004_NO_COLUMN_DROP,
 					TableName: ct.CanonicalName(),
@@ -363,7 +363,7 @@ func LintSchemaEvolution(current, desired *Schema, opts LintOptions) []Violation
 	}
 
 	for _, dt := range desired.Tables {
-		if ct, existed := currentByName[dt.CanonicalName()]; existed {
+		if ct, existed := currentByName[dt.LookupKey()]; existed {
 			violations = append(violations, LintTableEvolution(ct, dt, opts)...)
 		} else {
 			violations = append(violations, LintTable(dt)...)

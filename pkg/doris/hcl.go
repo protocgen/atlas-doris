@@ -197,11 +197,13 @@ func FormatDatabaseHCL(d *DatabaseDef) string {
 	if d == nil || d.Name == "" {
 		return ""
 	}
+	cat := d.Catalog
+	if cat == "" {
+		cat = "internal"
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "schema %q {\n", d.Name)
-	if d.Catalog != "" {
-		fmt.Fprintf(&b, "  catalog = %q\n", d.Catalog)
-	}
+	fmt.Fprintf(&b, "  catalog = %q\n", cat)
 	b.WriteString("}")
 	return b.String()
 }
@@ -1420,6 +1422,31 @@ func dorisTypeToHCLType(dorisType string) string {
 	norm := NormalizeType(dorisType)
 	if norm == "" {
 		return "varchar(256)"
+	}
+	return lowerTypePreservingStructFields(norm)
+}
+
+func lowerTypePreservingStructFields(norm string) string {
+	if strings.HasPrefix(norm, "ARRAY<") && strings.HasSuffix(norm, ">") {
+		return "array<" + lowerTypePreservingStructFields(norm[6:len(norm)-1]) + ">"
+	}
+	if strings.HasPrefix(norm, "MAP<") && strings.HasSuffix(norm, ">") {
+		parts := splitTopLevelComma(norm[4 : len(norm)-1])
+		if len(parts) == 2 {
+			return "map<" + lowerTypePreservingStructFields(parts[0]) + ", " + lowerTypePreservingStructFields(parts[1]) + ">"
+		}
+	}
+	if strings.HasPrefix(norm, "STRUCT<") && strings.HasSuffix(norm, ">") {
+		fields := splitTopLevelComma(norm[7 : len(norm)-1])
+		out := make([]string, 0, len(fields))
+		for _, f := range fields {
+			if fName, fType, ok := splitStructField(f); ok {
+				out = append(out, fName+":"+lowerTypePreservingStructFields(fType))
+			} else {
+				out = append(out, strings.ToLower(strings.TrimSpace(f)))
+			}
+		}
+		return "struct<" + strings.Join(out, ", ") + ">"
 	}
 	return strings.ToLower(norm)
 }

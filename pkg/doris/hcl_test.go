@@ -750,3 +750,161 @@ view "analytics.vw_summary" {
 		t.Errorf("expected non-empty FormatHCL(sVP)")
 	}
 }
+
+func TestDoris_DeepBranchCoverage(t *testing.T) {
+	// 1. Two-label HCL table/view blocks, order_by attribute, partition variants, and view without raw_sql
+	hclTwoLabels := `
+schema "internal.tenant_two" {
+  collate = "utf8mb4_general_ci"
+}
+
+table "schema.tenant_two" "events" {
+  order_by = [column.id]
+  column "id" {
+    type = varchar(64)
+    null = false
+  }
+  column "ts" {
+    type = datetimev2(6)
+    null = true
+  }
+  unique_key {
+    columns = [column.id]
+  }
+  distribution {
+    type = "RANDOM"
+    columns = [column.id]
+    buckets = 4
+  }
+  partition {
+    columns = [column.id]
+  }
+}
+
+view "schema.tenant_two" "vw_events" {
+  schema = "internal.tenant_${TENANT_SLUG}"
+  or_replace = false
+  as = "SELECT id FROM events;"
+}
+`
+	sTwo, err := doris.ParseHCL(hclTwoLabels)
+	if err != nil {
+		t.Fatalf("ParseHCL(hclTwoLabels): %v", err)
+	}
+	if sqlOut := doris.FormatSchema(sTwo); !strings.Contains(sqlOut, "CREATE VIEW") {
+		t.Errorf("expected CREATE VIEW in FormatSchema:\n%s", sqlOut)
+	}
+	if hclOut := doris.FormatHCL(sTwo); !strings.Contains(hclOut, `schema = "schema.tenant_${TENANT_SLUG}"`) {
+		t.Errorf("expected quoted schema ref in FormatHCL:\n%s", hclOut)
+	}
+
+	// 2. Additional HCL error paths
+	badHCLs := []string{
+		`schema "s" { bad_attr = "1" }`,
+		`view "" { as = "SELECT 1" }`,
+		`view "bad-name!" { as = "SELECT 1" }`,
+		`view "v" { nested {} }`,
+		`view "v" { or_replace = "not_bool" as = "SELECT 1" }`,
+		`view "v" { bad_attr = "1" }`,
+		`view "v" {}`,
+		`platform_object "ONLY_ONE_LABEL" {}`,
+		`platform_object "WORKLOAD_GROUP" "wg" { bad_block {} }`,
+		`platform_object "WORKLOAD_GROUP" "wg" { if_not_exists = "not_bool" }`,
+		`platform_object "WORKLOAD_GROUP" "wg" { bad_attr = "1" }`,
+		`table "t" { bad_attr = "1" column "c" { type = int } }`,
+		`table "t" { column "" { type = int } }`,
+		`table "t" { column "bad-col!" { type = int } }`,
+		`table "t" { column "c" { type = int } column "c" { type = int } }`,
+		`table "t" { column "c" { type = int null = "bad" } }`,
+		`table "t" { column "c" { type = int bad_attr = "1" } }`,
+		`table "t" { column "c" { type = int } unique_key { columns = [column.c] merge_on_write = "bad" } }`,
+		`table "t" { column "c" { type = int } unique_key { columns = [column.c] sequence_col = "bad-col!" } }`,
+		`table "t" { column "c" { type = int } unique_key { columns = [column.c] bad_attr = "1" } }`,
+		`table "t" { column "c" { type = int } unique_key {} }`,
+		`table "t" { column "c" { type = int } distribution { type = "BAD" } }`,
+		`table "t" { column "c" { type = int } distribution { buckets = -1 } }`,
+		`table "t" { column "c" { type = int } distribution { bad_attr = 1 } }`,
+		`table "t" { column "c" { type = int } distributed_by_hash { buckets = 4 } }`,
+		`table "t" { column "c" { type = int } partition_by_list {} }`,
+		`table "t" { column "c" { type = int } partition_by {} }`,
+		`table "t" { column "c" { type = int } partition { bad_attr = 1 } }`,
+		`table "t" { column "c" { type = int } order_by { bad_attr = 1 } }`,
+		`table "t" { column "c" { type = int } order_by {} }`,
+		`table "t" { column "c" { type = int } index "" { columns = [column.c] } }`,
+		`table "t" { column "c" { type = int } index "bad-idx!" { columns = [column.c] } }`,
+		`table "t" { column "c" { type = int } index "idx" { bad_block {} } }`,
+		`table "t" { column "c" { type = int } index "idx" { bad_attr = 1 } }`,
+		`table "t" { column "c" { type = int } index "idx" {} }`,
+		`table "t" { column "c" { type = int } rollup "" { columns = [column.c] } }`,
+	}
+	for _, bh := range badHCLs {
+		if _, err := doris.ParseHCL(bh); err == nil {
+			t.Errorf("expected error for ParseHCL(%s)", bh)
+		}
+	}
+
+	// 3. ApplyStatement table-level error branches and ModifyColumn FIRST / AddIndex overwrite / WorkloadGroup new prop
+	stmts, err := doris.ParseStatements(`
+CREATE DATABASE tenant_d;
+CREATE TABLE tenant_d.tbl (
+    a VARCHAR(64) NOT NULL,
+    b INT NOT NULL DEFAULT "0"
+)
+UNIQUE KEY(a)
+DISTRIBUTED BY HASH(a) BUCKETS 4;
+
+CREATE TABLE tenant_d.tbl (
+    a VARCHAR(64) NOT NULL,
+    b BIGINT NOT NULL DEFAULT "0",
+    INDEX idx_a (a) USING INVERTED
+)
+UNIQUE KEY(a)
+DISTRIBUTED BY HASH(a) BUCKETS 4;
+
+ALTER TABLE tenant_d.tbl MODIFY COLUMN b BIGINT NOT NULL DEFAULT "1" FIRST;
+ALTER TABLE tenant_d.tbl ADD INDEX idx_a (a) USING NGRAM_BF PROPERTIES("gram_size" = "3", "bf_size" = "256");
+
+CREATE WORKLOAD GROUP IF NOT EXISTS wg1 PROPERTIES ("cpu_share" = "10");
+ALTER WORKLOAD GROUP wg1 PROPERTIES ("cpu_share" = "20", "memory_limit" = "50%");
+CREATE WORKLOAD POLICY IF NOT EXISTS wp1;
+`)
+	if err != nil {
+		t.Fatalf("ParseStatements: %v", err)
+	}
+	replayed, err := doris.ReplayStatements(stmts)
+	if err != nil {
+		t.Fatalf("ReplayStatements: %v", err)
+	}
+	if replayed.Tables[0].Columns[0].Name != "b" {
+		t.Errorf("expected column 'b' to be FIRST after MODIFY COLUMN ... FIRST, got %q", replayed.Tables[0].Columns[0].Name)
+	}
+	if replayed.Tables[0].Indexes[0].Using != "NGRAM_BF" {
+		t.Errorf("expected idx_a to be updated to NGRAM_BF, got %q", replayed.Tables[0].Indexes[0].Using)
+	}
+
+	// Table-found but column/index-missing error branches in ApplyStatement
+	for _, errStmt := range []doris.Statement{
+		{Kind: doris.StmtAlterTableAddColumn, TargetTable: "tenant_d.tbl", Column: nil},
+		{Kind: doris.StmtAlterTableAddColumn, TargetTable: "tenant_d.tbl", Column: &doris.ColumnDef{Name: "a", Type: "INT"}},
+		{Kind: doris.StmtAlterTableAddColumn, TargetTable: "tenant_d.tbl", Column: &doris.ColumnDef{Name: "c", Type: "INT"}, AfterColumn: "nonexistent"},
+		{Kind: doris.StmtAlterTableDropColumn, TargetTable: "tenant_d.tbl", DropColumnName: "nonexistent"},
+		{Kind: doris.StmtAlterTableModifyColumn, TargetTable: "tenant_d.tbl", Column: nil},
+		{Kind: doris.StmtAlterTableModifyColumn, TargetTable: "tenant_d.tbl", Column: &doris.ColumnDef{Name: "nonexistent", Type: "INT"}},
+		{Kind: doris.StmtAlterTableModifyColumn, TargetTable: "tenant_d.tbl", Column: &doris.ColumnDef{Name: "a", Type: "VARCHAR(64)"}, AfterColumn: "nonexistent"},
+		{Kind: doris.StmtAlterTableAddIndex, TargetTable: "tenant_d.tbl", Index: nil},
+		{Kind: doris.StmtAlterTableDropIndex, TargetTable: "tenant_d.tbl", DropIndexName: "nonexistent"},
+		{Kind: doris.StmtBuildIndex, TargetTable: "tenant_d.tbl", DropIndexName: "nonexistent"},
+	} {
+		if err := doris.ApplyStatement(replayed, errStmt); err == nil {
+			t.Errorf("expected error from ApplyStatement(%+v)", errStmt)
+		}
+	}
+
+	// Quote escaping and reserved-keyword column formatting in StripCommentsAndSplitStatements / FormatSchema
+	escapedSQL := `CREATE TABLE t (a VARCHAR(64) DEFAULT 'it''s \'ok\'', b VARCHAR(64) DEFAULT "a""b\"c", ` + "`system`" + ` VARCHAR(32) NOT NULL DEFAULT "loinc") UNIQUE KEY(a) DISTRIBUTED BY HASH(a) BUCKETS 1;`
+	if sEsc, err := doris.ParseSchema(escapedSQL); err != nil {
+		t.Errorf("ParseSchema(escapedSQL) failed: %v", err)
+	} else if !strings.Contains(doris.FormatSchema(sEsc), "`system` VARCHAR(32)") {
+		t.Errorf("expected backtick-quoted reserved column `system` in FormatSchema:\n%s", doris.FormatSchema(sEsc))
+	}
+}

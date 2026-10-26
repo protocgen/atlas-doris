@@ -410,7 +410,7 @@ func (s *mockStmt) Query(args []driver.Value) (driver.Rows, error) {
 		return &mockRows{
 			cols: []string{"View", "Create View"},
 			rows: [][]driver.Value{
-				{"vw_patients", "CREATE OR REPLACE VIEW internal.tenant_duke.vw_patients AS SELECT patient_id FROM internal.tenant_duke.patients;"},
+				{"vw_patients", "CREATE OR REPLACE VIEW vw_patients AS SELECT patient_id FROM internal.tenant_duke.patients;"},
 			},
 		}, nil
 	}
@@ -422,12 +422,34 @@ func (s *mockStmt) Query(args []driver.Value) (driver.Rows, error) {
 		return &mockRows{
 			cols: []string{"Table", "Create Table"},
 			rows: [][]driver.Value{
-				{"patients", "CREATE TABLE IF NOT EXISTS internal.tenant_duke.patients (patient_id VARCHAR(64) NOT NULL, mrn VARCHAR(32) NOT NULL DEFAULT \"\") UNIQUE KEY(patient_id) DISTRIBUTED BY HASH(patient_id) BUCKETS 4;"},
+				{"patients", "CREATE TABLE IF NOT EXISTS patients (patient_id VARCHAR(64) NOT NULL, mrn VARCHAR(32) NOT NULL DEFAULT \"\") UNIQUE KEY(patient_id) DISTRIBUTED BY HASH(patient_id) BUCKETS 4;"},
 			},
 		}, nil
 	}
 
 	if strings.Contains(q, "information_schema") && strings.Contains(q, "columns") {
+		if len(args) >= 2 && fmt.Sprint(args[1]) == "dup_tbl" {
+			return &mockRows{
+				cols: []string{"COLUMN_NAME", "COLUMN_TYPE", "IS_NULLABLE", "COLUMN_KEY", "COLUMN_DEFAULT", "COLUMN_COMMENT"},
+				rows: [][]driver.Value{
+					{"id", "VARCHAR(64)", "NO", "DUP", nil, "Dup key"},
+				},
+			}, nil
+		}
+		if len(args) >= 2 && fmt.Sprint(args[1]) == "agg_tbl" {
+			return &mockRows{
+				cols: []string{"COLUMN_NAME", "COLUMN_TYPE", "IS_NULLABLE", "COLUMN_KEY", "COLUMN_DEFAULT", "COLUMN_COMMENT"},
+				rows: [][]driver.Value{
+					{"id", "VARCHAR(64)", "NO", "AGG", nil, "Agg key"},
+				},
+			}, nil
+		}
+		if len(args) >= 2 && fmt.Sprint(args[1]) == "empty_tbl" {
+			return &mockRows{
+				cols: []string{"COLUMN_NAME", "COLUMN_TYPE", "IS_NULLABLE", "COLUMN_KEY", "COLUMN_DEFAULT", "COLUMN_COMMENT"},
+				rows: nil,
+			}, nil
+		}
 		return &mockRows{
 			cols: []string{"COLUMN_NAME", "COLUMN_TYPE", "IS_NULLABLE", "COLUMN_KEY", "COLUMN_DEFAULT", "COLUMN_COMMENT"},
 			rows: [][]driver.Value{
@@ -439,14 +461,20 @@ func (s *mockStmt) Query(args []driver.Value) (driver.Rows, error) {
 
 	if strings.Contains(q, "FROM") && strings.Contains(q, "atlas_schema_revisions") {
 		var rows [][]driver.Value
-		for _, r := range s.c.m.revisions {
+		for idx, r := range s.c.m.revisions {
+			var execVal any = r.ExecutedAt.Format("2006-01-02 15:04:05.000000")
+			if idx%3 == 1 {
+				execVal = r.ExecutedAt
+			} else if idx%3 == 2 {
+				execVal = []byte(r.ExecutedAt.Format(time.RFC3339Nano))
+			}
 			rows = append(rows, []driver.Value{
 				r.Version,
 				r.Description,
 				int64(r.Type),
 				int64(r.Applied),
 				int64(r.Total),
-				r.ExecutedAt.Format("2006-01-02 15:04:05.000000"),
+				execVal,
 				r.ExecutionTimeNs,
 				r.Error,
 				r.ErrorStmt,
@@ -885,5 +913,129 @@ func TestInspectSchemaFromDB_AndInfoSchemaFallback(t *testing.T) {
 	}
 	if _, err := execDefaultSchema.Apply(ctx, migrate.ApplyOptions{DirPath: autoDir}); err == nil {
 		t.Errorf("expected checksum mismatch error in Apply")
+	}
+
+	// 9. Test additional ResolvePath, ParseDorisDSN, ValidateAndNormalizeVarValue, SubstituteVars, and dir error branches
+	var nilExecPtr *migrate.Executor
+	if err := nilExecPtr.Close(); err != nil {
+		t.Errorf("expected nil error on (*Executor)(nil).Close(), got %v", err)
+	}
+	for _, p := range []string{"file://localhost/tmp/abc", "file://./rel", "file://../rel", "file://host/path"} {
+		if got, err := migrate.ResolvePath(p); err != nil || got == "" {
+			t.Errorf("ResolvePath(%q) = (%q, %v)", p, got, err)
+		}
+	}
+	if _, err := migrate.ResolvePath("file://%zz"); err == nil {
+		t.Errorf("expected error for invalid file URL")
+	}
+	if dsn, dbN, err := migrate.ParseDorisDSN("root@tcp(127.0.0.1:9030)/plain_db"); err != nil || dbN != "plain_db" || dsn == "" {
+		t.Errorf("ParseDorisDSN(plain_db) = (%q, %q, %v)", dsn, dbN, err)
+	}
+	if _, _, err := migrate.ParseDorisDSN("doris://%zz"); err == nil {
+		t.Errorf("expected error for invalid URL in ParseDorisDSN")
+	}
+	for _, badVal := range []struct{ k, v string }{
+		{"TENANT_SLUG", ""},
+		{"TENANT_SLUG", "bad\x00char"},
+		{"TENANT_SLUG", "val--comment"},
+		{"TENANT_SLUG", "val/*comment*/"},
+		{"TENANT_SLUG", "123-invalid"},
+	} {
+		if _, err := migrate.ValidateAndNormalizeVarValue(badVal.k, badVal.v); err == nil {
+			t.Errorf("expected error for ValidateAndNormalizeVarValue(%q, %q)", badVal.k, badVal.v)
+		}
+	}
+	if _, err := migrate.SubstituteVars("SELECT ${UNCLOSED", map[string]string{}); err == nil {
+		t.Errorf("expected error for malformed placeholder in SubstituteVars")
+	}
+
+	// InspectSchemaFromDB with empty defaultDB and with non-internal catalog
+	if sEmptyDB, err := migrate.InspectSchemaFromDB(ctx, db, ""); err != nil || len(sEmptyDB.Tables) == 0 {
+		t.Errorf("InspectSchemaFromDB(empty defaultDB) = (%+v, %v)", sEmptyDB, err)
+	}
+	if sIceDB, err := migrate.InspectSchemaFromDB(ctx, db, "azra_lake.tenant_duke"); err != nil || len(sIceDB.Tables) == 0 {
+		t.Errorf("InspectSchemaFromDB(azra_lake.tenant_duke) = (%+v, %v)", sIceDB, err)
+	}
+
+	// Test future migration version increment (nextMigrationVersion when latest >= now) and sanitizeMigrationName fallback
+	futureDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(futureDir, "99991231235950_future.sql"), []byte("CREATE DATABASE IF NOT EXISTS internal.tenant_duke;\n"), 0o644); err != nil {
+		t.Fatalf("write future.sql: %v", err)
+	}
+	if err := migrate.HashDir(futureDir); err != nil {
+		t.Fatalf("HashDir(futureDir): %v", err)
+	}
+	fFuture, _, err := migrate.DiffAndWrite(futureDir, "   !!!   ", sLive, migrate.DiffWriteOptions{})
+	if err != nil || fFuture != "99991231235951_migration.sql" {
+		t.Errorf("expected 99991231235951_migration.sql, got %q (err=%v)", fFuture, err)
+	}
+
+	// Test ReplayDir, LintDir, HashDir, ValidateDir, DiffAndWrite on invalid paths / broken SQL
+	for _, fn := range []func() error{
+		func() error { _, _, err := migrate.ReplayDir(""); return err },
+		func() error { _, _, err := migrate.ReplayDir("/nonexistent/dir/path"); return err },
+		func() error { _, err := migrate.LintDir("", nil, doris.LintOptions{}); return err },
+		func() error { _, err := migrate.LintDir("/nonexistent/dir/path", nil, doris.LintOptions{}); return err },
+		func() error { return migrate.HashDir("") },
+		func() error { return migrate.HashDir("/nonexistent/dir/path") },
+		func() error { return migrate.ValidateDir("", doris.LintOptions{}) },
+		func() error { return migrate.ValidateDir(t.TempDir(), doris.LintOptions{}) }, // missing atlas.sum
+		func() error {
+			_, _, err := migrate.DiffAndWrite("", "x", sLive, migrate.DiffWriteOptions{})
+			return err
+		},
+	} {
+		if err := fn(); err == nil {
+			t.Errorf("expected error from directory helper")
+		}
+	}
+
+	// Test InspectTableFromInfoSchema with empty catalog, DUP key, AGG key, and empty table
+	if tblDup, err := migrate.InspectTableFromInfoSchema(ctx, db, "", "tenant_duke", "dup_tbl"); err != nil || tblDup.Key == nil || tblDup.Key.Kind != doris.KeyDuplicate {
+		t.Errorf("InspectTableFromInfoSchema(dup_tbl) = (%+v, %v)", tblDup, err)
+	}
+	if tblAgg, err := migrate.InspectTableFromInfoSchema(ctx, db, "", "tenant_duke", "agg_tbl"); err != nil || tblAgg.Key == nil || tblAgg.Key.Kind != doris.KeyAggregate {
+		t.Errorf("InspectTableFromInfoSchema(agg_tbl) = (%+v, %v)", tblAgg, err)
+	}
+	if _, err := migrate.InspectTableFromInfoSchema(ctx, db, "", "tenant_duke", "empty_tbl"); err == nil {
+		t.Errorf("expected error for empty_tbl in InspectTableFromInfoSchema")
+	}
+
+	// Test ReplayDir and LintDir on broken SQL and failing ApplyStatement
+	brokenDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(brokenDir, "20261025000001_broken.sql"), []byte("CREATE TABLE broken (\n"), 0o644)
+	if _, _, err := migrate.ReplayDir(brokenDir); err == nil {
+		t.Errorf("expected ReplayDir error on broken SQL")
+	}
+	if _, err := migrate.LintDir(brokenDir, nil, doris.LintOptions{}); err == nil {
+		t.Errorf("expected LintDir error on broken SQL")
+	}
+
+	badApplyDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(badApplyDir, "20261025000001_bad_apply.sql"), []byte("DROP TABLE nonexistent_tbl;\n"), 0o644)
+	if _, _, err := migrate.ReplayDir(badApplyDir); err == nil {
+		t.Errorf("expected ReplayDir error on DROP TABLE nonexistent_tbl")
+	}
+	if _, err := migrate.LintDir(badApplyDir, nil, doris.LintOptions{AllowDestructive: true}); err == nil {
+		t.Errorf("expected LintDir error on DROP TABLE nonexistent_tbl")
+	}
+	// DiffAndWrite when destructive change is disallowed returns lint error
+	if _, _, err := migrate.DiffAndWrite(futureDir, "drop_all", doris.NewSchema(), migrate.DiffWriteOptions{}); err == nil {
+		t.Errorf("expected DiffAndWrite lint error when dropping tables without AllowDestructive")
+	}
+
+	// Test async schema change polling timeout when job stays RUNNING
+	timeoutDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(timeoutDir, "20261025000001_alter.sql"), []byte("CREATE TABLE IF NOT EXISTS internal.tenant_duke.patients (patient_id VARCHAR(64) NOT NULL, mrn VARCHAR(32) NOT NULL DEFAULT \"\") UNIQUE KEY(patient_id) DISTRIBUTED BY HASH(patient_id) BUCKETS 4;\nALTER TABLE internal.tenant_duke.patients MODIFY COLUMN mrn VARCHAR(64) NOT NULL DEFAULT \"\";\n"), 0o644)
+	_ = migrate.HashDir(timeoutDir)
+	dbTimeout, mockTimeout := setupMockDB(t)
+	mockTimeout.alterState = "RUNNING"
+	execTimeout := migrate.NewExecutor(dbTimeout, "internal")
+	if _, err := execTimeout.Apply(ctx, migrate.ApplyOptions{
+		DirPath:      timeoutDir,
+		PollInterval: 2 * time.Millisecond,
+		PollTimeout:  5 * time.Millisecond,
+	}); err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("expected poll timeout error, got %v", err)
 	}
 }

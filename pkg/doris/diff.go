@@ -1,6 +1,7 @@
 package doris
 
 import (
+	"strconv"
 	"strings"
 )
 
@@ -53,15 +54,15 @@ func DiffWithOptions(current, desired *Schema, opts DiffOptions) ([]Statement, e
 	// 3. Tables (create new, alter existing, or drop removed when AllowDestructive is set).
 	currentByName := make(map[string]*TableDef, len(current.Tables))
 	for _, t := range current.Tables {
-		currentByName[t.CanonicalName()] = t
+		currentByName[t.LookupKey()] = t
 	}
 	desiredByName := make(map[string]*TableDef, len(desired.Tables))
 	for _, t := range desired.Tables {
-		desiredByName[t.CanonicalName()] = t
+		desiredByName[t.LookupKey()] = t
 	}
 
 	for _, dt := range desired.Tables {
-		ct, existed := currentByName[dt.CanonicalName()]
+		ct, existed := currentByName[dt.LookupKey()]
 		if !existed {
 			tblCopy := dt.Clone()
 			tblCopy.IfNotExists = true
@@ -76,7 +77,7 @@ func DiffWithOptions(current, desired *Schema, opts DiffOptions) ([]Statement, e
 
 	if opts.AllowDestructive {
 		for _, ct := range current.Tables {
-			if _, ok := desiredByName[ct.CanonicalName()]; !ok {
+			if _, ok := desiredByName[ct.LookupKey()]; !ok {
 				stmts = append(stmts, Statement{
 					Kind:        StmtDropTable,
 					TargetTable: ct.CanonicalName(),
@@ -116,22 +117,25 @@ func diffTable(current, desired *TableDef, opts DiffOptions) []Statement {
 	}
 
 	// 1. Dropped columns (if AllowDestructive).
-	if opts.AllowDestructive {
-		for _, cc := range current.Columns {
+	evolvingCols := make([]string, 0, len(current.Columns)+len(desired.Columns))
+	for _, cc := range current.Columns {
+		if opts.AllowDestructive {
 			if _, ok := desiredColByName[cc.Name]; !ok {
 				stmts = append(stmts, Statement{
 					Kind:           StmtAlterTableDropColumn,
 					TargetTable:    targetName,
 					DropColumnName: cc.Name,
 				})
+				continue
 			}
 		}
+		evolvingCols = append(evolvingCols, cc.Name)
 	}
 
 	// 2. Added and modified columns in desired order.
 	isIceberg := desired.IsIcebergTable()
 	isIcebergV3 := isIceberg && strings.TrimSpace(desired.PropertyMap()["format-version"]) == "3"
-	for _, dc := range desired.Columns {
+	for i, dc := range desired.Columns {
 		cc, existed := currentColByName[dc.Name]
 		if !existed {
 			colToAdd := dc.Clone()
@@ -140,10 +144,28 @@ func diffTable(current, desired *TableDef, opts DiffOptions) []Statement {
 				colToAdd.HasDefault = false
 				colToAdd.Default = ""
 			}
+			var isFirst bool
+			var afterCol string
+			if i == 0 {
+				if len(evolvingCols) > 0 {
+					isFirst = true
+				}
+				evolvingCols = append([]string{dc.Name}, evolvingCols...)
+			} else {
+				prevName := desired.Columns[i-1].Name
+				if len(evolvingCols) > 0 && evolvingCols[len(evolvingCols)-1] == prevName {
+					evolvingCols = append(evolvingCols, dc.Name)
+				} else {
+					afterCol = prevName
+					evolvingCols = insertAfterCol(evolvingCols, prevName, dc.Name)
+				}
+			}
 			stmts = append(stmts, Statement{
 				Kind:        StmtAlterTableAddColumn,
 				TargetTable: targetName,
 				Column:      colToAdd,
+				First:       isFirst,
+				AfterColumn: afterCol,
 			})
 			continue
 		}
@@ -215,16 +237,68 @@ func diffTable(current, desired *TableDef, opts DiffOptions) []Statement {
 		if !isMutableTableProperty(dp.Key) {
 			continue
 		}
-		if curVal, exists := curProps[dp.Key]; !exists || curVal != dp.Value {
-			stmts = append(stmts, Statement{
-				Kind:        StmtAlterTableSetProperties,
-				TargetTable: targetName,
-				Properties:  []Property{{Key: dp.Key, Value: dp.Value}},
-			})
+		if tablePropertyMatches(curProps, dp.Key, dp.Value) {
+			continue
 		}
+		stmts = append(stmts, Statement{
+			Kind:        StmtAlterTableSetProperties,
+			TargetTable: targetName,
+			Properties:  []Property{{Key: dp.Key, Value: dp.Value}},
+		})
 	}
 
 	return stmts
+}
+
+func insertAfterCol(cols []string, afterName, newName string) []string {
+	for i, c := range cols {
+		if c == afterName {
+			out := make([]string, 0, len(cols)+1)
+			out = append(out, cols[:i+1]...)
+			out = append(out, newName)
+			out = append(out, cols[i+1:]...)
+			return out
+		}
+	}
+	return append(cols, newName)
+}
+
+func tablePropertyMatches(curProps map[string]string, key, desiredVal string) bool {
+	if curVal, exists := curProps[key]; exists {
+		return curVal == desiredVal
+	}
+	// Live Doris SHOW CREATE TABLE renders "replication_num" = "N" as
+	// "replication_allocation" = "tag.location.default: N".
+	if key == "replication_num" {
+		if alloc, ok := curProps["replication_allocation"]; ok {
+			if count, ok := replicationCountFromAllocation(alloc); ok && count == strings.TrimSpace(desiredVal) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func replicationCountFromAllocation(alloc string) (string, bool) {
+	parts := strings.Split(alloc, ",")
+	total := 0
+	found := false
+	for _, p := range parts {
+		colonIdx := strings.LastIndexByte(p, ':')
+		if colonIdx < 0 {
+			return "", false
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(p[colonIdx+1:]))
+		if err != nil || n <= 0 {
+			return "", false
+		}
+		total += n
+		found = true
+	}
+	if !found {
+		return "", false
+	}
+	return strconv.Itoa(total), true
 }
 
 func shouldBuildIndexOnline(using string) bool {

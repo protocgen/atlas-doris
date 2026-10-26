@@ -126,47 +126,70 @@ func lintTableKeyAndANN(t *TableDef, colByName map[string]*ColumnDef) []Violatio
 		}
 	}
 
+	if seq := strings.TrimSpace(t.SequenceCol()); seq != "" {
+		if t.Key != nil && t.Key.Kind != KeyUnique && t.Key.Kind != KeyPrimary {
+			violations = append(violations, Violation{
+				Rule:       DORIS002_IMMUTABLE_SEQUENCE,
+				TableName:  tblName,
+				ColumnName: seq,
+				Message:    fmt.Sprintf("function_column.sequence_col %q is only supported on UNIQUE KEY or PRIMARY KEY tables (found %s KEY)", seq, t.Key.Kind),
+			})
+		}
+	}
+
 	for _, idx := range t.Indexes {
-		if !strings.EqualFold(strings.TrimSpace(idx.Using), "ANN") {
+		usingUpper := strings.ToUpper(strings.TrimSpace(idx.Using))
+		if usingUpper != "ANN" && usingUpper != "VECTOR" {
 			continue
 		}
-		if t.Key != nil && t.Key.Kind != KeyDuplicate && (t.Key.Kind != KeyUnique || !t.HasUniqueKeyMergeOnWrite()) {
-			violations = append(violations, Violation{
-				Rule:      DORIS006_SAFE_TYPE_EVOLUTION,
-				TableName: tblName,
-				Message:   fmt.Sprintf("ANN index %q is only supported on DUPLICATE KEY tables or UNIQUE KEY tables with merge-on-write enabled in Doris 4.x (found %s KEY)", idx.Name, t.Key.Kind),
-			})
+		if t.Key != nil {
+			validKeyModel := false
+			switch t.Key.Kind {
+			case KeyDuplicate:
+				validKeyModel = true
+			case KeyUnique:
+				validKeyModel = t.HasUniqueKeyMergeOnWrite()
+			case KeyPrimary:
+				validKeyModel = t.HasPersistentIndex() || t.HasUniqueKeyMergeOnWrite()
+			}
+			if !validKeyModel {
+				violations = append(violations, Violation{
+					Rule:      DORIS006_SAFE_TYPE_EVOLUTION,
+					TableName: tblName,
+					Message:   fmt.Sprintf("%s index %q is only supported on DUPLICATE KEY tables, UNIQUE KEY tables with merge-on-write enabled, or PRIMARY KEY tables with persistent index enabled (found %s KEY)", usingUpper, idx.Name, t.Key.Kind),
+				})
+			}
 		}
 		if len(idx.Columns) != 1 {
 			violations = append(violations, Violation{
 				Rule:      DORIS006_SAFE_TYPE_EVOLUTION,
 				TableName: tblName,
-				Message:   fmt.Sprintf("ANN index %q must target exactly 1 column", idx.Name),
+				Message:   fmt.Sprintf("%s index %q must target exactly 1 column", usingUpper, idx.Name),
 			})
 		} else if col, ok := colByName[idx.Columns[0]]; !ok {
 			violations = append(violations, Violation{
 				Rule:       DORIS006_SAFE_TYPE_EVOLUTION,
 				TableName:  tblName,
 				ColumnName: idx.Columns[0],
-				Message:    fmt.Sprintf("ANN index %q references unknown column %q", idx.Name, idx.Columns[0]),
+				Message:    fmt.Sprintf("%s index %q references unknown column %q", usingUpper, idx.Name, idx.Columns[0]),
 			})
 		} else if NormalizeType(col.Type) != "ARRAY<FLOAT>" || col.Nullable {
 			violations = append(violations, Violation{
 				Rule:       DORIS006_SAFE_TYPE_EVOLUTION,
 				TableName:  tblName,
 				ColumnName: col.Name,
-				Message:    fmt.Sprintf("ANN index %q column %q must be ARRAY<FLOAT> NOT NULL (got %s, nullable=%v)", idx.Name, col.Name, col.Type, col.Nullable),
+				Message:    fmt.Sprintf("%s index %q column %q must be ARRAY<FLOAT> NOT NULL (got %s, nullable=%v)", usingUpper, idx.Name, col.Name, col.Type, col.Nullable),
 			})
 		}
 		idxProps := propertiesToMap(idx.Properties)
 		indexType := strings.ToLower(strings.TrimSpace(idxProps["index_type"]))
 		switch indexType {
-		case "hnsw", "ivf", "ivf_on_disk":
+		case "hnsw", "ivf", "ivf_on_disk", "ivfpq":
 		default:
 			violations = append(violations, Violation{
 				Rule:      DORIS006_SAFE_TYPE_EVOLUTION,
 				TableName: tblName,
-				Message:   fmt.Sprintf("ANN index %q must set \"index_type\" to \"hnsw\", \"ivf\", or \"ivf_on_disk\" (got %q)", idx.Name, idxProps["index_type"]),
+				Message:   fmt.Sprintf("%s index %q must set \"index_type\" to \"hnsw\", \"ivf\", \"ivf_on_disk\", or \"ivfpq\" (got %q)", usingUpper, idx.Name, idxProps["index_type"]),
 			})
 		}
 		metricType := strings.ToLower(strings.TrimSpace(idxProps["metric_type"]))
@@ -176,14 +199,14 @@ func lintTableKeyAndANN(t *TableDef, colByName map[string]*ColumnDef) []Violatio
 			violations = append(violations, Violation{
 				Rule:      DORIS006_SAFE_TYPE_EVOLUTION,
 				TableName: tblName,
-				Message:   fmt.Sprintf("ANN index %q must set \"metric_type\" to \"l2_distance\", \"inner_product\", or \"cosine_distance\" (got %q)", idx.Name, idxProps["metric_type"]),
+				Message:   fmt.Sprintf("%s index %q must set \"metric_type\" to \"l2_distance\", \"inner_product\", or \"cosine_distance\" (got %q)", usingUpper, idx.Name, idxProps["metric_type"]),
 			})
 		}
 		if dim, err := strconv.Atoi(strings.TrimSpace(idxProps["dim"])); err != nil || dim <= 0 {
 			violations = append(violations, Violation{
 				Rule:      DORIS006_SAFE_TYPE_EVOLUTION,
 				TableName: tblName,
-				Message:   fmt.Sprintf("ANN index %q must specify positive integer \"dim\"", idx.Name),
+				Message:   fmt.Sprintf("%s index %q must specify positive integer \"dim\"", usingUpper, idx.Name),
 			})
 		}
 	}
@@ -216,13 +239,22 @@ func LintTableEvolution(before, after *TableDef, opts LintOptions) []Violation {
 
 	var violations []Violation
 
-	// DORIS001_IMMUTABLE_KEY: Block mutating UNIQUE KEY, DUPLICATE KEY, or AGGREGATE KEY columns.
+	// DORIS001_IMMUTABLE_KEY: Block mutating PRIMARY KEY, UNIQUE KEY, DUPLICATE KEY, or AGGREGATE KEY columns.
 	if !keysEqual(before.Key, after.Key) {
 		violations = append(violations, Violation{
 			Rule:      DORIS001_IMMUTABLE_KEY,
 			TableName: tblName,
 			Message:   fmt.Sprintf("table key clause cannot be mutated on existing table (before=%s, after=%s)", formatKeyDebug(before.Key), formatKeyDebug(after.Key)),
 		})
+	}
+	if before.Key != nil && before.Key.Kind == KeyPrimary && before.HasPersistentIndex() {
+		if afterVal, ok := after.GetProperty("enable_persistent_index"); ok && strings.EqualFold(strings.TrimSpace(afterVal), "false") {
+			violations = append(violations, Violation{
+				Rule:      DORIS001_IMMUTABLE_KEY,
+				TableName: tblName,
+				Message:   "enable_persistent_index cannot be disabled on existing PRIMARY KEY table",
+			})
+		}
 	}
 
 	// DORIS002_IMMUTABLE_SEQUENCE: Block mutating "function_column.sequence_col".
@@ -263,6 +295,13 @@ func LintTableEvolution(before, after *TableDef, opts LintOptions) []Violation {
 			Rule:      DORIS003_IMMUTABLE_DISTRIBUTION,
 			TableName: tblName,
 			Message:   fmt.Sprintf("colocate_with group cannot be mutated on existing table (before=%q, after=%q)", beforeColocate, afterColocate),
+		})
+	}
+	if before.Partition != nil && after.Partition != nil && !before.Partition.Equal(after.Partition) {
+		violations = append(violations, Violation{
+			Rule:      DORIS003_IMMUTABLE_DISTRIBUTION,
+			TableName: tblName,
+			Message:   "PARTITION BY clause cannot be mutated on existing table",
 		})
 	}
 
@@ -342,19 +381,12 @@ func LintSchemaEvolution(current, desired *Schema, opts LintOptions) []Violation
 	}
 
 	var violations []Violation
-	currentByName := make(map[string]*TableDef, len(current.Tables))
-	for _, t := range current.Tables {
-		currentByName[t.LookupKey()] = t
-	}
-	desiredByName := make(map[string]*TableDef, len(desired.Tables))
-	for _, t := range desired.Tables {
-		desiredByName[t.LookupKey()] = t
-	}
+	currentForDesired, desiredForCurrent := pairSchemaTables(current.Tables, desired.Tables)
 
 	// Check dropped tables if destructive changes are disallowed.
 	if !opts.AllowDestructive {
 		for _, ct := range current.Tables {
-			if _, ok := desiredByName[ct.LookupKey()]; !ok {
+			if _, ok := desiredForCurrent[ct]; !ok {
 				violations = append(violations, Violation{
 					Rule:      DORIS004_NO_COLUMN_DROP,
 					TableName: ct.CanonicalName(),
@@ -365,7 +397,7 @@ func LintSchemaEvolution(current, desired *Schema, opts LintOptions) []Violation
 	}
 
 	for _, dt := range desired.Tables {
-		if ct, existed := currentByName[dt.LookupKey()]; existed {
+		if ct, existed := currentForDesired[dt]; existed {
 			violations = append(violations, LintTableEvolution(ct, dt, opts)...)
 		} else {
 			violations = append(violations, LintTable(dt)...)
@@ -395,14 +427,14 @@ func IsSafeTypeEvolution(beforeType, afterType string) bool {
 	}
 
 	if strings.HasPrefix(bt, "ARRAY<") && strings.HasSuffix(bt, ">") {
-		if !(strings.HasPrefix(at, "ARRAY<") && strings.HasSuffix(at, ">")) {
+		if !strings.HasPrefix(at, "ARRAY<") || !strings.HasSuffix(at, ">") {
 			return false
 		}
 		return IsSafeTypeEvolution(bt[6:len(bt)-1], at[6:len(at)-1])
 	}
 
 	if strings.HasPrefix(bt, "MAP<") && strings.HasSuffix(bt, ">") {
-		if !(strings.HasPrefix(at, "MAP<") && strings.HasSuffix(at, ">")) {
+		if !strings.HasPrefix(at, "MAP<") || !strings.HasSuffix(at, ">") {
 			return false
 		}
 		partsB := splitTopLevelComma(bt[4 : len(bt)-1])
@@ -414,7 +446,7 @@ func IsSafeTypeEvolution(beforeType, afterType string) bool {
 	}
 
 	if strings.HasPrefix(bt, "STRUCT<") && strings.HasSuffix(bt, ">") {
-		if !(strings.HasPrefix(at, "STRUCT<") && strings.HasSuffix(at, ">")) {
+		if !strings.HasPrefix(at, "STRUCT<") || !strings.HasSuffix(at, ">") {
 			return false
 		}
 		fieldsB := splitTopLevelComma(bt[7 : len(bt)-1])
@@ -442,6 +474,9 @@ func IsSafeTypeEvolution(beforeType, afterType string) bool {
 		if n, okA := parseVarcharLength(at); okA {
 			return n >= m
 		}
+		if at == "STRING" || at == "TEXT" {
+			return true
+		}
 		return false
 	}
 
@@ -463,6 +498,10 @@ func IsSafeTypeEvolution(beforeType, afterType string) bool {
 		return at == "LARGEINT"
 	case "FLOAT":
 		return at == "DOUBLE"
+	case "DATE", "DATEV2":
+		return at == "DATETIME" || at == "DATETIMEV2" ||
+			(strings.HasPrefix(at, "DATETIME(") && strings.HasSuffix(at, ")")) ||
+			(strings.HasPrefix(at, "DATETIMEV2(") && strings.HasSuffix(at, ")"))
 	default:
 		return false
 	}

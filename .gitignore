@@ -1,5 +1,7 @@
 # Binaries
 /atlas-doris
+/atlas-olap
+/atlas-starrocks
 
 # OS
 .DS_Store

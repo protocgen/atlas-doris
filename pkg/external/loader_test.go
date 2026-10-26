@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/protocgen/atlas-doris/pkg/doris"
 	"github.com/protocgen/atlas-doris/pkg/external"
 	"github.com/protocgen/atlas-doris/pkg/migrate"
 )
@@ -169,6 +170,92 @@ table "patients" {
 	}
 	if len(external.FilterSchemaByTarget(schemaAllMode, external.TargetAll).Tables) != 2 {
 		t.Errorf("expected FilterSchemaByTarget(TargetAll) to keep 2 tables")
+	}
+
+	// 6. Add *_starrocks.sql and *_starrocks.hcl and verify TargetStarRocks & TargetDoris isolation
+	starrocksSQL := `
+CREATE TABLE IF NOT EXISTS internal.tenant_${TENANT_SLUG}.sr_encounters (
+    encounter_id VARCHAR(64) NOT NULL,
+    patient_id VARCHAR(64) NOT NULL,
+    publication_generation BIGINT NOT NULL DEFAULT "0"
+)
+PRIMARY KEY(encounter_id)
+DISTRIBUTED BY HASH(patient_id) BUCKETS ${TENANT_BUCKETS}
+PROPERTIES (
+    "storage_volume" = "builtin_storage_volume",
+    "enable_persistent_index" = "true",
+    "datacache.enable" = "true",
+    "function_column.sequence_col" = "publication_generation"
+);`
+	starrocksHCL := `
+table "sr_encounters" {
+  schema = "schema.tenant_${TENANT_SLUG}"
+  column "encounter_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "patient_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "publication_generation" {
+    type = bigint
+    null = false
+    default = "0"
+  }
+  primary_key {
+    columns = [column.encounter_id]
+    sequence_col = column.publication_generation
+  }
+  distributed_by_hash {
+    columns = [column.patient_id]
+    buckets = "${TENANT_BUCKETS}"
+  }
+  properties = {
+    storage_volume = "builtin_storage_volume"
+    enable_persistent_index = "true"
+    "datacache.enable" = "true"
+    "function_column.sequence_col" = "publication_generation"
+  }
+}`
+	if err := os.WriteFile(filepath.Join(tmpDir, "encounter_starrocks.sql"), []byte(starrocksSQL), 0o644); err != nil {
+		t.Fatalf("write starrocks sql: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "encounter_starrocks.hcl"), []byte(starrocksHCL), 0o644); err != nil {
+		t.Fatalf("write starrocks hcl: %v", err)
+	}
+
+	srOut, err := external.ExternalSchemaSQL(ctx, external.ExternalSchemaOptions{
+		SQLDir: tmpDir,
+		Target: external.TargetStarRocks,
+	})
+	if err != nil {
+		t.Fatalf("ExternalSchemaSQL(TargetStarRocks) failed: %v", err)
+	}
+	if !strings.Contains(srOut, "PRIMARY KEY(encounter_id)") || strings.Contains(srOut, "UNIQUE KEY(patient_id)") {
+		t.Errorf("TargetStarRocks output unexpected:\n%s", srOut)
+	}
+
+	dorisOnlyAfterSR, err := external.ExternalSchemaSQL(ctx, external.ExternalSchemaOptions{
+		SQLDir: tmpDir,
+		Target: external.TargetDoris,
+	})
+	if err != nil {
+		t.Fatalf("ExternalSchemaSQL(TargetDoris after adding starrocks files) failed: %v", err)
+	}
+	if strings.Contains(dorisOnlyAfterSR, "sr_encounters") || !strings.Contains(dorisOnlyAfterSR, "UNIQUE KEY(patient_id)") {
+		t.Errorf("TargetDoris should exclude *_starrocks.sql, got:\n%s", dorisOnlyAfterSR)
+	}
+
+	combinedSchema, err := external.LoadFromPath(tmpDir, external.TargetAll)
+	if err != nil {
+		t.Fatalf("LoadFromPath(TargetAll with starrocks): %v", err)
+	}
+	if len(external.FilterSchemaByTarget(combinedSchema, external.TargetStarRocks).Tables) != 1 {
+		t.Errorf("expected FilterSchemaByTarget(TargetStarRocks) to keep 1 StarRocks table")
+	}
+	if len(external.FilterSchemaByTarget(combinedSchema, external.TargetDoris).Tables) != 1 {
+		t.Errorf("expected FilterSchemaByTarget(TargetDoris) to keep 1 Doris table and exclude StarRocks table")
 	}
 
 	// Test --hcl-file and Format="hcl"
@@ -379,5 +466,252 @@ exit 0
 		if _, err := external.ExternalSchemaSQL(ctx, badOpts); err == nil {
 			t.Errorf("expected error for ExternalSchemaSQL(%+v)", badOpts)
 		}
+	}
+}
+
+func TestMultiDialectDirectory_SameTableName_DiffAndFilter(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	dorisSQL := `
+CREATE TABLE IF NOT EXISTS internal.tenant_${TENANT_SLUG}.patients (
+    patient_id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(64) NOT NULL DEFAULT "",
+    publication_generation BIGINT NOT NULL DEFAULT "0"
+)
+UNIQUE KEY(patient_id)
+DISTRIBUTED BY HASH(patient_id) BUCKETS ${TENANT_BUCKETS}
+PROPERTIES (
+    "storage_vault_name" = "azra_lakehouse_vault",
+    "enable_unique_key_merge_on_write" = "true",
+    "function_column.sequence_col" = "publication_generation"
+);`
+
+	starrocksSQL := `
+CREATE TABLE IF NOT EXISTS internal.tenant_${TENANT_SLUG}.patients (
+    patient_id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(64) NOT NULL DEFAULT "",
+    publication_generation BIGINT NOT NULL DEFAULT "0"
+)
+PRIMARY KEY(patient_id)
+DISTRIBUTED BY HASH(patient_id) BUCKETS ${TENANT_BUCKETS}
+PROPERTIES (
+    "storage_volume" = "azra_sr_volume",
+    "enable_persistent_index" = "true",
+    "function_column.sequence_col" = "publication_generation"
+);`
+
+	icebergSQL := `
+CREATE TABLE IF NOT EXISTS azra_lake.tenant_${TENANT_SLUG}.patients (
+    patient_id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(64) NOT NULL,
+    publication_generation BIGINT NOT NULL
+)
+PROPERTIES (
+    "compression_codec" = "zstd"
+);`
+
+	dorisHCL := `
+table "patients" {
+  schema = "schema.tenant_${TENANT_SLUG}"
+  column "patient_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "mrn" {
+    type = varchar(64)
+    null = false
+    default = ""
+  }
+  column "publication_generation" {
+    type = bigint
+    null = false
+    default = "0"
+  }
+  unique_key {
+    columns = [column.patient_id]
+    merge_on_write = true
+    sequence_col = column.publication_generation
+  }
+  distributed_by_hash {
+    columns = [column.patient_id]
+    buckets = "${TENANT_BUCKETS}"
+  }
+  properties = {
+    storage_vault_name = "azra_lakehouse_vault"
+  }
+}`
+
+	starrocksHCL := `
+table "patients" {
+  schema = "schema.tenant_${TENANT_SLUG}"
+  column "patient_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "mrn" {
+    type = varchar(64)
+    null = false
+    default = ""
+  }
+  column "publication_generation" {
+    type = bigint
+    null = false
+    default = "0"
+  }
+  primary_key {
+    columns = [column.patient_id]
+    enable_persistent_index = true
+    sequence_col = column.publication_generation
+  }
+  distributed_by_hash {
+    columns = [column.patient_id]
+    buckets = "${TENANT_BUCKETS}"
+  }
+  properties = {
+    storage_volume = "azra_sr_volume"
+  }
+}`
+
+	icebergHCL := `
+table "patients" {
+  catalog = "azra_lake"
+  schema = "schema.tenant_${TENANT_SLUG}"
+  column "patient_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "mrn" {
+    type = varchar(64)
+    null = false
+  }
+  column "publication_generation" {
+    type = bigint
+    null = false
+  }
+  properties = {
+    compression_codec = "zstd"
+  }
+}`
+
+	// StarRocks DUPLICATE KEY table WITHOUT storage_volume or GIN/VECTOR indexes
+	srDupSQL := `
+CREATE TABLE IF NOT EXISTS internal.tenant_${TENANT_SLUG}.audit_events (
+    event_id VARCHAR(64) NOT NULL,
+    event_type VARCHAR(32) NOT NULL DEFAULT ""
+)
+DUPLICATE KEY(event_id)
+DISTRIBUTED BY HASH(event_id) BUCKETS 8;`
+
+	srDupHCL := `
+table "audit_events" {
+  schema = "schema.tenant_${TENANT_SLUG}"
+  column "event_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "event_type" {
+    type = varchar(32)
+    null = false
+    default = ""
+  }
+  duplicate_key {
+    columns = [column.event_id]
+  }
+  distributed_by_hash {
+    columns = [column.event_id]
+    buckets = 8
+  }
+}`
+
+	for name, content := range map[string]string{
+		"patient_profile_doris.sql":     dorisSQL,
+		"patient_profile_starrocks.sql": starrocksSQL,
+		"patient_profile_iceberg.sql":   icebergSQL,
+		"patient_profile_doris.hcl":     dorisHCL,
+		"patient_profile_starrocks.hcl": starrocksHCL,
+		"patient_profile_iceberg.hcl":   icebergHCL,
+		"audit_events_starrocks.sql":    srDupSQL,
+		"audit_events_starrocks.hcl":    srDupHCL,
+	} {
+		if err := os.WriteFile(filepath.Join(tmpDir, name), []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	sAll, err := external.LoadFromPath(tmpDir, external.TargetAll)
+	if err != nil {
+		t.Fatalf("LoadFromPath(TargetAll): %v", err)
+	}
+	// Expect 4 deduplicated tables: 1 Doris (patients), 2 StarRocks (patients + audit_events), 1 Iceberg (patients)
+	if len(sAll.Tables) != 4 {
+		t.Fatalf("expected 4 deduplicated tables in TargetAll, got %d", len(sAll.Tables))
+	}
+
+	// Self-diff on multi-dialect schema must produce 0 statements and nil error (no DORIS001 collision)
+	diffStmts, err := doris.Diff(sAll, sAll)
+	if err != nil {
+		t.Fatalf("doris.Diff(sAll, sAll) failed on multi-dialect schema: %v", err)
+	}
+	if len(diffStmts) != 0 {
+		t.Fatalf("expected 0 diff statements on self-diff, got %d: %v", len(diffStmts), doris.FormatStatements(diffStmts))
+	}
+
+	// FilterSchemaByTarget must classify DUPLICATE KEY table from *_starrocks.sql as StarRocks, not Doris
+	sDorisFiltered := external.FilterSchemaByTarget(sAll, external.TargetDoris)
+	if len(sDorisFiltered.Tables) != 1 || sDorisFiltered.Tables[0].Name != "patients" {
+		t.Errorf("expected TargetDoris filter to retain only 1 Doris table (patients), got %d", len(sDorisFiltered.Tables))
+	}
+	sSRFiltered := external.FilterSchemaByTarget(sAll, external.TargetStarRocks)
+	if len(sSRFiltered.Tables) != 2 {
+		t.Errorf("expected TargetStarRocks filter to retain 2 StarRocks tables (patients + audit_events), got %d", len(sSRFiltered.Tables))
+	}
+	sIceFiltered := external.FilterSchemaByTarget(sAll, external.TargetIceberg)
+	if len(sIceFiltered.Tables) != 1 {
+		t.Errorf("expected TargetIceberg filter to retain 1 Iceberg table, got %d", len(sIceFiltered.Tables))
+	}
+}
+
+func TestRealProto2TypeIntegration_MultiTarget(t *testing.T) {
+	proto2typeDir := filepath.Clean(filepath.Join("..", "proto2type"))
+	protoFile := filepath.Join(proto2typeDir, "testdata", "doris_tenant_profile.proto")
+	if _, err := os.Stat(protoFile); os.IsNotExist(err) {
+		t.Skip("skipping real proto2type integration test: ../proto2type/testdata/doris_tenant_profile.proto not found")
+	}
+
+	ctx := context.Background()
+	sDoris, err := external.LoadSchema(ctx, "proto://"+protoFile, external.LoadOptions{
+		Target:        external.TargetDoris,
+		ProtoIncludes: []string{proto2typeDir},
+	})
+	if err != nil {
+		t.Fatalf("LoadSchema(TargetDoris) failed: %v", err)
+	}
+	sStarRocks, err := external.LoadSchema(ctx, "proto://"+protoFile, external.LoadOptions{
+		Target:        external.TargetStarRocks,
+		ProtoIncludes: []string{proto2typeDir},
+	})
+	if err != nil {
+		t.Fatalf("LoadSchema(TargetStarRocks) failed: %v", err)
+	}
+	sIceberg, err := external.LoadSchema(ctx, "proto://"+protoFile, external.LoadOptions{
+		Target:        external.TargetIceberg,
+		ProtoIncludes: []string{proto2typeDir},
+	})
+	if err != nil {
+		t.Fatalf("LoadSchema(TargetIceberg) failed: %v", err)
+	}
+	sAll, err := external.LoadSchema(ctx, "proto://"+protoFile+"?doris_mode=all", external.LoadOptions{
+		Target:        external.TargetAll,
+		ProtoIncludes: []string{proto2typeDir},
+	})
+	if err != nil {
+		t.Fatalf("LoadSchema(TargetAll, doris_mode=all) failed: %v", err)
+	}
+
+	if len(sDoris.Tables) == 0 || len(sDoris.Tables) != len(sStarRocks.Tables) || len(sDoris.Tables) != len(sIceberg.Tables) {
+		t.Fatalf("table count mismatch: doris=%d starrocks=%d iceberg=%d", len(sDoris.Tables), len(sStarRocks.Tables), len(sIceberg.Tables))
+	}
+	if stmts, err := doris.Diff(sAll, sAll); err != nil || len(stmts) != 0 {
+		t.Fatalf("Diff(sAll, sAll) on proto2type doris_mode=all failed: stmts=%d err=%v", len(stmts), err)
 	}
 }

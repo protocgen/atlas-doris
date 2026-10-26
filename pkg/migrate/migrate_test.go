@@ -234,6 +234,53 @@ func TestParseDorisDSN(t *testing.T) {
 	if !strings.HasPrefix(dsn, "admin:secret@tcp(doris-fe.internal:9030)/tenant_duke?") {
 		t.Errorf("unexpected DSN: %q", dsn)
 	}
+
+	srDSN, srDB, err := migrate.ParseDorisDSN("starrocks://admin:secret@starrocks-fe.internal:9030/tenant_duke")
+	if err != nil {
+		t.Fatalf("ParseDorisDSN(starrocks://) failed: %v", err)
+	}
+	if srDB != "tenant_duke" {
+		t.Errorf("expected srDB=tenant_duke, got %q", srDB)
+	}
+	if !strings.HasPrefix(srDSN, "admin:secret@tcp(starrocks-fe.internal:9030)/tenant_duke?") {
+		t.Errorf("unexpected StarRocks DSN: %q", srDSN)
+	}
+}
+
+func TestStarRocksExecutor_RevisionsDDLAndDial(t *testing.T) {
+	ctx := context.Background()
+	db, mock := setupMockDB(t)
+
+	srExec := migrate.NewStarRocksExecutor(db, "internal.tenant_duke")
+	ddl := srExec.RevisionsTableCreateSQL()
+	if !strings.Contains(ddl, "PRIMARY KEY(version)") {
+		t.Errorf("expected StarRocks revisions DDL to use PRIMARY KEY(version), got:\n%s", ddl)
+	}
+	if !strings.Contains(ddl, `"enable_persistent_index" = "true"`) {
+		t.Errorf("expected StarRocks revisions DDL to enable persistent index, got:\n%s", ddl)
+	}
+	if strings.Contains(ddl, "UNIQUE KEY(version)") {
+		t.Errorf("expected StarRocks revisions DDL not to contain UNIQUE KEY(version), got:\n%s", ddl)
+	}
+	if err := srExec.EnsureRevisionsTable(ctx); err != nil {
+		t.Fatalf("EnsureRevisionsTable on StarRocksExecutor failed: %v", err)
+	}
+	if len(mock.executedSQL) == 0 || !strings.Contains(mock.executedSQL[len(mock.executedSQL)-1], "PRIMARY KEY(version)") {
+		t.Errorf("expected EnsureRevisionsTable to execute StarRocks PRIMARY KEY DDL, got: %v", mock.executedSQL)
+	}
+
+	origDriver := migrate.DefaultSQLDriver
+	migrate.DefaultSQLDriver = "mockdoris"
+	t.Cleanup(func() { migrate.DefaultSQLDriver = origDriver })
+
+	dialedSR, err := migrate.DialExecutor("starrocks://root:pass@localhost:9030/tenant_duke", "internal.tenant_duke")
+	if err != nil {
+		t.Fatalf("DialExecutor(starrocks://) failed: %v", err)
+	}
+	defer func() { _ = dialedSR.Close() }()
+	if !strings.Contains(dialedSR.RevisionsTableCreateSQL(), "PRIMARY KEY(version)") {
+		t.Errorf("expected DialExecutor(starrocks://) to configure StarRocks revisions DDL, got:\n%s", dialedSR.RevisionsTableCreateSQL())
+	}
 }
 
 // In-process mock SQL driver to test Executor end-to-end (revisions table, async polling, status, apply)
@@ -463,9 +510,10 @@ func (s *mockStmt) Query(args []driver.Value) (driver.Rows, error) {
 		var rows [][]driver.Value
 		for idx, r := range s.c.m.revisions {
 			var execVal any = r.ExecutedAt.Format("2006-01-02 15:04:05.000000")
-			if idx%3 == 1 {
+			switch idx % 3 {
+			case 1:
 				execVal = r.ExecutedAt
-			} else if idx%3 == 2 {
+			case 2:
 				execVal = []byte(r.ExecutedAt.Format(time.RFC3339Nano))
 			}
 			rows = append(rows, []driver.Value{

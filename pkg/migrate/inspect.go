@@ -20,7 +20,7 @@ func InspectLiveSchema(ctx context.Context, rawURL string) (*doris.Schema, error
 	if err != nil {
 		return nil, fmt.Errorf("open doris connection: %w", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	return InspectSchemaFromDB(ctx, db, dbName)
 }
 
@@ -66,7 +66,7 @@ func InspectSchemaFromDB(ctx context.Context, db *sql.DB, defaultDB string) (*do
 	if err != nil {
 		return nil, fmt.Errorf("query tables (%s): %w", showTablesQuery, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	cols, err := rows.Columns()
 	if err != nil {
@@ -179,7 +179,7 @@ func queryCreateStatement(ctx context.Context, db *sql.DB, query string) (string
 	if err != nil {
 		return "", err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	cols, err := rows.Columns()
 	if err != nil {
@@ -233,7 +233,7 @@ func InspectTableFromInfoSchema(ctx context.Context, db *sql.DB, catalog, schema
 	if err != nil {
 		return nil, fmt.Errorf("inspect columns for %s: %w", tbl.FullName, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var keyCols []string
 	var keyKind doris.KeyKind

@@ -86,16 +86,37 @@ func drawGeneratedTable(ht *hegel.T, tblIdx int) *doris.TableDef {
 	var indexes []*doris.IndexDef
 	if hegel.Draw(ht, hegel.Booleans()) && len(cols) > 1 {
 		targetCol := cols[1].Name
-		indexes = append(indexes, &doris.IndexDef{
-			Name:    "idx_" + targetCol,
-			Columns: []string{targetCol},
-			Using:   "INVERTED",
-		})
+		usingChoice := hegel.Draw(ht, hegel.Integers(0, 2))
+		switch usingChoice {
+		case 0:
+			indexes = append(indexes, &doris.IndexDef{
+				Name:    "idx_" + targetCol,
+				Columns: []string{targetCol},
+				Using:   "INVERTED",
+			})
+		case 1:
+			indexes = append(indexes, &doris.IndexDef{
+				Name:       "idx_" + targetCol,
+				Columns:    []string{targetCol},
+				Using:      "GIN",
+				Properties: []doris.Property{{Key: "parser", Value: "english"}},
+			})
+		case 2:
+			indexes = append(indexes, &doris.IndexDef{
+				Name:    "idx_" + targetCol,
+				Columns: []string{targetCol},
+				Using:   "BITMAP",
+			})
+		}
 	}
 
+	keyChoice := hegel.Draw(ht, hegel.Integers(0, 2))
 	keyKind := doris.KeyUnique
-	if hegel.Draw(ht, hegel.Booleans()) {
+	switch keyChoice {
+	case 1:
 		keyKind = doris.KeyDuplicate
+	case 2:
+		keyKind = doris.KeyPrimary
 	}
 
 	buckets := strconv.Itoa(hegel.Draw(ht, hegel.Integers(1, 16)))
@@ -103,15 +124,25 @@ func drawGeneratedTable(ht *hegel.T, tblIdx int) *doris.TableDef {
 		buckets = "${TENANT_BUCKETS}"
 	}
 
-	props := []doris.Property{
-		{Key: "storage_vault_name", Value: "azra_lakehouse_vault"},
-		{Key: "compression", Value: "zstd"},
+	var props []doris.Property
+	if keyKind == doris.KeyPrimary {
+		props = append(props,
+			doris.Property{Key: "storage_volume", Value: "builtin_storage_volume"},
+			doris.Property{Key: "enable_persistent_index", Value: "true"},
+			doris.Property{Key: "datacache.enable", Value: "true"},
+			doris.Property{Key: "function_column.sequence_col", Value: "publication_generation"},
+		)
+	} else {
+		props = append(props,
+			doris.Property{Key: "storage_vault_name", Value: "azra_lakehouse_vault"},
+			doris.Property{Key: "compression", Value: "zstd"},
+		)
+		if keyKind == doris.KeyUnique {
+			props = append(props, doris.Property{Key: "enable_unique_key_merge_on_write", Value: "true"})
+			props = append(props, doris.Property{Key: "function_column.sequence_col", Value: "publication_generation"})
+		}
+		props = append(props, doris.Property{Key: "group_commit_interval_ms", Value: "200"})
 	}
-	if keyKind == doris.KeyUnique {
-		props = append(props, doris.Property{Key: "enable_unique_key_merge_on_write", Value: "true"})
-		props = append(props, doris.Property{Key: "function_column.sequence_col", Value: "publication_generation"})
-	}
-	props = append(props, doris.Property{Key: "group_commit_interval_ms", Value: "200"})
 
 	tblName := fmt.Sprintf("tbl_%d_%s", tblIdx, drawIdent(ht, "t"))
 	return &doris.TableDef{

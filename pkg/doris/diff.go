@@ -52,17 +52,10 @@ func DiffWithOptions(current, desired *Schema, opts DiffOptions) ([]Statement, e
 	}
 
 	// 3. Tables (create new, alter existing, or drop removed when AllowDestructive is set).
-	currentByName := make(map[string]*TableDef, len(current.Tables))
-	for _, t := range current.Tables {
-		currentByName[t.LookupKey()] = t
-	}
-	desiredByName := make(map[string]*TableDef, len(desired.Tables))
-	for _, t := range desired.Tables {
-		desiredByName[t.LookupKey()] = t
-	}
+	currentForDesired, desiredForCurrent := pairSchemaTables(current.Tables, desired.Tables)
 
 	for _, dt := range desired.Tables {
-		ct, existed := currentByName[dt.LookupKey()]
+		ct, existed := currentForDesired[dt]
 		if !existed {
 			tblCopy := dt.Clone()
 			tblCopy.IfNotExists = true
@@ -77,7 +70,7 @@ func DiffWithOptions(current, desired *Schema, opts DiffOptions) ([]Statement, e
 
 	if opts.AllowDestructive {
 		for _, ct := range current.Tables {
-			if _, ok := desiredByName[ct.LookupKey()]; !ok {
+			if _, ok := desiredForCurrent[ct]; !ok {
 				stmts = append(stmts, Statement{
 					Kind:        StmtDropTable,
 					TargetTable: ct.CanonicalName(),
@@ -333,7 +326,7 @@ func replicationCountFromAllocation(alloc string) (string, bool) {
 
 func shouldBuildIndexOnline(using string) bool {
 	switch strings.ToUpper(strings.TrimSpace(using)) {
-	case "INVERTED", "NGRAM_BF", "ANN":
+	case "INVERTED", "NGRAM_BF", "ANN", "GIN", "BITMAP", "VECTOR":
 		return true
 	default:
 		return false
@@ -348,7 +341,11 @@ func isMutableTableProperty(key string) bool {
 		"colocate_with",
 		"compression_codec",
 		"replication_num",
-		"enable_single_replica_compaction":
+		"enable_single_replica_compaction",
+		"datacache.enable",
+		"datacache.partition_duration",
+		"enable_persistent_index",
+		"storage_volume":
 		return true
 	}
 	return strings.HasPrefix(key, "write.parquet.")

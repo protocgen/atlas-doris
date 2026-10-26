@@ -279,6 +279,608 @@ PROPERTIES (
 	}
 }
 
+func TestProto2TypeCrossRepoGoldenContract(t *testing.T) {
+	dorisSQL := `
+CREATE DATABASE IF NOT EXISTS internal.tenant_${TENANT_SLUG};
+
+CREATE TABLE IF NOT EXISTS internal.tenant_${TENANT_SLUG}.patient_profiles (
+    tenant_id VARCHAR(64) NOT NULL,
+    patient_id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(64) NOT NULL DEFAULT "",
+    full_name VARCHAR(128) NOT NULL DEFAULT "",
+    status VARCHAR(32) NOT NULL DEFAULT "ACTIVE",
+    clinical_notes TEXT,
+    profile_embedding ARRAY<FLOAT> NOT NULL,
+    publication_generation BIGINT NOT NULL DEFAULT "0",
+    INDEX idx_status (status) USING INVERTED,
+    INDEX idx_clinical_notes (clinical_notes) USING INVERTED PROPERTIES("parser" = "english"),
+    INDEX idx_ngram_full_name (full_name) USING NGRAM_BF PROPERTIES("gram_size" = "3", "bf_size" = "256"),
+    INDEX idx_ann_profile_embedding (profile_embedding) USING ANN PROPERTIES("index_type" = "hnsw", "metric_type" = "cosine_distance", "dim" = "768")
+)
+UNIQUE KEY(tenant_id, patient_id)
+PARTITION BY LIST (tenant_id) ()
+DISTRIBUTED BY HASH(patient_id) BUCKETS ${TENANT_BUCKETS}
+PROPERTIES (
+    "storage_vault_name" = "azra_lakehouse_vault",
+    "enable_unique_key_merge_on_write" = "true",
+    "function_column.sequence_col" = "publication_generation",
+    "colocate_with" = "azra_patient_group",
+    "bloom_filter_columns" = "patient_id, mrn"
+);
+
+CREATE TABLE IF NOT EXISTS internal.tenant_${TENANT_SLUG}.patient_note_chunks (
+    tenant_id VARCHAR(64) NOT NULL,
+    patient_id VARCHAR(64) NOT NULL,
+    chunk_id VARCHAR(64) NOT NULL,
+    event_date DATE NOT NULL,
+    chunk_text TEXT,
+    chunk_embedding ARRAY<FLOAT> NOT NULL,
+    INDEX idx_chunk_text (chunk_text) USING INVERTED PROPERTIES("parser" = "english"),
+    INDEX idx_chunk_embedding (chunk_embedding) USING ANN PROPERTIES("index_type" = "hnsw", "metric_type" = "l2_distance", "dim" = "768")
+)
+DUPLICATE KEY(tenant_id, patient_id, chunk_id)
+PARTITION BY RANGE (event_date) ()
+DISTRIBUTED BY HASH(patient_id) BUCKETS ${TENANT_BUCKETS}
+PROPERTIES (
+    "storage_vault_name" = "azra_lakehouse_vault",
+    "colocate_with" = "azra_patient_group"
+);`
+
+	dorisHCL := `
+schema "tenant_${TENANT_SLUG}" {
+  catalog = "internal"
+}
+
+table "patient_profiles" {
+  schema = "schema.tenant_${TENANT_SLUG}"
+  column "tenant_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "patient_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "mrn" {
+    type = varchar(64)
+    null = false
+    default = ""
+  }
+  column "full_name" {
+    type = varchar(128)
+    null = false
+    default = ""
+  }
+  column "status" {
+    type = varchar(32)
+    null = false
+    default = "ACTIVE"
+  }
+  column "clinical_notes" {
+    type = text
+    null = true
+  }
+  column "profile_embedding" {
+    type = array<float>
+    null = false
+  }
+  column "publication_generation" {
+    type = bigint
+    null = false
+    default = "0"
+  }
+  unique_key {
+    columns = [column.tenant_id, column.patient_id]
+    merge_on_write = true
+    sequence_col = column.publication_generation
+  }
+  partition_by_list {
+    columns = [column.tenant_id]
+  }
+  distributed_by_hash {
+    columns = [column.patient_id]
+    buckets = "${TENANT_BUCKETS}"
+  }
+  index "idx_status" {
+    columns = [column.status]
+    using = "INVERTED"
+  }
+  index "idx_clinical_notes" {
+    columns = [column.clinical_notes]
+    using = "INVERTED"
+    properties = {
+      parser = "english"
+    }
+  }
+  index "idx_ngram_full_name" {
+    columns = [column.full_name]
+    using = "NGRAM_BF"
+    properties = {
+      gram_size = "3"
+      bf_size = "256"
+    }
+  }
+  index "idx_ann_profile_embedding" {
+    columns = [column.profile_embedding]
+    using = "ANN"
+    properties = {
+      index_type = "hnsw"
+      metric_type = "cosine_distance"
+      dim = "768"
+    }
+  }
+  properties = {
+    storage_vault_name = "azra_lakehouse_vault"
+    enable_unique_key_merge_on_write = "true"
+    "function_column.sequence_col" = "publication_generation"
+    colocate_with = "azra_patient_group"
+    bloom_filter_columns = "patient_id, mrn"
+  }
+}
+
+table "patient_note_chunks" {
+  schema = "schema.tenant_${TENANT_SLUG}"
+  column "tenant_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "patient_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "chunk_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "event_date" {
+    type = date
+    null = false
+  }
+  column "chunk_text" {
+    type = text
+    null = true
+  }
+  column "chunk_embedding" {
+    type = array<float>
+    null = false
+  }
+  duplicate_key {
+    columns = [column.tenant_id, column.patient_id, column.chunk_id]
+  }
+  partition_by_range {
+    columns = [column.event_date]
+  }
+  distributed_by_hash {
+    columns = [column.patient_id]
+    buckets = "${TENANT_BUCKETS}"
+  }
+  index "idx_chunk_text" {
+    columns = [column.chunk_text]
+    using = "INVERTED"
+    properties = {
+      parser = "english"
+    }
+  }
+  index "idx_chunk_embedding" {
+    columns = [column.chunk_embedding]
+    using = "ANN"
+    properties = {
+      index_type = "hnsw"
+      metric_type = "l2_distance"
+      dim = "768"
+    }
+  }
+  properties = {
+    storage_vault_name = "azra_lakehouse_vault"
+    colocate_with = "azra_patient_group"
+  }
+}`
+
+	starrocksSQL := `
+CREATE DATABASE IF NOT EXISTS internal.tenant_${TENANT_SLUG};
+
+CREATE TABLE IF NOT EXISTS internal.tenant_${TENANT_SLUG}.patient_profiles (
+    tenant_id VARCHAR(64) NOT NULL,
+    patient_id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(64) NOT NULL DEFAULT "",
+    full_name VARCHAR(128) NOT NULL DEFAULT "",
+    status VARCHAR(32) NOT NULL DEFAULT "ACTIVE",
+    clinical_notes STRING,
+    profile_embedding ARRAY<FLOAT> NOT NULL,
+    publication_generation BIGINT NOT NULL DEFAULT "0",
+    INDEX idx_status (status) USING BITMAP,
+    INDEX idx_clinical_notes (clinical_notes) USING GIN("parser" = "english"),
+    INDEX idx_ngram_full_name (full_name) USING NGRAMBF ("gram_num" = "3", "bloom_filter_fpp" = "0.05")
+)
+PRIMARY KEY(tenant_id, patient_id)
+PARTITION BY LIST (tenant_id) ()
+DISTRIBUTED BY HASH(patient_id) BUCKETS ${TENANT_BUCKETS}
+ORDER BY (tenant_id, patient_id, mrn)
+PROPERTIES (
+    "storage_volume" = "azra_sr_volume",
+    "enable_persistent_index" = "true",
+    "function_column.sequence_col" = "publication_generation",
+    "colocate_with" = "azra_patient_group",
+    "bloom_filter_columns" = "patient_id, mrn"
+);
+
+CREATE TABLE IF NOT EXISTS internal.tenant_${TENANT_SLUG}.patient_note_chunks (
+    tenant_id VARCHAR(64) NOT NULL,
+    patient_id VARCHAR(64) NOT NULL,
+    chunk_id VARCHAR(64) NOT NULL,
+    event_date DATE NOT NULL,
+    chunk_text STRING,
+    chunk_embedding ARRAY<FLOAT> NOT NULL,
+    INDEX idx_chunk_text (chunk_text) USING GIN("parser" = "english"),
+    INDEX idx_chunk_embedding (chunk_embedding) USING VECTOR ("index_type" = "hnsw", "metric_type" = "l2_distance", "dim" = "768")
+)
+DUPLICATE KEY(tenant_id, patient_id, chunk_id)
+PARTITION BY RANGE (event_date) ()
+DISTRIBUTED BY HASH(patient_id) BUCKETS ${TENANT_BUCKETS}
+PROPERTIES (
+    "storage_volume" = "azra_sr_volume",
+    "colocate_with" = "azra_patient_group"
+);`
+
+	starrocksHCL := `
+schema "tenant_${TENANT_SLUG}" {
+  catalog = "internal"
+}
+
+table "patient_profiles" {
+  schema = "schema.tenant_${TENANT_SLUG}"
+  column "tenant_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "patient_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "mrn" {
+    type = varchar(64)
+    null = false
+    default = ""
+  }
+  column "full_name" {
+    type = varchar(128)
+    null = false
+    default = ""
+  }
+  column "status" {
+    type = varchar(32)
+    null = false
+    default = "ACTIVE"
+  }
+  column "clinical_notes" {
+    type = string
+    null = true
+  }
+  column "profile_embedding" {
+    type = array<float>
+    null = false
+  }
+  column "publication_generation" {
+    type = bigint
+    null = false
+    default = "0"
+  }
+  primary_key {
+    columns = [column.tenant_id, column.patient_id]
+    enable_persistent_index = true
+    sequence_col = column.publication_generation
+  }
+  partition_by_list {
+    columns = [column.tenant_id]
+  }
+  distributed_by_hash {
+    columns = [column.patient_id]
+    buckets = "${TENANT_BUCKETS}"
+  }
+  order_by {
+    columns = [column.tenant_id, column.patient_id, column.mrn]
+  }
+  index "idx_status" {
+    columns = [column.status]
+    using = "BITMAP"
+  }
+  index "idx_clinical_notes" {
+    columns = [column.clinical_notes]
+    using = "GIN"
+    properties = {
+      parser = "english"
+    }
+  }
+  index "idx_ngram_full_name" {
+    columns = [column.full_name]
+    using = "NGRAMBF"
+    properties = {
+      gram_num = "3"
+      bloom_filter_fpp = "0.05"
+    }
+  }
+  properties = {
+    storage_volume = "azra_sr_volume"
+    enable_persistent_index = "true"
+    "function_column.sequence_col" = "publication_generation"
+    colocate_with = "azra_patient_group"
+    bloom_filter_columns = "patient_id, mrn"
+  }
+}
+
+table "patient_note_chunks" {
+  schema = "schema.tenant_${TENANT_SLUG}"
+  column "tenant_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "patient_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "chunk_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "event_date" {
+    type = date
+    null = false
+  }
+  column "chunk_text" {
+    type = string
+    null = true
+  }
+  column "chunk_embedding" {
+    type = array<float>
+    null = false
+  }
+  duplicate_key {
+    columns = [column.tenant_id, column.patient_id, column.chunk_id]
+  }
+  partition_by_range {
+    columns = [column.event_date]
+  }
+  distributed_by_hash {
+    columns = [column.patient_id]
+    buckets = "${TENANT_BUCKETS}"
+  }
+  index "idx_chunk_text" {
+    columns = [column.chunk_text]
+    using = "GIN"
+    properties = {
+      parser = "english"
+    }
+  }
+  index "idx_chunk_embedding" {
+    columns = [column.chunk_embedding]
+    using = "VECTOR"
+    properties = {
+      index_type = "hnsw"
+      metric_type = "l2_distance"
+      dim = "768"
+    }
+  }
+  properties = {
+    storage_volume = "azra_sr_volume"
+    colocate_with = "azra_patient_group"
+  }
+}`
+
+	icebergSQL := `
+CREATE DATABASE IF NOT EXISTS azra_lake.tenant_${TENANT_SLUG};
+
+CREATE TABLE IF NOT EXISTS azra_lake.tenant_${TENANT_SLUG}.patient_profiles (
+    tenant_id VARCHAR(64) NOT NULL,
+    patient_id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(64) NOT NULL,
+    full_name VARCHAR(128) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    clinical_notes STRING,
+    profile_embedding ARRAY<FLOAT> NOT NULL,
+    publication_generation BIGINT NOT NULL
+)
+PARTITION BY LIST (tenant_id) ()
+PROPERTIES (
+    "compression_codec" = "zstd"
+);
+
+CREATE TABLE IF NOT EXISTS azra_lake.tenant_${TENANT_SLUG}.patient_note_chunks (
+    tenant_id VARCHAR(64) NOT NULL,
+    patient_id VARCHAR(64) NOT NULL,
+    chunk_id VARCHAR(64) NOT NULL,
+    event_date DATE NOT NULL,
+    chunk_text STRING,
+    chunk_embedding ARRAY<FLOAT> NOT NULL
+)
+PARTITION BY RANGE (event_date) ()
+PROPERTIES (
+    "compression_codec" = "zstd"
+);`
+
+	icebergHCL := `
+schema "tenant_${TENANT_SLUG}" {
+  catalog = "azra_lake"
+}
+
+table "patient_profiles" {
+  catalog = "azra_lake"
+  schema = "schema.tenant_${TENANT_SLUG}"
+  column "tenant_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "patient_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "mrn" {
+    type = varchar(64)
+    null = false
+  }
+  column "full_name" {
+    type = varchar(128)
+    null = false
+  }
+  column "status" {
+    type = varchar(32)
+    null = false
+  }
+  column "clinical_notes" {
+    type = string
+    null = true
+  }
+  column "profile_embedding" {
+    type = array<float>
+    null = false
+  }
+  column "publication_generation" {
+    type = bigint
+    null = false
+  }
+  partition_by_list {
+    columns = [column.tenant_id]
+  }
+  properties = {
+    compression_codec = "zstd"
+  }
+}
+
+table "patient_note_chunks" {
+  catalog = "azra_lake"
+  schema = "schema.tenant_${TENANT_SLUG}"
+  column "tenant_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "patient_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "chunk_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "event_date" {
+    type = date
+    null = false
+  }
+  column "chunk_text" {
+    type = string
+    null = true
+  }
+  column "chunk_embedding" {
+    type = array<float>
+    null = false
+  }
+  partition_by_range {
+    columns = [column.event_date]
+  }
+  properties = {
+    compression_codec = "zstd"
+  }
+}`
+
+	sDorisSQL, err := doris.ParseSchemaAuto(dorisSQL, "profiles_doris.sql")
+	if err != nil {
+		t.Fatalf("ParseSchemaAuto(dorisSQL): %v", err)
+	}
+	sDorisHCL, err := doris.ParseSchemaAuto(dorisHCL, "profiles_doris.hcl")
+	if err != nil {
+		t.Fatalf("ParseSchemaAuto(dorisHCL): %v", err)
+	}
+	sStarRocksSQL, err := doris.ParseSchemaAuto(starrocksSQL, "profiles_starrocks.sql")
+	if err != nil {
+		t.Fatalf("ParseSchemaAuto(starrocksSQL): %v", err)
+	}
+	sStarRocksHCL, err := doris.ParseSchemaAuto(starrocksHCL, "profiles_starrocks.hcl")
+	if err != nil {
+		t.Fatalf("ParseSchemaAuto(starrocksHCL): %v", err)
+	}
+	sIcebergSQL, err := doris.ParseSchemaAuto(icebergSQL, "profiles_iceberg.sql")
+	if err != nil {
+		t.Fatalf("ParseSchemaAuto(icebergSQL): %v", err)
+	}
+	sIcebergHCL, err := doris.ParseSchemaAuto(icebergHCL, "profiles_iceberg.hcl")
+	if err != nil {
+		t.Fatalf("ParseSchemaAuto(icebergHCL): %v", err)
+	}
+
+	// 1. SQL <-> HCL equivalence across all 3 dialects
+	for _, pair := range []struct {
+		name string
+		sqlS *doris.Schema
+		hclS *doris.Schema
+	}{
+		{"doris", sDorisSQL, sDorisHCL},
+		{"starrocks", sStarRocksSQL, sStarRocksHCL},
+		{"iceberg", sIcebergSQL, sIcebergHCL},
+	} {
+		stmts, err := doris.Diff(pair.sqlS, pair.hclS)
+		if err != nil || len(stmts) != 0 {
+			t.Fatalf("%s SQL <-> HCL diff produced %d stmts (err=%v):\n%s", pair.name, len(stmts), err, doris.FormatStatements(stmts))
+		}
+		if v := doris.LintSchema(pair.sqlS); len(v) != 0 {
+			t.Fatalf("%s SQL LintSchema failed: %v", pair.name, v)
+		}
+		if v := doris.LintSchema(pair.hclS); len(v) != 0 {
+			t.Fatalf("%s HCL LintSchema failed: %v", pair.name, v)
+		}
+	}
+
+	// 2. FormatHCL round-trip on StarRocks HCL
+	formattedSRHCL := doris.FormatHCL(sStarRocksHCL)
+	reParsedSRHCL, err := doris.ParseHCL(formattedSRHCL)
+	if err != nil {
+		t.Fatalf("ParseHCL(formattedSRHCL): %v", err)
+	}
+	if doris.FormatHCL(reParsedSRHCL) != formattedSRHCL {
+		t.Fatalf("FormatHCL not idempotent on StarRocks golden HCL")
+	}
+
+	// 3. CheckSchemaParity passes with 0 mismatches on both SQL and HCL golden sets
+	if m := cli.CheckSchemaParity(sDorisSQL, sStarRocksSQL, sIcebergSQL); len(m) != 0 {
+		t.Fatalf("CheckSchemaParity(SQL) failed: %v", m)
+	}
+	if m := cli.CheckSchemaParity(sDorisHCL, sStarRocksHCL, sIcebergHCL); len(m) != 0 {
+		t.Fatalf("CheckSchemaParity(HCL) failed: %v", m)
+	}
+
+	// 4. Verify CheckSchemaParity catches distribution, colocate_with, bloom_filter_columns, partition, and index drift
+	driftSR := sStarRocksSQL.Clone()
+	driftSR.Tables[0].Distribution.Columns = []string{"tenant_id"}
+	driftSR.Tables[0].SetProperty("colocate_with", "wrong_group")
+	driftSR.Tables[0].SetProperty("bloom_filter_columns", "patient_id")
+	driftSR.Tables[0].Partition.Columns = []string{"patient_id"}
+	// Change GIN parser on patient_profiles and drop NGRAMBF index
+	driftSR.Tables[0].Indexes[1].Properties = []doris.Property{{Key: "parser", Value: "chinese"}}
+	driftSR.Tables[0].Indexes = driftSR.Tables[0].Indexes[:2]
+	// Add extra index on patient_note_chunks in StarRocks
+	driftSR.Tables[1].Indexes = append(driftSR.Tables[1].Indexes, &doris.IndexDef{
+		Name:    "idx_extra_bm",
+		Columns: []string{"tenant_id"},
+		Using:   "BITMAP",
+	})
+
+	driftIce := sIcebergSQL.Clone()
+	driftIce.Tables[0].Partition.Columns = []string{"patient_id"}
+
+	driftMismatches := strings.Join(cli.CheckSchemaParity(sDorisSQL, driftSR, driftIce), "\n")
+	for _, want := range []string{
+		"distribution columns mismatch",
+		"colocate_with mismatch",
+		"bloom_filter_columns mismatch",
+		"partition mismatch between Doris and StarRocks",
+		"Iceberg partition columns mismatch",
+		"index mismatch on FULLTEXT(clinical_notes): properties differ",
+		"index mismatch: NGRAM(full_name) present in Doris but missing in StarRocks",
+		"index mismatch: SECONDARY(tenant_id) present in StarRocks but missing in Doris",
+	} {
+		if !strings.Contains(driftMismatches, want) {
+			t.Errorf("expected drift CheckSchemaParity to report %q, got:\n%s", want, driftMismatches)
+		}
+	}
+}
+
 func TestRealProto2Type_SchemaParity(t *testing.T) {
 	proto2typeDir := filepath.Clean(filepath.Join("..", "..", "..", "proto2type"))
 	if _, err := os.Stat(proto2typeDir); os.IsNotExist(err) {

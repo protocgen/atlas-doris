@@ -985,6 +985,39 @@ table "patient_note_chunks" {
       parser = "english"
     }
   }
+  index "idx_chunk_text_ngram" {
+    columns = [column.chunk_text]
+    using = "NGRAMBF"
+    properties = {
+      gram_num = "3"
+      bloom_filter_fpp = "0.05"
+    }
+  }
+  properties = {
+    storage_volume = "azra_sr_vol"
+    enable_persistent_index = "true"
+    "datacache.enable" = "true"
+    "function_column.sequence_col" = "updated_at"
+  }
+}
+
+table "patient_note_embeddings" {
+  schema = "schema.tenant_${TENANT_SLUG}"
+  column "chunk_id" {
+    type = varchar(64)
+    null = false
+  }
+  column "embedding" {
+    type = array<float>
+    null = false
+  }
+  duplicate_key {
+    columns = [column.chunk_id]
+  }
+  distributed_by_hash {
+    columns = [column.chunk_id]
+    buckets = "${TENANT_BUCKETS}"
+  }
   index "idx_embedding_vec" {
     columns = [column.embedding]
     using = "VECTOR"
@@ -996,9 +1029,7 @@ table "patient_note_chunks" {
   }
   properties = {
     storage_volume = "azra_sr_vol"
-    enable_persistent_index = "true"
     "datacache.enable" = "true"
-    "function_column.sequence_col" = "updated_at"
   }
 }
 `
@@ -1010,8 +1041,8 @@ table "patient_note_chunks" {
 	if len(s1.PlatformObjects) != 2 {
 		t.Fatalf("expected 2 platform objects from storage_volume and external_catalog HCL blocks, got %d", len(s1.PlatformObjects))
 	}
-	if len(s1.Tables) != 1 {
-		t.Fatalf("expected 1 table, got %d", len(s1.Tables))
+	if len(s1.Tables) != 2 {
+		t.Fatalf("expected 2 tables, got %d", len(s1.Tables))
 	}
 	tbl := s1.Tables[0]
 	if tbl.Key == nil || tbl.Key.Kind != doris.KeyPrimary {

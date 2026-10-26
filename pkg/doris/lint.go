@@ -112,6 +112,12 @@ func lintTableKeyAndANN(t *TableDef, colByName map[string]*ColumnDef) []Violatio
 		for _, kc := range t.Key.Columns {
 			col, ok := colByName[kc]
 			if !ok {
+				violations = append(violations, Violation{
+					Rule:       DORIS001_IMMUTABLE_KEY,
+					TableName:  tblName,
+					ColumnName: kc,
+					Message:    fmt.Sprintf("key column %q does not exist in table", kc),
+				})
 				continue
 			}
 			upperType := NormalizeType(col.Type)
@@ -122,7 +128,60 @@ func lintTableKeyAndANN(t *TableDef, colByName map[string]*ColumnDef) []Violatio
 					ColumnName: kc,
 					Message:    fmt.Sprintf("key column %q uses floating-point type %s (prohibited by Doris)", kc, col.Type),
 				})
+			} else if IsNonScalarColumnType(col.Type) || upperType == "BITMAP" || upperType == "HLL" || (t.Key.Kind == KeyPrimary && (upperType == "STRING" || upperType == "TEXT")) {
+				violations = append(violations, Violation{
+					Rule:       DORIS001_IMMUTABLE_KEY,
+					TableName:  tblName,
+					ColumnName: kc,
+					Message:    fmt.Sprintf("key column %q uses ineligible key type %s", kc, col.Type),
+				})
 			}
+		}
+	}
+
+	if t.Distribution != nil {
+		for _, dc := range t.Distribution.Columns {
+			col, ok := colByName[dc]
+			if !ok {
+				violations = append(violations, Violation{
+					Rule:       DORIS003_IMMUTABLE_DISTRIBUTION,
+					TableName:  tblName,
+					ColumnName: dc,
+					Message:    fmt.Sprintf("distribution column %q does not exist in table", dc),
+				})
+				continue
+			}
+			upperType := NormalizeType(col.Type)
+			if upperType == "FLOAT" || upperType == "DOUBLE" || IsNonScalarColumnType(col.Type) || upperType == "BITMAP" || upperType == "HLL" {
+				violations = append(violations, Violation{
+					Rule:       DORIS003_IMMUTABLE_DISTRIBUTION,
+					TableName:  tblName,
+					ColumnName: dc,
+					Message:    fmt.Sprintf("distribution column %q uses ineligible hash type %s", dc, col.Type),
+				})
+			}
+		}
+	}
+
+	for _, oc := range t.OrderBy {
+		col, ok := colByName[oc]
+		if !ok {
+			violations = append(violations, Violation{
+				Rule:       DORIS001_IMMUTABLE_KEY,
+				TableName:  tblName,
+				ColumnName: oc,
+				Message:    fmt.Sprintf("ORDER BY column %q does not exist in table", oc),
+			})
+			continue
+		}
+		upperType := NormalizeType(col.Type)
+		if upperType == "FLOAT" || upperType == "DOUBLE" || IsNonScalarColumnType(col.Type) || upperType == "BITMAP" || upperType == "HLL" {
+			violations = append(violations, Violation{
+				Rule:       DORIS001_IMMUTABLE_KEY,
+				TableName:  tblName,
+				ColumnName: oc,
+				Message:    fmt.Sprintf("ORDER BY column %q uses ineligible sort key type %s", oc, col.Type),
+			})
 		}
 	}
 
@@ -143,21 +202,29 @@ func lintTableKeyAndANN(t *TableDef, colByName map[string]*ColumnDef) []Violatio
 			continue
 		}
 		if t.Key != nil {
-			validKeyModel := false
-			switch t.Key.Kind {
-			case KeyDuplicate:
-				validKeyModel = true
-			case KeyUnique:
-				validKeyModel = t.HasUniqueKeyMergeOnWrite()
-			case KeyPrimary:
-				validKeyModel = t.HasPersistentIndex() || t.HasUniqueKeyMergeOnWrite()
-			}
-			if !validKeyModel {
-				violations = append(violations, Violation{
-					Rule:      DORIS006_SAFE_TYPE_EVOLUTION,
-					TableName: tblName,
-					Message:   fmt.Sprintf("%s index %q is only supported on DUPLICATE KEY tables, UNIQUE KEY tables with merge-on-write enabled, or PRIMARY KEY tables with persistent index enabled (found %s KEY)", usingUpper, idx.Name, t.Key.Kind),
-				})
+			if usingUpper == "VECTOR" {
+				if t.Key.Kind != KeyDuplicate {
+					violations = append(violations, Violation{
+						Rule:      DORIS006_SAFE_TYPE_EVOLUTION,
+						TableName: tblName,
+						Message:   fmt.Sprintf("VECTOR index %q is only supported on DUPLICATE KEY tables in StarRocks 4.x (found %s KEY)", idx.Name, t.Key.Kind),
+					})
+				}
+			} else {
+				validKeyModel := false
+				switch t.Key.Kind {
+				case KeyDuplicate:
+					validKeyModel = true
+				case KeyUnique:
+					validKeyModel = t.HasUniqueKeyMergeOnWrite()
+				}
+				if !validKeyModel {
+					violations = append(violations, Violation{
+						Rule:      DORIS006_SAFE_TYPE_EVOLUTION,
+						TableName: tblName,
+						Message:   fmt.Sprintf("%s index %q is only supported on DUPLICATE KEY tables or UNIQUE KEY tables with merge-on-write enabled (found %s KEY)", usingUpper, idx.Name, t.Key.Kind),
+					})
+				}
 			}
 		}
 		if len(idx.Columns) != 1 {

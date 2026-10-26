@@ -1424,7 +1424,7 @@ CREATE TABLE IF NOT EXISTS internal.tenant_${TENANT_SLUG}.patient_notes (
     publication_generation BIGINT NOT NULL DEFAULT "0",
     INDEX idx_status_bitmap (status) USING BITMAP,
     INDEX idx_note_text_gin (note_text) USING GIN("parser" = "english"),
-    INDEX idx_embedding_vec (embedding) USING VECTOR ("index_type" = "hnsw", "metric_type" = "cosine_distance", "dim" = "768")
+    INDEX idx_note_text_ngram (note_text) USING NGRAMBF ("gram_num" = "3", "bloom_filter_fpp" = "0.05")
 )
 PRIMARY KEY(tenant_id, patient_id, note_id)
 PARTITION BY LIST (tenant_id) ()
@@ -1460,7 +1460,7 @@ PROPERTIES (
 		t.Fatalf("expected IsStarRocksTable=true, IsIcebergTable=false, HasPersistentIndex=true")
 	}
 
-	// Verify canonical formatting of PRIMARY KEY, USING GIN(...), USING BITMAP, USING VECTOR (...), and PlatformObjects
+	// Verify canonical formatting of PRIMARY KEY, USING GIN(...), USING BITMAP, USING NGRAMBF (...), and PlatformObjects
 	for _, po := range s1.PlatformObjects {
 		po.RawSQL = ""
 	}
@@ -1472,7 +1472,7 @@ PROPERTIES (
 		"PRIMARY KEY(tenant_id, patient_id, note_id)",
 		"INDEX idx_status_bitmap (status) USING BITMAP",
 		`INDEX idx_note_text_gin (note_text) USING GIN("parser" = "english")`,
-		`INDEX idx_embedding_vec (embedding) USING VECTOR ("index_type" = "hnsw", "metric_type" = "cosine_distance", "dim" = "768")`,
+		`INDEX idx_note_text_ngram (note_text) USING NGRAMBF ("gram_num" = "3", "bloom_filter_fpp" = "0.05")`,
 	} {
 		if !strings.Contains(formatted1, want) {
 			t.Errorf("FormatSchema missing %q in:\n%s", want, formatted1)
@@ -1558,6 +1558,32 @@ PROPERTIES (
 	sDisablePersist.Tables[0].SetProperty("enable_persistent_index", "false")
 	assertHasRule(t, doris.LintSchemaEvolution(s1, sDisablePersist, doris.LintOptions{}), doris.DORIS001_IMMUTABLE_KEY)
 
+	// DORIS001: nonexistent key column, complex key column, or STRING on PRIMARY KEY; nonexistent/complex ORDER BY column
+	missingKeyTbl := s1.Tables[0].Clone()
+	missingKeyTbl.Key.Columns = []string{"nonexistent_key"}
+	assertHasRule(t, doris.LintTable(missingKeyTbl), doris.DORIS001_IMMUTABLE_KEY)
+
+	stringPKTbl := s1.Tables[0].Clone()
+	stringPKTbl.Key.Columns = []string{"note_text"}
+	assertHasRule(t, doris.LintTable(stringPKTbl), doris.DORIS001_IMMUTABLE_KEY)
+
+	missingOrderByTbl := s1.Tables[0].Clone()
+	missingOrderByTbl.OrderBy = []string{"nonexistent_order_col"}
+	assertHasRule(t, doris.LintTable(missingOrderByTbl), doris.DORIS001_IMMUTABLE_KEY)
+
+	complexOrderByTbl := s1.Tables[0].Clone()
+	complexOrderByTbl.OrderBy = []string{"embedding"}
+	assertHasRule(t, doris.LintTable(complexOrderByTbl), doris.DORIS001_IMMUTABLE_KEY)
+
+	// DORIS003: nonexistent distribution column or complex distribution column
+	missingDistTbl := s1.Tables[0].Clone()
+	missingDistTbl.Distribution.Columns = []string{"nonexistent_dist_col"}
+	assertHasRule(t, doris.LintTable(missingDistTbl), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
+
+	complexDistTbl := s1.Tables[0].Clone()
+	complexDistTbl.Distribution.Columns = []string{"embedding"}
+	assertHasRule(t, doris.LintTable(complexDistTbl), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
+
 	// DORIS002: mutating sequence_col on PRIMARY KEY table or setting sequence_col on DUPLICATE KEY table
 	sBadSeq := s1.Clone()
 	sBadSeq.Tables[0].SetProperty("function_column.sequence_col", "event_date")
@@ -1572,15 +1598,29 @@ PROPERTIES (
 	sBadPart.Tables[0].Partition.Columns = []string{"patient_id"}
 	assertHasRule(t, doris.LintSchemaEvolution(s1, sBadPart, doris.LintOptions{}), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
 
-	// DORIS006: USING VECTOR on PRIMARY KEY with enable_persistent_index = "false" is rejected; ivfpq is accepted
-	badVecTbl := s1.Tables[0].Clone()
-	badVecTbl.SetProperty("enable_persistent_index", "false")
-	assertHasRule(t, doris.LintTable(badVecTbl), doris.DORIS006_SAFE_TYPE_EVOLUTION)
+	// DORIS006: USING VECTOR on PRIMARY KEY is rejected in StarRocks 4.x; USING VECTOR on DUPLICATE KEY (hnsw & ivfpq) is accepted
+	badVecOnPKTbl := s1.Tables[0].Clone()
+	badVecOnPKTbl.Indexes = append(badVecOnPKTbl.Indexes, &doris.IndexDef{
+		Name:    "idx_embedding_vec",
+		Columns: []string{"embedding"},
+		Using:   "VECTOR",
+		Properties: []doris.Property{
+			{Key: "index_type", Value: "hnsw"},
+			{Key: "metric_type", Value: "cosine_distance"},
+			{Key: "dim", Value: "768"},
+		},
+	})
+	assertHasRule(t, doris.LintTable(badVecOnPKTbl), doris.DORIS006_SAFE_TYPE_EVOLUTION)
 
-	ivfpqTbl := s1.Tables[0].Clone()
-	ivfpqTbl.Indexes[2].Properties[0].Value = "ivfpq"
-	if v := doris.LintTable(ivfpqTbl); len(v) != 0 {
-		t.Fatalf("expected ivfpq VECTOR index to pass LintTable, got %v", v)
+	dupVecTbl := badVecOnPKTbl.Clone()
+	dupVecTbl.Key.Kind = doris.KeyDuplicate
+	dupVecTbl.Properties = nil
+	if v := doris.LintTable(dupVecTbl); len(v) != 0 {
+		t.Fatalf("expected DUPLICATE KEY table with hnsw VECTOR index to pass LintTable, got %v", v)
+	}
+	dupVecTbl.Indexes[len(dupVecTbl.Indexes)-1].Properties[0].Value = "ivfpq"
+	if v := doris.LintTable(dupVecTbl); len(v) != 0 {
+		t.Fatalf("expected DUPLICATE KEY table with ivfpq VECTOR index to pass LintTable, got %v", v)
 	}
 
 	// Verify TEXT <-> STRING semantic equivalence and VARCHAR -> TEXT/STRING, DATE -> DATETIME safe evolution
@@ -1620,7 +1660,7 @@ PROPERTIES (
 		}
 	}
 
-	// Verify NGRAMBF SQL + HCL round-trip and no BUILD INDEX on GIN, BITMAP, VECTOR, NGRAMBF
+	// Verify NGRAMBF SQL + HCL round-trip (canonical properties = { ... } block + backwards-compatible top-level attributes)
 	ngramSQL := `
 CREATE TABLE IF NOT EXISTS internal.tenant_a.patients (
     patient_id VARCHAR(64) NOT NULL,
@@ -1645,8 +1685,8 @@ PROPERTIES (
 		t.Errorf("expected unquoted DEFAULT [] on ARRAY column, got:\n%s", formattedNgramSQL)
 	}
 	ngramHCL := doris.FormatHCL(sNgram)
-	if !strings.Contains(ngramHCL, `using = "NGRAMBF"`) || !strings.Contains(ngramHCL, `gram_num = "3"`) || !strings.Contains(ngramHCL, `bloom_filter_fpp = "0.05"`) {
-		t.Errorf("expected top-level gram_num and bloom_filter_fpp in NGRAMBF HCL, got:\n%s", ngramHCL)
+	if !strings.Contains(ngramHCL, `using = "NGRAMBF"`) || !strings.Contains(ngramHCL, "properties = {\n      gram_num = \"3\"\n      bloom_filter_fpp = \"0.05\"\n    }") {
+		t.Errorf("expected properties = { gram_num = \"3\", bloom_filter_fpp = \"0.05\" } in NGRAMBF HCL, got:\n%s", ngramHCL)
 	}
 	sNgramFromHCL, err := doris.ParseHCL(ngramHCL)
 	if err != nil {
@@ -1654,6 +1694,15 @@ PROPERTIES (
 	}
 	if doris.FormatSchema(sNgramFromHCL) != formattedNgramSQL {
 		t.Errorf("NGRAMBF HCL -> SQL mismatch:\nwant:\n%s\ngot:\n%s", formattedNgramSQL, doris.FormatSchema(sNgramFromHCL))
+	}
+	// Backwards-compatibility: top-level gram_num and bloom_filter_fpp attributes in HCL still parse identically
+	topLevelNgramHCL := strings.Replace(ngramHCL, "properties = {\n      gram_num = \"3\"\n      bloom_filter_fpp = \"0.05\"\n    }", "gram_num = \"3\"\n    bloom_filter_fpp = \"0.05\"", 1)
+	sNgramFromTopLevelHCL, err := doris.ParseHCL(topLevelNgramHCL)
+	if err != nil {
+		t.Fatalf("ParseHCL(topLevelNgramHCL) failed: %v", err)
+	}
+	if doris.FormatSchema(sNgramFromTopLevelHCL) != formattedNgramSQL {
+		t.Errorf("top-level NGRAMBF HCL -> SQL mismatch:\nwant:\n%s\ngot:\n%s", formattedNgramSQL, doris.FormatSchema(sNgramFromTopLevelHCL))
 	}
 
 	// Verify adding GIN, BITMAP, VECTOR, and NGRAMBF indexes on StarRocks never emits BUILD INDEX

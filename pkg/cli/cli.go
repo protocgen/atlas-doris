@@ -662,6 +662,31 @@ func CheckSchemaParity(dorisSchema, starrocksSchema, icebergSchema *doris.Schema
 		if dt.SequenceCol() != st.SequenceCol() {
 			mismatches = append(mismatches, fmt.Sprintf("table %s: sequence_col mismatch (doris=%q, starrocks=%q)", k, dt.SequenceCol(), st.SequenceCol()))
 		}
+
+		if dt.Distribution != nil && st.Distribution != nil {
+			if !stringSlicesEqual(dt.Distribution.Columns, st.Distribution.Columns) {
+				mismatches = append(mismatches, fmt.Sprintf("table %s: distribution columns mismatch (doris=%v, starrocks=%v)", k, dt.Distribution.Columns, st.Distribution.Columns))
+			}
+		}
+
+		if dt.ColocateGroup() != st.ColocateGroup() {
+			mismatches = append(mismatches, fmt.Sprintf("table %s: colocate_with mismatch (doris=%q, starrocks=%q)", k, dt.ColocateGroup(), st.ColocateGroup()))
+		}
+
+		dBloomRaw, _ := dt.GetProperty("bloom_filter_columns")
+		sBloomRaw, _ := st.GetProperty("bloom_filter_columns")
+		dBloom := normalizeCSVProp(dBloomRaw)
+		sBloom := normalizeCSVProp(sBloomRaw)
+		if dBloom != sBloom {
+			mismatches = append(mismatches, fmt.Sprintf("table %s: bloom_filter_columns mismatch (doris=%q, starrocks=%q)", k, dBloom, sBloom))
+		}
+
+		if (dt.Partition != nil) != (st.Partition != nil) ||
+			(dt.Partition != nil && st.Partition != nil && (!strings.EqualFold(dt.Partition.Kind, st.Partition.Kind) || !stringSlicesEqual(dt.Partition.Columns, st.Partition.Columns))) {
+			mismatches = append(mismatches, fmt.Sprintf("table %s: partition mismatch between Doris and StarRocks", k))
+		}
+
+		mismatches = append(mismatches, checkTableIndexParity(k, dt, st)...)
 	}
 
 	if icebergSchema != nil && len(icebergSchema.Tables) > 0 {
@@ -712,10 +737,129 @@ func CheckSchemaParity(dorisSchema, starrocksSchema, icebergSchema *doris.Schema
 					mismatches = append(mismatches, fmt.Sprintf("table %s: column %q present in Iceberg but missing in Doris", k, ic.Name))
 				}
 			}
+			if dt.Partition != nil && it.Partition != nil && len(dt.Partition.Columns) > 0 && len(it.Partition.Columns) > 0 {
+				if !stringSlicesEqual(dt.Partition.Columns, it.Partition.Columns) {
+					mismatches = append(mismatches, fmt.Sprintf("table %s: Iceberg partition columns mismatch (doris=%v, iceberg=%v)", k, dt.Partition.Columns, it.Partition.Columns))
+				}
+			}
 		}
 	}
 
 	return mismatches
+}
+
+type parityIndexDescriptor struct {
+	Kind       string
+	Columns    []string
+	Parser     string
+	IndexType  string
+	MetricType string
+	Dim        string
+}
+
+func (d parityIndexDescriptor) Key() string {
+	return d.Kind + "(" + strings.Join(d.Columns, ",") + ")"
+}
+
+func toParityIndexDescriptor(idx *doris.IndexDef) (parityIndexDescriptor, bool) {
+	if idx == nil {
+		return parityIndexDescriptor{}, false
+	}
+	props := make(map[string]string, len(idx.Properties))
+	for _, p := range idx.Properties {
+		props[strings.ToLower(strings.TrimSpace(p.Key))] = strings.TrimSpace(p.Value)
+	}
+	using := strings.ToUpper(strings.TrimSpace(idx.Using))
+	if using == "" {
+		using = "INVERTED"
+	}
+	switch using {
+	case "INVERTED":
+		if parser := strings.ToLower(props["parser"]); parser != "" {
+			return parityIndexDescriptor{Kind: "FULLTEXT", Columns: idx.Columns, Parser: parser}, true
+		}
+		return parityIndexDescriptor{Kind: "SECONDARY", Columns: idx.Columns}, true
+	case "GIN":
+		return parityIndexDescriptor{Kind: "FULLTEXT", Columns: idx.Columns, Parser: strings.ToLower(props["parser"])}, true
+	case "BITMAP":
+		return parityIndexDescriptor{Kind: "SECONDARY", Columns: idx.Columns}, true
+	case "NGRAM_BF", "NGRAMBF":
+		return parityIndexDescriptor{Kind: "NGRAM", Columns: idx.Columns}, true
+	case "ANN", "VECTOR":
+		return parityIndexDescriptor{
+			Kind:       "VECTOR",
+			Columns:    idx.Columns,
+			IndexType:  strings.ToLower(props["index_type"]),
+			MetricType: strings.ToLower(props["metric_type"]),
+			Dim:        props["dim"],
+		}, true
+	default:
+		return parityIndexDescriptor{Kind: using, Columns: idx.Columns}, true
+	}
+}
+
+func checkTableIndexParity(tableKey string, dt, st *doris.TableDef) []string {
+	var mismatches []string
+	exemptSRPrimaryVector := st.Key != nil && st.Key.Kind == doris.KeyPrimary
+
+	dMap := make(map[string]parityIndexDescriptor)
+	var dOrder []string
+	for _, idx := range dt.Indexes {
+		desc, ok := toParityIndexDescriptor(idx)
+		if !ok {
+			continue
+		}
+		if exemptSRPrimaryVector && desc.Kind == "VECTOR" {
+			continue
+		}
+		ik := desc.Key()
+		dMap[ik] = desc
+		dOrder = append(dOrder, ik)
+	}
+
+	sMap := make(map[string]parityIndexDescriptor)
+	var sOrder []string
+	for _, idx := range st.Indexes {
+		desc, ok := toParityIndexDescriptor(idx)
+		if !ok {
+			continue
+		}
+		ik := desc.Key()
+		sMap[ik] = desc
+		sOrder = append(sOrder, ik)
+	}
+
+	for _, ik := range dOrder {
+		dDesc := dMap[ik]
+		sDesc, ok := sMap[ik]
+		if !ok {
+			mismatches = append(mismatches, fmt.Sprintf("table %s: index mismatch: %s present in Doris but missing in StarRocks", tableKey, ik))
+			continue
+		}
+		if dDesc.Parser != sDesc.Parser || dDesc.IndexType != sDesc.IndexType || dDesc.MetricType != sDesc.MetricType || dDesc.Dim != sDesc.Dim {
+			mismatches = append(mismatches, fmt.Sprintf("table %s: index mismatch on %s: properties differ (doris=%+v, starrocks=%+v)", tableKey, ik, dDesc, sDesc))
+		}
+	}
+	for _, ik := range sOrder {
+		if _, ok := dMap[ik]; !ok {
+			mismatches = append(mismatches, fmt.Sprintf("table %s: index mismatch: %s present in StarRocks but missing in Doris", tableKey, ik))
+		}
+	}
+	return mismatches
+}
+
+func normalizeCSVProp(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return ""
+	}
+	parts := strings.Split(raw, ",")
+	var cleaned []string
+	for _, p := range parts {
+		if s := strings.TrimSpace(p); s != "" {
+			cleaned = append(cleaned, s)
+		}
+	}
+	return strings.Join(cleaned, ",")
 }
 
 func parityTableKey(t *doris.TableDef) string {

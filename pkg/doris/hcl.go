@@ -407,17 +407,9 @@ func FormatTableHCL(t *TableDef) string {
 		fmt.Fprintf(&b, "  index %q {\n", idx.Name)
 		fmt.Fprintf(&b, "    columns = %s\n", formatHCLColRefList(idx.Columns))
 		fmt.Fprintf(&b, "    using = %q\n", using)
-		var remProps []Property
-		for _, p := range idx.Properties {
-			if using == "NGRAMBF" && (p.Key == "gram_num" || p.Key == "bloom_filter_fpp") {
-				fmt.Fprintf(&b, "    %s = %q\n", p.Key, p.Value)
-				continue
-			}
-			remProps = append(remProps, p)
-		}
-		if len(remProps) > 0 {
+		if len(idx.Properties) > 0 {
 			b.WriteString("    properties = {\n")
-			for _, p := range remProps {
+			for _, p := range idx.Properties {
 				fmt.Fprintf(&b, "      %s = %q\n", formatHCLPropKey(p.Key), p.Value)
 			}
 			b.WriteString("    }\n")

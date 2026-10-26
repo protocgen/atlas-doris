@@ -1363,4 +1363,34 @@ func TestASTFormattingAndEqualityHelpers(t *testing.T) {
 	if vNoCol.Error() != "[R1] table t1: msg" || vWithCol.String() != "[R2] table t1 column c1: msg" {
 		t.Errorf("unexpected Violation formatting: %q / %q", vNoCol.Error(), vWithCol.String())
 	}
+
+	// Regression cases for FuzzParseAndRoundTripSchema invalid identifiers and escaped strings
+	for _, invalidInput := range []string{
+		`schema "'0.0" {}`,
+		`schema "0" { catalog = "'0" }`,
+		`schema "a.b.c" {}`,
+		"CREATE DATABASE IF NOT EXISTS `'0`.0;",
+		"DROP TABLE `'0`.0;",
+		"CREATE TABLE `'0`.0 (id INT);",
+		"CREATE TABLE A (A 0);",
+		"CREATE VIEW `'0`.0 AS SELECT 1;",
+	} {
+		if _, err := doris.ParseSchema(invalidInput); err == nil {
+			t.Errorf("expected error for invalid identifier input %q, got nil", invalidInput)
+		}
+	}
+
+	escSQL := "CREATE TABLE A (\n    A INT\n)\nPROPERTIES (\n    \"\\xd7\" = \"\\n\"\n);\n"
+	sEsc1, err := doris.ParseSchema(escSQL)
+	if err != nil {
+		t.Fatalf("ParseSchema(escSQL): %v", err)
+	}
+	fEsc1 := doris.FormatSchema(sEsc1)
+	sEsc2, err := doris.ParseSchema(fEsc1)
+	if err != nil {
+		t.Fatalf("re-parse fEsc1: %v", err)
+	}
+	if doris.FormatSchema(sEsc2) != fEsc1 {
+		t.Fatalf("escaped string round-trip not idempotent:\n%s\nvs\n%s", fEsc1, doris.FormatSchema(sEsc2))
+	}
 }

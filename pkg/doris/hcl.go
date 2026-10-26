@@ -436,6 +436,9 @@ func parseHCLSchemaBlock(labels []string, body string) (*DatabaseDef, error) {
 		rawName = labels[len(labels)-1]
 	}
 	fullName, catalog, db, short := splitQualifiedName(rawName)
+	if catalog != "" && db != "" {
+		return nil, fmt.Errorf("invalid schema name %q in Atlas HCL", rawName)
+	}
 	if db != "" && catalog == "" {
 		catalog = db
 	}
@@ -456,6 +459,13 @@ func parseHCLSchemaBlock(labels []string, body string) (*DatabaseDef, error) {
 		default:
 			return nil, fmt.Errorf("schema %q: unsupported attribute %q", rawName, it.Key)
 		}
+	}
+
+	if short != "" && !isValidDorisIdentOrVar(short) {
+		return nil, fmt.Errorf("invalid schema name %q in Atlas HCL", short)
+	}
+	if catalog != "" && !isValidDorisIdentOrVar(catalog) {
+		return nil, fmt.Errorf("invalid catalog name %q in Atlas HCL", catalog)
 	}
 
 	dbDef := &DatabaseDef{
@@ -520,6 +530,12 @@ func parseHCLViewBlock(labels []string, body string) (*ViewDef, error) {
 			return nil, fmt.Errorf("view %q: unsupported attribute %q", shortName, it.Key)
 		}
 	}
+	if vw.Database != "" && !isValidDorisIdentOrVar(vw.Database) {
+		return nil, fmt.Errorf("view %q: invalid database name %q", shortName, vw.Database)
+	}
+	if vw.Catalog != "" && !isValidDorisIdentOrVar(vw.Catalog) {
+		return nil, fmt.Errorf("view %q: invalid catalog name %q", shortName, vw.Catalog)
+	}
 	if vw.AsSQL == "" && vw.RawSQL == "" {
 		return nil, fmt.Errorf("view %q: requires as or raw_sql attribute", shortName)
 	}
@@ -533,6 +549,9 @@ func parseHCLPlatformObjectBlock(labels []string, body string) (*PlatformObject,
 	po := &PlatformObject{
 		Kind: strings.TrimSpace(labels[0]),
 		Name: strings.TrimSpace(labels[1]),
+	}
+	if !isValidDorisIdentOrVar(po.Name) {
+		return nil, fmt.Errorf("platform_object %q: invalid name %q", po.Kind, po.Name)
 	}
 	items, err := parseHCLBodyItems(body)
 	if err != nil {
@@ -715,8 +734,8 @@ func parseHCLTableBlock(labels []string, body string) (*TableDef, error) {
 			}
 
 		case "rollup":
-			if len(bLabels) != 1 || bLabels[0] == "" {
-				return nil, fmt.Errorf("table %q: rollup block requires a name label", shortName)
+			if len(bLabels) != 1 || !isValidHCLIdent(bLabels[0]) {
+				return nil, fmt.Errorf("table %q: rollup block requires a valid name label", shortName)
 			}
 			rCols, err := parseHCLOrderByBlock(it.BlockBody)
 			if err != nil {
@@ -730,6 +749,16 @@ func parseHCLTableBlock(labels []string, body string) (*TableDef, error) {
 		default:
 			return nil, fmt.Errorf("table %q: unsupported HCL block %q", shortName, it.BlockHeader)
 		}
+	}
+
+	if tbl.Database != "" && !isValidDorisIdentOrVar(tbl.Database) {
+		return nil, fmt.Errorf("table %q: invalid database name %q", shortName, tbl.Database)
+	}
+	if tbl.Catalog != "" && !isValidDorisIdentOrVar(tbl.Catalog) {
+		return nil, fmt.Errorf("table %q: invalid catalog name %q", shortName, tbl.Catalog)
+	}
+	if tbl.Engine != "" && !isValidDorisIdentOrVar(tbl.Engine) {
+		return nil, fmt.Errorf("table %q: invalid engine %q", shortName, tbl.Engine)
 	}
 
 	if len(tbl.Columns) == 0 {
@@ -762,7 +791,12 @@ func parseHCLColumnBlock(colName, body string) (*ColumnDef, error) {
 	for _, kv := range kvs {
 		switch kv.Key {
 		case "type":
-			col.Type = NormalizeType(unquoteHCLString(kv.Value))
+			rawType := unquoteHCLString(kv.Value)
+			parsedType, rem, err := consumeSQLType(rawType)
+			if err != nil || parsedType == "" || rem != "" {
+				return nil, fmt.Errorf("column %q: invalid type %q", colName, kv.Value)
+			}
+			col.Type = NormalizeType(parsedType)
 		case "null":
 			b, err := strconv.ParseBool(unquoteHCLString(kv.Value))
 			if err != nil {
@@ -775,7 +809,13 @@ func parseHCLColumnBlock(colName, body string) (*ColumnDef, error) {
 		case "comment":
 			col.Comment = unquoteHCLString(kv.Value)
 		case "agg_type", "aggregate":
-			col.AggType = strings.ToUpper(strings.TrimSpace(unquoteHCLString(kv.Value)))
+			agg := strings.ToUpper(strings.TrimSpace(unquoteHCLString(kv.Value)))
+			switch agg {
+			case "", "SUM", "REPLACE", "MAX", "MIN", "REPLACE_IF_NOT_NULL", "HLL_UNION", "BITMAP_UNION":
+				col.AggType = agg
+			default:
+				return nil, fmt.Errorf("column %q: unsupported aggregate type %q", colName, kv.Value)
+			}
 		default:
 			return nil, fmt.Errorf("column %q: unsupported attribute %q", colName, kv.Key)
 		}

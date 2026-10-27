@@ -742,6 +742,21 @@ table "patient_note_chunks" {
 		t.Errorf("expected drift CheckSchemaParity to report Iceberg partition columns mismatch, got:\n%s", driftMismatches)
 	}
 
+	// Verify Doris UNIQUE KEY table with non-key Iceberg-only partition spec (e.g. event_month not in UNIQUE KEY) passes parity
+	nonKeyPartDoris := sDorisSQL.Clone()
+	nonKeyPartDoris.Tables[0].Partition = nil
+	nonKeyPartIce := sIcebergSQL.Clone()
+	nonKeyPartIce.Tables[0].Partition.Columns = []string{"status"}
+	if m := CheckSchemaParity(nonKeyPartDoris, nonKeyPartIce); len(m) != 0 {
+		t.Errorf("expected Doris UNIQUE KEY table with non-key Iceberg partition column to pass parity, got: %v", m)
+	}
+	// Whereas DUPLICATE KEY table with dt.Partition == nil && it.Partition != nil fails parity
+	unpartDupDoris := sDorisSQL.Clone()
+	unpartDupDoris.Tables[1].Partition = nil
+	if m := CheckSchemaParity(unpartDupDoris, sIcebergSQL); len(m) == 0 {
+		t.Errorf("expected Doris DUPLICATE KEY table with Iceberg-only partition spec to fail parity")
+	}
+
 	// 5. Exercise live ../proto2type plugin binary when sibling repository is present
 	t.Run("live_proto2type_binary_contract", func(t *testing.T) {
 		var proto2typeDir string

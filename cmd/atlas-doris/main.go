@@ -607,8 +607,10 @@ func CheckSchemaParity(dorisSchema, icebergSchema *doris.Schema) []string {
 				mismatches = append(mismatches, fmt.Sprintf("table %s: column %q present in Iceberg but missing in Doris", k, ic.Name))
 			}
 		}
-		if (dt.Partition == nil) != (it.Partition == nil) {
-			mismatches = append(mismatches, fmt.Sprintf("table %s: Iceberg partition presence mismatch (doris partitioned=%v, iceberg partitioned=%v)", k, dt.Partition != nil, it.Partition != nil))
+		if dt.Partition != nil && it.Partition == nil {
+			mismatches = append(mismatches, fmt.Sprintf("table %s: Iceberg partition presence mismatch (doris partitioned=true, iceberg partitioned=false)", k))
+		} else if dt.Partition == nil && it.Partition != nil && !isNonKeyIcebergPartition(dt, it.Partition) {
+			mismatches = append(mismatches, fmt.Sprintf("table %s: Iceberg partition presence mismatch (doris partitioned=false, iceberg partitioned=true)", k))
 		} else if dt.Partition != nil && it.Partition != nil {
 			if !stringSlicesEqual(dt.Partition.Columns, it.Partition.Columns) {
 				mismatches = append(mismatches, fmt.Sprintf("table %s: Iceberg partition columns mismatch (doris=%v, iceberg=%v)", k, dt.Partition.Columns, it.Partition.Columns))
@@ -617,6 +619,22 @@ func CheckSchemaParity(dorisSchema, icebergSchema *doris.Schema) []string {
 	}
 
 	return mismatches
+}
+
+func isNonKeyIcebergPartition(dt *doris.TableDef, icePart *doris.PartitionClause) bool {
+	if dt == nil || icePart == nil || dt.Key.Kind != doris.KeyUnique || len(icePart.Columns) == 0 {
+		return false
+	}
+	keySet := make(map[string]bool, len(dt.Key.Columns))
+	for _, kc := range dt.Key.Columns {
+		keySet[kc] = true
+	}
+	for _, pc := range icePart.Columns {
+		if !keySet[pc] {
+			return true
+		}
+	}
+	return false
 }
 
 func parityTableKey(t *doris.TableDef) string {

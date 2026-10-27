@@ -299,6 +299,17 @@ func tablePropertyMatches(curProps map[string]string, key, desiredVal string) bo
 			}
 		}
 	}
+	// Doris Iceberg SQL uses "compression_codec" while Iceberg HCL uses "write.parquet.compression-codec".
+	if key == "write.parquet.compression-codec" {
+		if codec, ok := curProps["compression_codec"]; ok && strings.EqualFold(strings.TrimSpace(codec), strings.TrimSpace(desiredVal)) {
+			return true
+		}
+	}
+	if key == "compression_codec" {
+		if codec, ok := curProps["write.parquet.compression-codec"]; ok && strings.EqualFold(strings.TrimSpace(codec), strings.TrimSpace(desiredVal)) {
+			return true
+		}
+	}
 	return false
 }
 

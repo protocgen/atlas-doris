@@ -607,7 +607,9 @@ func CheckSchemaParity(dorisSchema, icebergSchema *doris.Schema) []string {
 				mismatches = append(mismatches, fmt.Sprintf("table %s: column %q present in Iceberg but missing in Doris", k, ic.Name))
 			}
 		}
-		if dt.Partition != nil && it.Partition != nil && len(dt.Partition.Columns) > 0 && len(it.Partition.Columns) > 0 {
+		if (dt.Partition == nil) != (it.Partition == nil) {
+			mismatches = append(mismatches, fmt.Sprintf("table %s: Iceberg partition presence mismatch (doris partitioned=%v, iceberg partitioned=%v)", k, dt.Partition != nil, it.Partition != nil))
+		} else if dt.Partition != nil && it.Partition != nil {
 			if !stringSlicesEqual(dt.Partition.Columns, it.Partition.Columns) {
 				mismatches = append(mismatches, fmt.Sprintf("table %s: Iceberg partition columns mismatch (doris=%v, iceberg=%v)", k, dt.Partition.Columns, it.Partition.Columns))
 			}
@@ -650,7 +652,64 @@ func parityIcebergTypesCompatible(dorisType, icebergType string) bool {
 	if (dt == "JSON" || strings.HasPrefix(dt, "VARCHAR(")) && it == "STRING" {
 		return true
 	}
+	if dt == "LARGEINT" && (it == "DECIMALV3(38, 0)" || it == "DECIMAL(38, 0)") {
+		return true
+	}
+	if strings.HasPrefix(dt, "ARRAY<") && strings.HasSuffix(dt, ">") &&
+		strings.HasPrefix(it, "ARRAY<") && strings.HasSuffix(it, ">") {
+		return parityIcebergTypesCompatible(dt[6:len(dt)-1], it[6:len(it)-1])
+	}
+	if strings.HasPrefix(dt, "MAP<") && strings.HasSuffix(dt, ">") &&
+		strings.HasPrefix(it, "MAP<") && strings.HasSuffix(it, ">") {
+		dParts := splitTopLevelTypeCSV(dt[4 : len(dt)-1])
+		iParts := splitTopLevelTypeCSV(it[4 : len(it)-1])
+		return len(dParts) == 2 && len(iParts) == 2 &&
+			parityIcebergTypesCompatible(dParts[0], iParts[0]) &&
+			parityIcebergTypesCompatible(dParts[1], iParts[1])
+	}
+	if strings.HasPrefix(dt, "STRUCT<") && strings.HasSuffix(dt, ">") &&
+		strings.HasPrefix(it, "STRUCT<") && strings.HasSuffix(it, ">") {
+		dFields := splitTopLevelTypeCSV(dt[7 : len(dt)-1])
+		iFields := splitTopLevelTypeCSV(it[7 : len(it)-1])
+		if len(dFields) != len(iFields) {
+			return false
+		}
+		for i := range dFields {
+			dName, dType, dOk := strings.Cut(dFields[i], ":")
+			iName, iType, iOk := strings.Cut(iFields[i], ":")
+			if !dOk || !iOk || strings.TrimSpace(dName) != strings.TrimSpace(iName) ||
+				!parityIcebergTypesCompatible(strings.TrimSpace(dType), strings.TrimSpace(iType)) {
+				return false
+			}
+		}
+		return true
+	}
 	return false
+}
+
+func splitTopLevelTypeCSV(s string) []string {
+	var parts []string
+	depth := 0
+	start := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '<', '(':
+			depth++
+		case '>', ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				parts = append(parts, strings.TrimSpace(s[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	if tail := strings.TrimSpace(s[start:]); tail != "" {
+		parts = append(parts, tail)
+	}
+	return parts
 }
 
 func stringSlicesEqual(a, b []string) bool {

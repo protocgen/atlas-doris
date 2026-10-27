@@ -101,6 +101,16 @@ func LintTable(t *TableDef) []Violation {
 	return violations
 }
 
+func isIneligibleKeyOrHashType(upperType, rawType string) bool {
+	return IsNonScalarColumnType(rawType) ||
+		upperType == "BITMAP" ||
+		upperType == "HLL" ||
+		upperType == "STRING" ||
+		upperType == "TEXT" ||
+		upperType == "QUANTILE_STATE" ||
+		strings.HasPrefix(upperType, "AGG_STATE")
+}
+
 func lintTableKeyAndANN(t *TableDef, colByName map[string]*ColumnDef) []Violation {
 	if t == nil {
 		return nil
@@ -108,8 +118,10 @@ func lintTableKeyAndANN(t *TableDef, colByName map[string]*ColumnDef) []Violatio
 	var violations []Violation
 	tblName := t.CanonicalName()
 
+	keyColSet := make(map[string]bool)
 	if t.Key != nil {
 		for _, kc := range t.Key.Columns {
+			keyColSet[kc] = true
 			col, ok := colByName[kc]
 			if !ok {
 				violations = append(violations, Violation{
@@ -128,7 +140,7 @@ func lintTableKeyAndANN(t *TableDef, colByName map[string]*ColumnDef) []Violatio
 					ColumnName: kc,
 					Message:    fmt.Sprintf("key column %q uses floating-point type %s (prohibited by Doris)", kc, col.Type),
 				})
-			} else if IsNonScalarColumnType(col.Type) || upperType == "BITMAP" || upperType == "HLL" {
+			} else if isIneligibleKeyOrHashType(upperType, col.Type) {
 				violations = append(violations, Violation{
 					Rule:       DORIS001_IMMUTABLE_KEY,
 					TableName:  tblName,
@@ -140,6 +152,8 @@ func lintTableKeyAndANN(t *TableDef, colByName map[string]*ColumnDef) []Violatio
 	}
 
 	if t.Distribution != nil {
+		isHashDist := t.Distribution.Kind == "" || strings.EqualFold(t.Distribution.Kind, "HASH")
+		requireKeyMembership := isHashDist && t.Key != nil && (t.Key.Kind == KeyUnique || t.Key.Kind == KeyAggregate) && len(t.Key.Columns) > 0
 		for _, dc := range t.Distribution.Columns {
 			col, ok := colByName[dc]
 			if !ok {
@@ -152,12 +166,20 @@ func lintTableKeyAndANN(t *TableDef, colByName map[string]*ColumnDef) []Violatio
 				continue
 			}
 			upperType := NormalizeType(col.Type)
-			if upperType == "FLOAT" || upperType == "DOUBLE" || IsNonScalarColumnType(col.Type) || upperType == "BITMAP" || upperType == "HLL" {
+			if upperType == "FLOAT" || upperType == "DOUBLE" || isIneligibleKeyOrHashType(upperType, col.Type) {
 				violations = append(violations, Violation{
 					Rule:       DORIS003_IMMUTABLE_DISTRIBUTION,
 					TableName:  tblName,
 					ColumnName: dc,
 					Message:    fmt.Sprintf("distribution column %q uses ineligible hash type %s", dc, col.Type),
+				})
+			}
+			if requireKeyMembership && !keyColSet[dc] {
+				violations = append(violations, Violation{
+					Rule:       DORIS003_IMMUTABLE_DISTRIBUTION,
+					TableName:  tblName,
+					ColumnName: dc,
+					Message:    fmt.Sprintf("distribution column %q must be a key column on %s KEY tables", dc, t.Key.Kind),
 				})
 			}
 		}
@@ -185,7 +207,8 @@ func lintTableKeyAndANN(t *TableDef, colByName map[string]*ColumnDef) []Violatio
 			case KeyDuplicate:
 				validKeyModel = true
 			case KeyUnique:
-				validKeyModel = t.HasUniqueKeyMergeOnWrite()
+				v, ok := t.GetProperty("enable_unique_key_merge_on_write")
+				validKeyModel = !ok || !strings.EqualFold(strings.TrimSpace(v), "false")
 			}
 			if !validKeyModel {
 				violations = append(violations, Violation{
@@ -323,7 +346,7 @@ func LintTableEvolution(before, after *TableDef, opts LintOptions) []Violation {
 			Message:   fmt.Sprintf("colocate_with group cannot be mutated on existing table (before=%q, after=%q)", beforeColocate, afterColocate),
 		})
 	}
-	if before.Partition != nil && after.Partition != nil && !partitionStrategyEqual(before.Partition, after.Partition) {
+	if !partitionStrategyEqual(before.Partition, after.Partition) {
 		violations = append(violations, Violation{
 			Rule:      DORIS003_IMMUTABLE_DISTRIBUTION,
 			TableName: tblName,

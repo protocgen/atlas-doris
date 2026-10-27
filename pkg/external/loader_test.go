@@ -555,30 +555,69 @@ table "audit_events" {
 }
 
 func TestRealProto2TypeIntegration_MultiTarget(t *testing.T) {
-	proto2typeDir := filepath.Clean(filepath.Join("..", "proto2type"))
-	protoFile := filepath.Join(proto2typeDir, "testdata", "doris_tenant_profile.proto")
-	if _, err := os.Stat(protoFile); os.IsNotExist(err) {
-		t.Skip("skipping real proto2type integration test: ../proto2type/testdata/doris_tenant_profile.proto not found")
+	var proto2typeDir string
+	for _, cand := range []string{
+		filepath.Join("..", "..", "..", "proto2type"),
+		filepath.Join("..", "..", "proto2type"),
+		filepath.Join("..", "proto2type"),
+	} {
+		if _, err := os.Stat(filepath.Join(cand, "proto", "proto2type", "options.proto")); err == nil {
+			proto2typeDir = filepath.Clean(cand)
+			break
+		}
 	}
+	if proto2typeDir == "" {
+		t.Skip("skipping real proto2type integration test: sibling proto2type repository not found")
+	}
+
+	protoDir := t.TempDir()
+	protoFile := filepath.Join(protoDir, "doris_tenant_profile.proto")
+	protoContent := `syntax = "proto3";
+package test.tenant.v1;
+option go_package = "github.com/protocgen/atlas-doris/testdata/tenantv1";
+
+import "proto2type/options.proto";
+
+message PatientProfile {
+  option (proto2type.message).table = {
+    table_name: "patient_profiles"
+    database_scope: "TENANT"
+    unique_key_columns: ["tenant_id", "patient_id"]
+    distributed_by_column: "patient_id"
+    sequence_col: "publication_generation"
+    colocate_group: "azra_patient_group"
+    storage_vault_name: "azra_lakehouse_vault"
+  };
+
+  string tenant_id = 1 [(proto2type.field).column = { doris_type: "VARCHAR(64)", is_unique_key: true }];
+  string patient_id = 2 [(proto2type.field).column = { doris_type: "VARCHAR(64)", is_unique_key: true }];
+  string mrn = 3 [(proto2type.field).column = { doris_type: "VARCHAR(64)", default_value: "", inverted_index: true }];
+  int64 publication_generation = 4 [(proto2type.field).column = { doris_type: "BIGINT", default_value: "0", is_sequence_col: true }];
+}
+`
+	if err := os.WriteFile(protoFile, []byte(protoContent), 0o644); err != nil {
+		t.Fatalf("write protoFile: %v", err)
+	}
+	protoInclude := filepath.Join(proto2typeDir, "proto")
 
 	ctx := context.Background()
 	sDoris, err := external.LoadSchema(ctx, "proto://"+protoFile, external.LoadOptions{
 		Target:        external.TargetDoris,
-		ProtoIncludes: []string{proto2typeDir},
+		ProtoIncludes: []string{protoInclude},
 	})
 	if err != nil {
 		t.Fatalf("LoadSchema(TargetDoris) failed: %v", err)
 	}
 	sIceberg, err := external.LoadSchema(ctx, "proto://"+protoFile, external.LoadOptions{
 		Target:        external.TargetIceberg,
-		ProtoIncludes: []string{proto2typeDir},
+		ProtoIncludes: []string{protoInclude},
 	})
 	if err != nil {
 		t.Fatalf("LoadSchema(TargetIceberg) failed: %v", err)
 	}
 	sAll, err := external.LoadSchema(ctx, "proto://"+protoFile+"?doris_mode=both", external.LoadOptions{
 		Target:        external.TargetAll,
-		ProtoIncludes: []string{proto2typeDir},
+		ProtoIncludes: []string{protoInclude},
 	})
 	if err != nil {
 		t.Fatalf("LoadSchema(TargetAll, doris_mode=both) failed: %v", err)

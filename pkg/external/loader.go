@@ -409,8 +409,9 @@ func resolveProto2TypePlugin(ctx context.Context, explicitPath string) (string, 
 				continue
 			}
 			binPath := filepath.Join(tmpBinDir, "protoc-gen-proto2type")
-			buildCmd := exec.CommandContext(ctx, "go", "build", "-workfile=off", "-o", binPath, ".")
+			buildCmd := exec.CommandContext(ctx, "go", "build", "-o", binPath, ".")
 			buildCmd.Dir = repoDir
+			buildCmd.Env = append(os.Environ(), "GOWORK=off")
 			if err := buildCmd.Run(); err == nil {
 				return binPath, func() { _ = os.RemoveAll(tmpBinDir) }, nil
 			}

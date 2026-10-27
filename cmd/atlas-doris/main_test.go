@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/protocgen/atlas-doris/pkg/doris"
+	"github.com/protocgen/atlas-doris/pkg/external"
 )
 
 func TestCLI_FullMigrationWorkflowAndErrorPaths(t *testing.T) {
@@ -302,6 +304,66 @@ PROPERTIES (
 	mismatches := CheckSchemaParity(sDoris, sReorderedIce)
 	if !strings.Contains(strings.Join(mismatches, "\n"), "order/name mismatch") {
 		t.Errorf("expected CheckSchemaParity to report order/name mismatch, got: %v", mismatches)
+	}
+
+	// 6. Test LARGEINT <-> DECIMAL(38, 0), recursive ARRAY/MAP/STRUCT type compatibility, and partition presence mismatch
+	sComplexDoris, err := doris.ParseSchema(`
+CREATE TABLE IF NOT EXISTS internal.tenant_a.complex_items (
+    item_id VARCHAR(64) NOT NULL,
+    huge_seq LARGEINT NOT NULL,
+    tags ARRAY<VARCHAR(64)> NOT NULL DEFAULT [],
+    big_nums ARRAY<LARGEINT> NOT NULL DEFAULT [],
+    attrs MAP<VARCHAR(32), LARGEINT>,
+    meta STRUCT<label:VARCHAR(64), count:LARGEINT>
+)
+UNIQUE KEY(item_id)
+PARTITION BY LIST (item_id) ()
+DISTRIBUTED BY HASH(item_id) BUCKETS 4;`)
+	if err != nil {
+		t.Fatalf("ParseSchema(sComplexDoris): %v", err)
+	}
+	sComplexIce, err := doris.ParseSchema(`
+CREATE TABLE IF NOT EXISTS azra_lake.tenant_a.complex_items (
+    item_id STRING NOT NULL,
+    huge_seq DECIMAL(38, 0) NOT NULL,
+    tags ARRAY<STRING> NOT NULL,
+    big_nums ARRAY<DECIMAL(38, 0)> NOT NULL,
+    attrs MAP<STRING, DECIMAL(38, 0)>,
+    meta STRUCT<label:STRING, count:DECIMAL(38, 0)>
+)
+PARTITION BY LIST (item_id) ()
+PROPERTIES (
+    "compression_codec" = "zstd"
+);`)
+	if err != nil {
+		t.Fatalf("ParseSchema(sComplexIce): %v", err)
+	}
+	if m := CheckSchemaParity(sComplexDoris, sComplexIce); len(m) != 0 {
+		t.Fatalf("expected 0 parity mismatches for LARGEINT/ARRAY/MAP/STRUCT Doris<->Iceberg mappings, got: %v", m)
+	}
+
+	// Partition presence mismatch when one side is partitioned and the other is unpartitioned
+	sUnpartitionedIce := sComplexIce.Clone()
+	sUnpartitionedIce.Tables[0].Partition = nil
+	if m := CheckSchemaParity(sComplexDoris, sUnpartitionedIce); !strings.Contains(strings.Join(m, "\n"), "Iceberg partition presence mismatch") {
+		t.Errorf("expected Iceberg partition presence mismatch when Iceberg table is unpartitioned, got: %v", m)
+	}
+	sUnpartitionedDoris := sComplexDoris.Clone()
+	sUnpartitionedDoris.Tables[0].Partition = nil
+	if m := CheckSchemaParity(sUnpartitionedDoris, sComplexIce); !strings.Contains(strings.Join(m, "\n"), "Iceberg partition presence mismatch") {
+		t.Errorf("expected Iceberg partition presence mismatch when Doris table is unpartitioned, got: %v", m)
+	}
+
+	// Inner type mismatch on ARRAY, MAP, and STRUCT
+	sBadInnerIce := sComplexIce.Clone()
+	sBadInnerIce.Tables[0].Columns[2].Type = "ARRAY<BIGINT>"
+	sBadInnerIce.Tables[0].Columns[4].Type = "MAP<STRING, VARCHAR(16)>"
+	sBadInnerIce.Tables[0].Columns[5].Type = "STRUCT<label:STRING>"
+	innerMismatches := strings.Join(CheckSchemaParity(sComplexDoris, sBadInnerIce), "\n")
+	for _, colName := range []string{`column "tags"`, `column "attrs"`, `column "meta"`} {
+		if !strings.Contains(innerMismatches, colName) {
+			t.Errorf("expected inner complex type mismatch on %s, got:\n%s", colName, innerMismatches)
+		}
 	}
 }
 
@@ -679,32 +741,121 @@ table "patient_note_chunks" {
 	if !strings.Contains(driftMismatches, "Iceberg partition columns mismatch") {
 		t.Errorf("expected drift CheckSchemaParity to report Iceberg partition columns mismatch, got:\n%s", driftMismatches)
 	}
+
+	// 5. Exercise live ../proto2type plugin binary when sibling repository is present
+	t.Run("live_proto2type_binary_contract", func(t *testing.T) {
+		var proto2typeDir string
+		for _, cand := range []string{
+			filepath.Join("..", "..", "..", "proto2type"),
+			filepath.Join("..", "..", "proto2type"),
+		} {
+			if _, err := os.Stat(filepath.Join(cand, "proto", "proto2type", "options.proto")); err == nil {
+				proto2typeDir = filepath.Clean(cand)
+				break
+			}
+		}
+		if proto2typeDir == "" {
+			t.Skip("skipping live proto2type binary subtest: sibling proto2type repository not found")
+		}
+
+		protoDir := t.TempDir()
+		protoFile := filepath.Join(protoDir, "doris_tenant_profile.proto")
+		protoContent := `syntax = "proto3";
+package test.tenant.v1;
+option go_package = "github.com/protocgen/atlas-doris/testdata/tenantv1";
+
+import "proto2type/options.proto";
+
+message PatientProfile {
+  option (proto2type.message).table = {
+    table_name: "patient_profiles"
+    database_scope: "TENANT"
+    unique_key_columns: ["tenant_id", "patient_id"]
+    distributed_by_column: "patient_id"
+    sequence_col: "publication_generation"
+    colocate_group: "azra_patient_group"
+    storage_vault_name: "azra_lakehouse_vault"
+  };
+
+  string tenant_id = 1 [(proto2type.field).column = { doris_type: "VARCHAR(64)", is_unique_key: true }];
+  string patient_id = 2 [(proto2type.field).column = { doris_type: "VARCHAR(64)", is_unique_key: true }];
+  string mrn = 3 [(proto2type.field).column = { doris_type: "VARCHAR(64)", default_value: "", inverted_index: true }];
+  int64 publication_generation = 4 [(proto2type.field).column = { doris_type: "BIGINT", default_value: "0", is_sequence_col: true }];
 }
+`
+		if err := os.WriteFile(protoFile, []byte(protoContent), 0o644); err != nil {
+			t.Fatalf("write protoFile: %v", err)
+		}
 
-func TestRealProto2Type_SchemaParity(t *testing.T) {
-	proto2typeDir := filepath.Clean(filepath.Join("..", "..", "..", "proto2type"))
-	if _, err := os.Stat(proto2typeDir); os.IsNotExist(err) {
-		proto2typeDir = filepath.Clean(filepath.Join("..", "..", "proto2type"))
-	}
-	protoFile := filepath.Join(proto2typeDir, "testdata", "doris_tenant_profile.proto")
-	if _, err := os.Stat(protoFile); os.IsNotExist(err) {
-		t.Skip("skipping real proto2type parity test: doris_tenant_profile.proto not found")
-	}
+		pluginBin := filepath.Join(t.TempDir(), "protoc-gen-proto2type")
+		buildCmd := exec.Command("go", "build", "-o", pluginBin, ".")
+		buildCmd.Dir = proto2typeDir
+		buildCmd.Env = append(os.Environ(), "GOWORK=off")
+		if out, err := buildCmd.CombinedOutput(); err != nil {
+			t.Fatalf("build protoc-gen-proto2type failed: %v\n%s", err, string(out))
+		}
 
-	ctx := context.Background()
-	out, errOut, code := runCLI(
-		ctx,
-		"schema", "parity",
-		"--doris", "proto://"+protoFile,
-		"--iceberg", "proto://"+protoFile,
-		"--include", proto2typeDir,
-	)
-	if code != 0 {
-		t.Fatalf("schema parity on real proto2type failed (code=%d): %s", code, errOut)
-	}
-	if !strings.Contains(out, "schema parity passed") {
-		t.Errorf("unexpected schema parity stdout: %q", out)
-	}
+		protoInclude := filepath.Join(proto2typeDir, "proto")
+		ctx := context.Background()
+		loadOpts := func(target external.TargetFilter) external.LoadOptions {
+			return external.LoadOptions{
+				Target:        target,
+				ProtoIncludes: []string{protoInclude},
+				PluginPath:    pluginBin,
+			}
+		}
+
+		liveDorisSQL, err := external.LoadSchema(ctx, "proto://"+protoFile+"?mode=ddl", loadOpts(external.TargetDoris))
+		if err != nil {
+			t.Fatalf("LoadSchema(live Doris SQL): %v", err)
+		}
+		liveDorisHCL, err := external.LoadSchema(ctx, "proto://"+protoFile+"?mode=hcl", loadOpts(external.TargetDoris))
+		if err != nil {
+			t.Fatalf("LoadSchema(live Doris HCL): %v", err)
+		}
+		liveIcebergSQL, err := external.LoadSchema(ctx, "proto://"+protoFile+"?mode=ddl", loadOpts(external.TargetIceberg))
+		if err != nil {
+			t.Fatalf("LoadSchema(live Iceberg SQL): %v", err)
+		}
+		liveIcebergHCL, err := external.LoadSchema(ctx, "proto://"+protoFile+"?mode=hcl", loadOpts(external.TargetIceberg))
+		if err != nil {
+			t.Fatalf("LoadSchema(live Iceberg HCL): %v", err)
+		}
+
+		if stmts, err := doris.Diff(liveDorisSQL, liveDorisHCL); err != nil || len(stmts) != 0 {
+			t.Fatalf("live Doris SQL <-> HCL diff = %d stmts (err=%v):\n%s", len(stmts), err, doris.FormatStatements(stmts))
+		}
+		if stmts, err := doris.Diff(liveIcebergSQL, liveIcebergHCL); err != nil || len(stmts) != 0 {
+			t.Fatalf("live Iceberg SQL -> HCL diff = %d stmts (err=%v):\n%s", len(stmts), err, doris.FormatStatements(stmts))
+		}
+		if stmts, err := doris.Diff(liveIcebergHCL, liveIcebergSQL); err != nil || len(stmts) != 0 {
+			t.Fatalf("live Iceberg HCL -> SQL diff = %d stmts (err=%v):\n%s", len(stmts), err, doris.FormatStatements(stmts))
+		}
+		if v := doris.LintSchema(liveDorisSQL); len(v) != 0 {
+			t.Fatalf("live Doris LintSchema violations: %v", v)
+		}
+		if v := doris.LintSchema(liveIcebergSQL); len(v) != 0 {
+			t.Fatalf("live Iceberg LintSchema violations: %v", v)
+		}
+		if m := CheckSchemaParity(liveDorisSQL, liveIcebergSQL); len(m) != 0 {
+			t.Fatalf("live CheckSchemaParity(SQL) mismatches: %v", m)
+		}
+		if m := CheckSchemaParity(liveDorisHCL, liveIcebergHCL); len(m) != 0 {
+			t.Fatalf("live CheckSchemaParity(HCL) mismatches: %v", m)
+		}
+
+		out, errOut, code := runCLI(
+			ctx,
+			"schema", "parity",
+			"--doris", "proto://"+protoFile,
+			"--iceberg", "proto://"+protoFile,
+			"--include", protoInclude,
+			"--plugin", pluginBin,
+		)
+		if code != 0 || !strings.Contains(out, "schema parity passed") {
+			t.Fatalf("schema parity CLI on live proto2type failed (code=%d): out=%q err=%s", code, out, errOut)
+		}
+	})
 }
 
 func runCLI(ctx context.Context, args ...string) (string, string, int) {

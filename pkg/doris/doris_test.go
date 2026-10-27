@@ -1437,16 +1437,25 @@ PROPERTIES (
 		t.Errorf("expected unquoted DEFAULT [] on ARRAY column, got:\n%s", formatted1)
 	}
 
-	// DORIS001: nonexistent key column or complex key column
+	// DORIS001: nonexistent key column or complex/ineligible key column (ARRAY, STRING, TEXT, QUANTILE_STATE, AGG_STATE)
 	missingKeyTbl := s1.Tables[0].Clone()
 	missingKeyTbl.Key.Columns = []string{"nonexistent_key"}
 	assertHasRule(t, doris.LintTable(missingKeyTbl), doris.DORIS001_IMMUTABLE_KEY)
 
-	complexKeyTbl := s1.Tables[0].Clone()
-	complexKeyTbl.Key.Columns = []string{"embedding"}
-	assertHasRule(t, doris.LintTable(complexKeyTbl), doris.DORIS001_IMMUTABLE_KEY)
+	for _, ineligibleKeyType := range []string{"ARRAY<FLOAT>", "STRING", "TEXT", "QUANTILE_STATE", "AGG_STATE<max_by(INT NOT NULL, INT)>"} {
+		badKeyTbl := s1.Tables[0].Clone()
+		badKeyTbl.Columns = append(badKeyTbl.Columns, &doris.ColumnDef{
+			Name:     "bad_key_col",
+			Type:     ineligibleKeyType,
+			Nullable: false,
+		})
+		badKeyTbl.Key.Columns = []string{"bad_key_col"}
+		badKeyTbl.Distribution.Columns = []string{"bad_key_col"}
+		assertHasRule(t, doris.LintTable(badKeyTbl), doris.DORIS001_IMMUTABLE_KEY)
+		assertHasRule(t, doris.LintTable(badKeyTbl), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
+	}
 
-	// DORIS003: nonexistent distribution column or complex distribution column
+	// DORIS003: nonexistent distribution column, complex distribution column, or non-key distribution column on UNIQUE/AGGREGATE KEY table
 	missingDistTbl := s1.Tables[0].Clone()
 	missingDistTbl.Distribution.Columns = []string{"nonexistent_dist_col"}
 	assertHasRule(t, doris.LintTable(missingDistTbl), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
@@ -1455,15 +1464,49 @@ PROPERTIES (
 	complexDistTbl.Distribution.Columns = []string{"embedding"}
 	assertHasRule(t, doris.LintTable(complexDistTbl), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
 
+	nonKeyDistUniqueTbl := s1.Tables[0].Clone()
+	nonKeyDistUniqueTbl.Distribution.Columns = []string{"status"}
+	assertHasRule(t, doris.LintTable(nonKeyDistUniqueTbl), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
+
+	nonKeyDistAggTbl := s1.Tables[0].Clone()
+	nonKeyDistAggTbl.Key.Kind = doris.KeyAggregate
+	nonKeyDistAggTbl.SetProperty("function_column.sequence_col", "")
+	nonKeyDistAggTbl.Distribution.Columns = []string{"status"}
+	assertHasRule(t, doris.LintTable(nonKeyDistAggTbl), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
+
+	// DUPLICATE KEY table allows hash distribution on non-key scalar column
+	nonKeyDistDupTbl := s1.Tables[0].Clone()
+	nonKeyDistDupTbl.Key.Kind = doris.KeyDuplicate
+	nonKeyDistDupTbl.Properties = nil
+	nonKeyDistDupTbl.Distribution.Columns = []string{"status"}
+	if v := doris.LintTable(nonKeyDistDupTbl); len(v) != 0 {
+		t.Errorf("expected DUPLICATE KEY table to allow non-key scalar distribution column, got %v", v)
+	}
+
+	// UNIQUE KEY table with ANN index: omitted enable_unique_key_merge_on_write defaults to true (valid), explicit "false" is rejected
+	omittedMoWTbl := s1.Tables[0].Clone()
+	omittedMoWTbl.Properties = nil
+	if v := doris.LintTable(omittedMoWTbl); len(v) != 0 {
+		t.Errorf("expected UNIQUE KEY table with omitted enable_unique_key_merge_on_write (default true) to allow ANN index, got %v", v)
+	}
+	disabledMoWTbl := s1.Tables[0].Clone()
+	disabledMoWTbl.SetProperty("enable_unique_key_merge_on_write", "false")
+	assertHasRule(t, doris.LintTable(disabledMoWTbl), doris.DORIS006_SAFE_TYPE_EVOLUTION)
+
 	// DORIS002: setting sequence_col on DUPLICATE KEY table
 	dupWithSeq := s1.Tables[0].Clone()
 	dupWithSeq.Key.Kind = doris.KeyDuplicate
 	assertHasRule(t, doris.LintTable(dupWithSeq), doris.DORIS002_IMMUTABLE_SEQUENCE)
 
-	// DORIS003: mutating PARTITION BY on existing table
+	// DORIS003: mutating, adding, or removing PARTITION BY on existing table
 	sBadPart := s1.Clone()
 	sBadPart.Tables[0].Partition.Columns = []string{"patient_id"}
 	assertHasRule(t, doris.LintSchemaEvolution(s1, sBadPart, doris.LintOptions{}), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
+
+	sDroppedPart := s1.Clone()
+	sDroppedPart.Tables[0].Partition = nil
+	assertHasRule(t, doris.LintSchemaEvolution(s1, sDroppedPart, doris.LintOptions{}), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
+	assertHasRule(t, doris.LintSchemaEvolution(sDroppedPart, s1, doris.LintOptions{}), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
 
 	// Verify TEXT <-> STRING semantic equivalence and VARCHAR -> TEXT/STRING, DATE -> DATETIME safe evolution
 	if !doris.TypesSemanticallyEqual("TEXT", "STRING") {

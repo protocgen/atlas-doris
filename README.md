@@ -123,7 +123,7 @@ atlas-doris migrate apply \
 atlas-doris migrate apply \
   --dir file://./migrations \
   --url "doris://root:${DORIS_PASSWORD}@doris-fe:9030/internal" \
-  --revisions-table internal.atlas_revisions \
+  --revisions-table internal \
   --baseline 00000000000000 \
   --var TENANT_SLUG=acme_corp \
   --var TENANT_BUCKETS=16
@@ -169,7 +169,7 @@ func main() {
 	fmt.Print(doris.FormatSchema(currentSchema))
 
 	// 3. Apply pending migrations against Apache Doris FE
-	exec, err := migrate.DialExecutor("doris://root@127.0.0.1:9030/internal", "internal.atlas_revisions")
+	exec, err := migrate.DialExecutor("doris://root@127.0.0.1:9030/internal", "internal")
 	if err != nil {
 		log.Fatalf("dial doris: %v", err)
 	}

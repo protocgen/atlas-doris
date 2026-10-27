@@ -879,3 +879,19 @@ func TestMainEntrypoint(t *testing.T) {
 		t.Errorf("expected exit code 0 from main(), got %d", gotCode)
 	}
 }
+
+func TestReorderFlagsFirst_PreservesTerminator(t *testing.T) {
+	got := reorderFlagsFirst(
+		[]string{"--dir", "file://m", "--to", "file://s.sql", "--", "-my-name"},
+		nil,
+	)
+	want := []string{"--dir", "file://m", "--to", "file://s.sql", "--", "-my-name"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("at index %d: expected %q, got %q (full: %v)", i, want[i], got[i], got)
+		}
+	}
+}

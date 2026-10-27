@@ -794,10 +794,12 @@ func parseKeyValueFlags(pairs []string) (map[string]string, error) {
 func reorderFlagsFirst(args []string, boolFlags map[string]bool) []string {
 	var flags []string
 	var pos []string
+	sawTerminator := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if a == "--" {
 			pos = append(pos, args[i+1:]...)
+			sawTerminator = true
 			break
 		}
 		if strings.HasPrefix(a, "-") {
@@ -809,6 +811,9 @@ func reorderFlagsFirst(args []string, boolFlags map[string]bool) []string {
 		} else {
 			pos = append(pos, a)
 		}
+	}
+	if sawTerminator {
+		flags = append(flags, "--")
 	}
 	return append(flags, pos...)
 }

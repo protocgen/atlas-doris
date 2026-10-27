@@ -217,7 +217,7 @@ func diffTable(current, desired *TableDef, opts DiffOptions) []Statement {
 				TargetTable: targetName,
 				Index:       dIdx.Clone(),
 			})
-			if desired.IsDorisInternalTable() && !desired.IsStarRocksTable() && shouldBuildIndexOnline(dIdx.Using) {
+			if desired.IsDorisInternalTable() && shouldBuildIndexOnline(dIdx.Using) {
 				stmts = append(stmts, Statement{
 					Kind:          StmtBuildIndex,
 					TargetTable:   targetName,
@@ -299,6 +299,17 @@ func tablePropertyMatches(curProps map[string]string, key, desiredVal string) bo
 			}
 		}
 	}
+	// Doris Iceberg SQL uses "compression_codec" while Iceberg HCL uses "write.parquet.compression-codec".
+	if key == "write.parquet.compression-codec" {
+		if codec, ok := curProps["compression_codec"]; ok && strings.EqualFold(strings.TrimSpace(codec), strings.TrimSpace(desiredVal)) {
+			return true
+		}
+	}
+	if key == "compression_codec" {
+		if codec, ok := curProps["write.parquet.compression-codec"]; ok && strings.EqualFold(strings.TrimSpace(codec), strings.TrimSpace(desiredVal)) {
+			return true
+		}
+	}
 	return false
 }
 
@@ -341,11 +352,7 @@ func isMutableTableProperty(key string) bool {
 		"colocate_with",
 		"compression_codec",
 		"replication_num",
-		"enable_single_replica_compaction",
-		"datacache.enable",
-		"datacache.partition_duration",
-		"enable_persistent_index",
-		"storage_volume":
+		"enable_single_replica_compaction":
 		return true
 	}
 	return strings.HasPrefix(key, "write.parquet.")

@@ -22,10 +22,9 @@ import (
 type TargetFilter string
 
 const (
-	TargetAll       TargetFilter = "all"
-	TargetDoris     TargetFilter = "doris"
-	TargetIceberg   TargetFilter = "iceberg"
-	TargetStarRocks TargetFilter = "starrocks"
+	TargetAll     TargetFilter = "all"
+	TargetDoris   TargetFilter = "doris"
+	TargetIceberg TargetFilter = "iceberg"
 )
 
 // LoadOptions configures how LoadSchema loads SQL or Protobuf schema definitions.
@@ -59,17 +58,10 @@ func LoadSchema(ctx context.Context, targetURL string, opts LoadOptions) (*doris
 	if strings.HasPrefix(raw, "proto://") {
 		return loadFromProtoURL(ctx, raw, opts)
 	}
-	if strings.HasPrefix(raw, "doris://") || strings.HasPrefix(raw, "starrocks://") || strings.HasPrefix(raw, "mysql://") {
+	if strings.HasPrefix(raw, "doris://") || strings.HasPrefix(raw, "mysql://") {
 		s, err := migrate.InspectLiveSchema(ctx, raw)
 		if err != nil {
 			return nil, err
-		}
-		if strings.HasPrefix(strings.ToLower(raw), "starrocks://") {
-			for _, t := range s.Tables {
-				if !t.IsIcebergTable() && t.Dialect == "" {
-					t.Dialect = "starrocks"
-				}
-			}
 		}
 		return FilterSchemaByTarget(s, opts.Target), nil
 	}
@@ -98,11 +90,7 @@ func FilterSchemaByTarget(s *doris.Schema, target TargetFilter) *doris.Schema {
 	for _, t := range s.Tables {
 		switch target {
 		case TargetDoris:
-			if t.IsDorisInternalTable() && !t.IsStarRocksTable() {
-				out.Tables = append(out.Tables, t)
-			}
-		case TargetStarRocks:
-			if t.IsStarRocksTable() {
+			if t.IsDorisInternalTable() {
 				out.Tables = append(out.Tables, t)
 			}
 		case TargetIceberg:
@@ -356,20 +344,7 @@ func loadFromProtoURL(ctx context.Context, rawURL string, opts LoadOptions) (*do
 		dorisMode = strings.ToLower(strings.TrimSpace(queryValues.Get("doris_mode")))
 	}
 	if dorisMode == "" {
-		if target == TargetStarRocks {
-			dorisMode = "starrocks"
-		} else {
-			dorisMode = "ddl"
-		}
-	} else if target == TargetStarRocks {
-		switch dorisMode {
-		case "ddl":
-			dorisMode = "starrocks_ddl"
-		case "hcl":
-			dorisMode = "starrocks_hcl"
-		case "both":
-			dorisMode = "starrocks"
-		}
+		dorisMode = "ddl"
 	}
 
 	var args []string
@@ -434,8 +409,9 @@ func resolveProto2TypePlugin(ctx context.Context, explicitPath string) (string, 
 				continue
 			}
 			binPath := filepath.Join(tmpBinDir, "protoc-gen-proto2type")
-			buildCmd := exec.CommandContext(ctx, "go", "build", "-workfile=off", "-o", binPath, ".")
+			buildCmd := exec.CommandContext(ctx, "go", "build", "-o", binPath, ".")
 			buildCmd.Dir = repoDir
+			buildCmd.Env = append(os.Environ(), "GOWORK=off")
 			if err := buildCmd.Run(); err == nil {
 				return binPath, func() { _ = os.RemoveAll(tmpBinDir) }, nil
 			}
@@ -448,10 +424,7 @@ func resolveProto2TypePlugin(ctx context.Context, explicitPath string) (string, 
 func matchesTargetFilter(lowerFileName string, target TargetFilter) bool {
 	switch target {
 	case TargetDoris:
-		if strings.HasSuffix(lowerFileName, "_starrocks.sql") ||
-			strings.HasSuffix(lowerFileName, "_starrocks.hcl") ||
-			strings.Contains(lowerFileName, "starrocks") ||
-			strings.HasSuffix(lowerFileName, "_iceberg.sql") ||
+		if strings.HasSuffix(lowerFileName, "_iceberg.sql") ||
 			strings.HasSuffix(lowerFileName, "_iceberg.hcl") ||
 			strings.Contains(lowerFileName, "iceberg") {
 			return false
@@ -459,10 +432,6 @@ func matchesTargetFilter(lowerFileName string, target TargetFilter) bool {
 		return strings.HasSuffix(lowerFileName, "_doris.sql") ||
 			strings.HasSuffix(lowerFileName, "_doris.hcl") ||
 			strings.Contains(lowerFileName, "doris")
-	case TargetStarRocks:
-		return strings.HasSuffix(lowerFileName, "_starrocks.sql") ||
-			strings.HasSuffix(lowerFileName, "_starrocks.hcl") ||
-			strings.Contains(lowerFileName, "starrocks")
 	case TargetIceberg:
 		return strings.HasSuffix(lowerFileName, "_iceberg.sql") ||
 			strings.HasSuffix(lowerFileName, "_iceberg.hcl") ||

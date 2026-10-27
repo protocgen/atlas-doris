@@ -23,7 +23,7 @@ func IsReservedKeyword(colName string) bool {
 		"kill", "load", "export", "backup", "restore", "alter", "create", "drop",
 		"truncate", "rename", "replace", "insert", "update", "delete", "merge",
 		"into", "over", "window", "rows", "preceding", "following", "current",
-		"true", "false", "properties", "inverted", "ngram_bf", "ngrambf", "ann", "bitmap", "gin", "vector":
+		"true", "false", "properties", "inverted", "ngram_bf", "ann", "bitmap":
 		return true
 	default:
 		return false
@@ -309,20 +309,9 @@ func FormatIndexDefInline(idx *IndexDef) string {
 		for i, p := range idx.Properties {
 			pairs[i] = fmt.Sprintf("%q = %q", p.Key, p.Value)
 		}
-		switch usingUpper {
-		case "GIN":
-			b.WriteByte('(')
-			b.WriteString(strings.Join(pairs, ", "))
-			b.WriteByte(')')
-		case "VECTOR", "NGRAMBF":
-			b.WriteString(" (")
-			b.WriteString(strings.Join(pairs, ", "))
-			b.WriteByte(')')
-		default:
-			b.WriteString(" PROPERTIES (")
-			b.WriteString(strings.Join(pairs, ", "))
-			b.WriteByte(')')
-		}
+		b.WriteString(" PROPERTIES (")
+		b.WriteString(strings.Join(pairs, ", "))
+		b.WriteByte(')')
 	}
 	if idx.Comment != "" {
 		_, _ = fmt.Fprintf(&b, " COMMENT %q", idx.Comment)
@@ -486,9 +475,7 @@ func FormatPlatformObject(p *PlatformObject) string {
 	switch p.Kind {
 	case "SET_DEFAULT_STORAGE_VAULT":
 		return fmt.Sprintf("SET %s AS DEFAULT STORAGE VAULT;", p.Name)
-	case "SET_DEFAULT_STORAGE_VOLUME":
-		return fmt.Sprintf("SET %s AS DEFAULT STORAGE VOLUME;", p.Name)
-	case "STORAGE_VAULT", "STORAGE_VOLUME", "WORKLOAD_GROUP", "CATALOG", "EXTERNAL_CATALOG", "RESOURCE":
+	case "STORAGE_VAULT", "WORKLOAD_GROUP", "CATALOG", "RESOURCE":
 		kw := strings.ReplaceAll(p.Kind, "_", " ")
 		ine := ""
 		if p.IfNotExists {

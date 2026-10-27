@@ -1395,22 +1395,8 @@ func TestASTFormattingAndEqualityHelpers(t *testing.T) {
 	}
 }
 
-func TestStarRocks4x_SQLParserFormatterDifferAndLinter(t *testing.T) {
-	starrocksV1SQL := `
-CREATE STORAGE VOLUME IF NOT EXISTS azra_sr_volume
-PROPERTIES (
-    "type" = "s3",
-    "locations" = "s3://azra-starrocks-bucket/data"
-);
-
-SET azra_sr_volume AS DEFAULT STORAGE VOLUME;
-
-CREATE EXTERNAL CATALOG IF NOT EXISTS azra_iceberg_cat
-PROPERTIES (
-    "type" = "iceberg",
-    "iceberg.catalog.type" = "rest"
-);
-
+func TestDoris4x_HardeningAndEvolutionInvariants(t *testing.T) {
+	dorisV1SQL := `
 CREATE DATABASE IF NOT EXISTS internal.tenant_${TENANT_SLUG};
 
 CREATE TABLE IF NOT EXISTS internal.tenant_${TENANT_SLUG}.patient_notes (
@@ -1419,169 +1405,108 @@ CREATE TABLE IF NOT EXISTS internal.tenant_${TENANT_SLUG}.patient_notes (
     note_id VARCHAR(64) NOT NULL,
     status VARCHAR(32) NOT NULL DEFAULT "DRAFT",
     event_date DATE NOT NULL,
-    note_text STRING,
+    note_text TEXT,
+    tags ARRAY<VARCHAR(255)> NOT NULL DEFAULT [],
     embedding ARRAY<FLOAT> NOT NULL,
     publication_generation BIGINT NOT NULL DEFAULT "0",
     INDEX idx_status_bitmap (status) USING BITMAP,
-    INDEX idx_note_text_gin (note_text) USING GIN("parser" = "english"),
-    INDEX idx_embedding_vec (embedding) USING VECTOR ("index_type" = "hnsw", "metric_type" = "cosine_distance", "dim" = "768")
+    INDEX idx_note_text_inv (note_text) USING INVERTED PROPERTIES("parser" = "english"),
+    INDEX idx_embedding_ann (embedding) USING ANN PROPERTIES("index_type" = "ivfpq", "metric_type" = "cosine_distance", "dim" = "768")
 )
-PRIMARY KEY(tenant_id, patient_id, note_id)
+UNIQUE KEY(tenant_id, patient_id, note_id)
 PARTITION BY LIST (tenant_id) ()
 DISTRIBUTED BY HASH(patient_id) BUCKETS ${TENANT_BUCKETS}
-ORDER BY (tenant_id, patient_id, event_date)
 PROPERTIES (
-    "storage_volume" = "azra_sr_volume",
-    "enable_persistent_index" = "true",
-    "datacache.enable" = "true",
+    "storage_vault_name" = "azra_lakehouse_vault",
+    "enable_unique_key_merge_on_write" = "true",
     "function_column.sequence_col" = "publication_generation",
     "colocate_with" = "azra_patient_group",
     "replication_num" = "1"
 );`
 
-	s1, err := doris.ParseSchema(starrocksV1SQL)
+	s1, err := doris.ParseSchema(dorisV1SQL)
 	if err != nil {
-		t.Fatalf("ParseSchema(starrocksV1SQL) failed: %v", err)
-	}
-	if len(s1.PlatformObjects) != 3 {
-		t.Fatalf("expected 3 StarRocks platform objects, got %d", len(s1.PlatformObjects))
-	}
-	if s1.PlatformObjects[0].Kind != "STORAGE_VOLUME" || s1.PlatformObjects[1].Kind != "SET_DEFAULT_STORAGE_VOLUME" || s1.PlatformObjects[2].Kind != "EXTERNAL_CATALOG" {
-		t.Fatalf("unexpected platform object kinds: %+v, %+v, %+v", s1.PlatformObjects[0], s1.PlatformObjects[1], s1.PlatformObjects[2])
-	}
-	if len(s1.Tables) != 1 {
-		t.Fatalf("expected 1 StarRocks table, got %d", len(s1.Tables))
-	}
-	tbl := s1.Tables[0]
-	if tbl.Key == nil || tbl.Key.Kind != doris.KeyPrimary {
-		t.Fatalf("expected KeyPrimary on patient_notes, got %+v", tbl.Key)
-	}
-	if !tbl.IsStarRocksTable() || tbl.IsIcebergTable() || !tbl.HasPersistentIndex() {
-		t.Fatalf("expected IsStarRocksTable=true, IsIcebergTable=false, HasPersistentIndex=true")
-	}
-
-	// Verify canonical formatting of PRIMARY KEY, USING GIN(...), USING BITMAP, USING VECTOR (...), and PlatformObjects
-	for _, po := range s1.PlatformObjects {
-		po.RawSQL = ""
-	}
-	formatted1 := doris.FormatSchema(s1)
-	for _, want := range []string{
-		"CREATE STORAGE VOLUME IF NOT EXISTS azra_sr_volume",
-		"SET azra_sr_volume AS DEFAULT STORAGE VOLUME;",
-		"CREATE EXTERNAL CATALOG IF NOT EXISTS azra_iceberg_cat",
-		"PRIMARY KEY(tenant_id, patient_id, note_id)",
-		"INDEX idx_status_bitmap (status) USING BITMAP",
-		`INDEX idx_note_text_gin (note_text) USING GIN("parser" = "english")`,
-		`INDEX idx_embedding_vec (embedding) USING VECTOR ("index_type" = "hnsw", "metric_type" = "cosine_distance", "dim" = "768")`,
-	} {
-		if !strings.Contains(formatted1, want) {
-			t.Errorf("FormatSchema missing %q in:\n%s", want, formatted1)
-		}
-	}
-
-	// Round-trip FormatSchema -> ParseSchema -> FormatSchema
-	reParsed, err := doris.ParseSchema(formatted1)
-	if err != nil {
-		t.Fatalf("ParseSchema(formatted1) failed: %v", err)
-	}
-	if doris.FormatSchema(reParsed) != formatted1 {
-		t.Fatalf("FormatSchema not idempotent on StarRocks DDL:\n--- 1 ---\n%s\n--- 2 ---\n%s", formatted1, doris.FormatSchema(reParsed))
+		t.Fatalf("ParseSchema(dorisV1SQL) failed: %v", err)
 	}
 	if violations := doris.LintSchema(s1); len(violations) != 0 {
 		t.Fatalf("expected 0 lint violations on s1, got %v", violations)
 	}
 
-	// Evolve s1 -> s2:
-	// - Widen status VARCHAR(32) -> STRING
-	// - Widen event_date DATE -> DATETIME
-	// - Add summary VARCHAR(128) NOT NULL DEFAULT "" with a new GIN index
-	// - Update datacache.partition_duration = "7 DAY"
-	s2 := s1.Clone()
-	t2 := s2.Tables[0]
-	t2.Columns[3].Type = "STRING"
-	t2.Columns[4].Type = "DATETIME"
-	t2.Columns = append(t2.Columns, &doris.ColumnDef{
-		Name:       "summary",
-		Type:       "VARCHAR(128)",
-		Nullable:   false,
-		HasDefault: true,
-		Default:    "N/A",
-	})
-	t2.Indexes = append(t2.Indexes, &doris.IndexDef{
-		Name:       "idx_summary_gin",
-		Columns:    []string{"summary"},
-		Using:      "GIN",
-		Properties: []doris.Property{{Key: "parser", Value: "standard"}},
-	})
-	t2.SetProperty("datacache.partition_duration", "7 DAY")
-
-	diffStmts, err := doris.Diff(s1, s2)
-	if err != nil {
-		t.Fatalf("Diff(s1, s2) failed: %v", err)
-	}
-	diffSQL := doris.FormatStatements(diffStmts)
-	for _, want := range []string{
-		`ALTER TABLE internal.tenant_${TENANT_SLUG}.patient_notes ADD COLUMN summary VARCHAR(128) NOT NULL DEFAULT "N/A";`,
-		`ALTER TABLE internal.tenant_${TENANT_SLUG}.patient_notes MODIFY COLUMN status STRING NOT NULL DEFAULT "DRAFT";`,
-		`ALTER TABLE internal.tenant_${TENANT_SLUG}.patient_notes MODIFY COLUMN event_date DATETIME NOT NULL;`,
-		`ALTER TABLE internal.tenant_${TENANT_SLUG}.patient_notes ADD INDEX idx_summary_gin (summary) USING GIN("parser" = "standard");`,
-		`ALTER TABLE internal.tenant_${TENANT_SLUG}.patient_notes SET ("datacache.partition_duration" = "7 DAY");`,
-	} {
-		if !strings.Contains(diffSQL, want) {
-			t.Errorf("StarRocks diff SQL missing %q in:\n%s", want, diffSQL)
-		}
-	}
-	if strings.Contains(diffSQL, "BUILD INDEX") {
-		t.Errorf("expected StarRocks diff SQL not to emit BUILD INDEX, got:\n%s", diffSQL)
+	formatted1 := doris.FormatSchema(s1)
+	if !strings.Contains(formatted1, "tags ARRAY<VARCHAR(255)> NOT NULL DEFAULT []") {
+		t.Errorf("expected unquoted DEFAULT [] on ARRAY column, got:\n%s", formatted1)
 	}
 
-	// Replay initial + diff statements and verify exact schema match
-	initStmts, err := doris.ParseStatements(formatted1)
-	if err != nil {
-		t.Fatalf("ParseStatements(formatted1): %v", err)
+	// DORIS001: nonexistent key column or complex/ineligible key column (ARRAY, STRING, TEXT, QUANTILE_STATE, AGG_STATE)
+	missingKeyTbl := s1.Tables[0].Clone()
+	missingKeyTbl.Key.Columns = []string{"nonexistent_key"}
+	assertHasRule(t, doris.LintTable(missingKeyTbl), doris.DORIS001_IMMUTABLE_KEY)
+
+	for _, ineligibleKeyType := range []string{"ARRAY<FLOAT>", "STRING", "TEXT", "QUANTILE_STATE", "AGG_STATE<max_by(INT NOT NULL, INT)>"} {
+		badKeyTbl := s1.Tables[0].Clone()
+		badKeyTbl.Columns = append(badKeyTbl.Columns, &doris.ColumnDef{
+			Name:     "bad_key_col",
+			Type:     ineligibleKeyType,
+			Nullable: false,
+		})
+		badKeyTbl.Key.Columns = []string{"bad_key_col"}
+		badKeyTbl.Distribution.Columns = []string{"bad_key_col"}
+		assertHasRule(t, doris.LintTable(badKeyTbl), doris.DORIS001_IMMUTABLE_KEY)
+		assertHasRule(t, doris.LintTable(badKeyTbl), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
 	}
-	replayed, err := doris.ReplayStatements(append(initStmts, diffStmts...))
-	if err != nil {
-		t.Fatalf("ReplayStatements failed: %v", err)
+
+	// DORIS003: nonexistent distribution column, complex distribution column, or non-key distribution column on UNIQUE/AGGREGATE KEY table
+	missingDistTbl := s1.Tables[0].Clone()
+	missingDistTbl.Distribution.Columns = []string{"nonexistent_dist_col"}
+	assertHasRule(t, doris.LintTable(missingDistTbl), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
+
+	complexDistTbl := s1.Tables[0].Clone()
+	complexDistTbl.Distribution.Columns = []string{"embedding"}
+	assertHasRule(t, doris.LintTable(complexDistTbl), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
+
+	nonKeyDistUniqueTbl := s1.Tables[0].Clone()
+	nonKeyDistUniqueTbl.Distribution.Columns = []string{"status"}
+	assertHasRule(t, doris.LintTable(nonKeyDistUniqueTbl), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
+
+	nonKeyDistAggTbl := s1.Tables[0].Clone()
+	nonKeyDistAggTbl.Key.Kind = doris.KeyAggregate
+	nonKeyDistAggTbl.SetProperty("function_column.sequence_col", "")
+	nonKeyDistAggTbl.Distribution.Columns = []string{"status"}
+	assertHasRule(t, doris.LintTable(nonKeyDistAggTbl), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
+
+	// DUPLICATE KEY table allows hash distribution on non-key scalar column
+	nonKeyDistDupTbl := s1.Tables[0].Clone()
+	nonKeyDistDupTbl.Key.Kind = doris.KeyDuplicate
+	nonKeyDistDupTbl.Properties = nil
+	nonKeyDistDupTbl.Distribution.Columns = []string{"status"}
+	if v := doris.LintTable(nonKeyDistDupTbl); len(v) != 0 {
+		t.Errorf("expected DUPLICATE KEY table to allow non-key scalar distribution column, got %v", v)
 	}
-	if doris.FormatSchema(replayed) != doris.FormatSchema(s2) {
-		t.Fatalf("replayed StarRocks schema mismatch:\nwant:\n%s\ngot:\n%s", doris.FormatSchema(s2), doris.FormatSchema(replayed))
+
+	// UNIQUE KEY table with ANN index: omitted enable_unique_key_merge_on_write defaults to true (valid), explicit "false" is rejected
+	omittedMoWTbl := s1.Tables[0].Clone()
+	omittedMoWTbl.Properties = nil
+	if v := doris.LintTable(omittedMoWTbl); len(v) != 0 {
+		t.Errorf("expected UNIQUE KEY table with omitted enable_unique_key_merge_on_write (default true) to allow ANN index, got %v", v)
 	}
+	disabledMoWTbl := s1.Tables[0].Clone()
+	disabledMoWTbl.SetProperty("enable_unique_key_merge_on_write", "false")
+	assertHasRule(t, doris.LintTable(disabledMoWTbl), doris.DORIS006_SAFE_TYPE_EVOLUTION)
 
-	// Verify DORIS001-DORIS007 lint rules on StarRocks PRIMARY KEY tables
-	// DORIS001: changing PRIMARY KEY -> UNIQUE KEY or disabling enable_persistent_index
-	sBadKeyKind := s1.Clone()
-	sBadKeyKind.Tables[0].Key.Kind = doris.KeyUnique
-	assertHasRule(t, doris.LintSchemaEvolution(s1, sBadKeyKind, doris.LintOptions{}), doris.DORIS001_IMMUTABLE_KEY)
-
-	sDisablePersist := s1.Clone()
-	sDisablePersist.Tables[0].SetProperty("enable_persistent_index", "false")
-	assertHasRule(t, doris.LintSchemaEvolution(s1, sDisablePersist, doris.LintOptions{}), doris.DORIS001_IMMUTABLE_KEY)
-
-	// DORIS002: mutating sequence_col on PRIMARY KEY table or setting sequence_col on DUPLICATE KEY table
-	sBadSeq := s1.Clone()
-	sBadSeq.Tables[0].SetProperty("function_column.sequence_col", "event_date")
-	assertHasRule(t, doris.LintSchemaEvolution(s1, sBadSeq, doris.LintOptions{}), doris.DORIS002_IMMUTABLE_SEQUENCE)
-
+	// DORIS002: setting sequence_col on DUPLICATE KEY table
 	dupWithSeq := s1.Tables[0].Clone()
 	dupWithSeq.Key.Kind = doris.KeyDuplicate
 	assertHasRule(t, doris.LintTable(dupWithSeq), doris.DORIS002_IMMUTABLE_SEQUENCE)
 
-	// DORIS003: mutating PARTITION BY on PRIMARY KEY table
+	// DORIS003: mutating, adding, or removing PARTITION BY on existing table
 	sBadPart := s1.Clone()
 	sBadPart.Tables[0].Partition.Columns = []string{"patient_id"}
 	assertHasRule(t, doris.LintSchemaEvolution(s1, sBadPart, doris.LintOptions{}), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
 
-	// DORIS006: USING VECTOR on PRIMARY KEY with enable_persistent_index = "false" is rejected; ivfpq is accepted
-	badVecTbl := s1.Tables[0].Clone()
-	badVecTbl.SetProperty("enable_persistent_index", "false")
-	assertHasRule(t, doris.LintTable(badVecTbl), doris.DORIS006_SAFE_TYPE_EVOLUTION)
-
-	ivfpqTbl := s1.Tables[0].Clone()
-	ivfpqTbl.Indexes[2].Properties[0].Value = "ivfpq"
-	if v := doris.LintTable(ivfpqTbl); len(v) != 0 {
-		t.Fatalf("expected ivfpq VECTOR index to pass LintTable, got %v", v)
-	}
+	sDroppedPart := s1.Clone()
+	sDroppedPart.Tables[0].Partition = nil
+	assertHasRule(t, doris.LintSchemaEvolution(s1, sDroppedPart, doris.LintOptions{}), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
+	assertHasRule(t, doris.LintSchemaEvolution(sDroppedPart, s1, doris.LintOptions{}), doris.DORIS003_IMMUTABLE_DISTRIBUTION)
 
 	// Verify TEXT <-> STRING semantic equivalence and VARCHAR -> TEXT/STRING, DATE -> DATETIME safe evolution
 	if !doris.TypesSemanticallyEqual("TEXT", "STRING") {
@@ -1620,84 +1545,22 @@ PROPERTIES (
 		}
 	}
 
-	// Verify NGRAMBF SQL + HCL round-trip and no BUILD INDEX on GIN, BITMAP, VECTOR, NGRAMBF
-	ngramSQL := `
-CREATE TABLE IF NOT EXISTS internal.tenant_a.patients (
-    patient_id VARCHAR(64) NOT NULL,
-    full_name VARCHAR(128) NOT NULL DEFAULT "",
-    tags ARRAY<VARCHAR(255)> NOT NULL DEFAULT [],
-    INDEX idx_ngram_patients_full_name (full_name) USING NGRAMBF ("gram_num" = "3", "bloom_filter_fpp" = "0.05")
-)
-PRIMARY KEY(patient_id)
-DISTRIBUTED BY HASH(patient_id) BUCKETS 8
-PROPERTIES (
-    "enable_persistent_index" = "true"
-);`
-	sNgram, err := doris.ParseSchema(ngramSQL)
-	if err != nil {
-		t.Fatalf("ParseSchema(ngramSQL) failed: %v", err)
-	}
-	formattedNgramSQL := doris.FormatSchema(sNgram)
-	if !strings.Contains(formattedNgramSQL, `INDEX idx_ngram_patients_full_name (full_name) USING NGRAMBF ("gram_num" = "3", "bloom_filter_fpp" = "0.05")`) {
-		t.Errorf("unexpected NGRAMBF SQL formatting:\n%s", formattedNgramSQL)
-	}
-	if !strings.Contains(formattedNgramSQL, "tags ARRAY<VARCHAR(255)> NOT NULL DEFAULT []") {
-		t.Errorf("expected unquoted DEFAULT [] on ARRAY column, got:\n%s", formattedNgramSQL)
-	}
-	ngramHCL := doris.FormatHCL(sNgram)
-	if !strings.Contains(ngramHCL, `using = "NGRAMBF"`) || !strings.Contains(ngramHCL, `gram_num = "3"`) || !strings.Contains(ngramHCL, `bloom_filter_fpp = "0.05"`) {
-		t.Errorf("expected top-level gram_num and bloom_filter_fpp in NGRAMBF HCL, got:\n%s", ngramHCL)
-	}
-	sNgramFromHCL, err := doris.ParseHCL(ngramHCL)
-	if err != nil {
-		t.Fatalf("ParseHCL(ngramHCL) failed: %v", err)
-	}
-	if doris.FormatSchema(sNgramFromHCL) != formattedNgramSQL {
-		t.Errorf("NGRAMBF HCL -> SQL mismatch:\nwant:\n%s\ngot:\n%s", formattedNgramSQL, doris.FormatSchema(sNgramFromHCL))
-	}
-
-	// Verify adding GIN, BITMAP, VECTOR, and NGRAMBF indexes on StarRocks never emits BUILD INDEX
-	sBaseNoIdx, err := doris.ParseSchema(`
-CREATE TABLE IF NOT EXISTS internal.tenant_a.patients (
-    patient_id VARCHAR(64) NOT NULL,
-    full_name VARCHAR(128) NOT NULL DEFAULT "",
-    tags ARRAY<VARCHAR(255)> NOT NULL DEFAULT []
-)
-PRIMARY KEY(patient_id)
-DISTRIBUTED BY HASH(patient_id) BUCKETS 8
-PROPERTIES (
-    "enable_persistent_index" = "true"
-);`)
-	if err != nil {
-		t.Fatalf("ParseSchema(sBaseNoIdx): %v", err)
-	}
-	idxDiffStmts, err := doris.Diff(sBaseNoIdx, sNgram)
-	if err != nil {
-		t.Fatalf("Diff(sBaseNoIdx, sNgram) failed: %v", err)
-	}
-	idxDiffSQL := doris.FormatStatements(idxDiffStmts)
-	if !strings.Contains(idxDiffSQL, `ADD INDEX idx_ngram_patients_full_name (full_name) USING NGRAMBF ("gram_num" = "3", "bloom_filter_fpp" = "0.05");`) {
-		t.Errorf("expected ADD INDEX USING NGRAMBF, got:\n%s", idxDiffSQL)
-	}
-	if strings.Contains(idxDiffSQL, "BUILD INDEX") {
-		t.Errorf("expected no BUILD INDEX for StarRocks NGRAMBF index, got:\n%s", idxDiffSQL)
-	}
-
 	// Verify basename-only dialect detection in ParseSchemaAuto
 	dupSQL := `CREATE TABLE t (id BIGINT NOT NULL) DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;`
-	sDorisInSRDir, err := doris.ParseSchemaAuto(dupSQL, "/work/starrocks-migrations/patients_doris.sql")
+	sDorisInIceDir, err := doris.ParseSchemaAuto(dupSQL, "/work/iceberg-migrations/patients_doris.sql")
 	if err != nil {
 		t.Fatalf("ParseSchemaAuto(patients_doris.sql): %v", err)
 	}
-	if sDorisInSRDir.Tables[0].IsStarRocksTable() || sDorisInSRDir.Tables[0].Dialect != "doris" {
-		t.Errorf("expected /work/starrocks-migrations/patients_doris.sql to have Dialect=doris, got %q", sDorisInSRDir.Tables[0].Dialect)
+	if sDorisInIceDir.Tables[0].Dialect != "doris" {
+		t.Errorf("expected /work/iceberg-migrations/patients_doris.sql to have Dialect=doris, got %q", sDorisInIceDir.Tables[0].Dialect)
 	}
-	sSRInDorisDir, err := doris.ParseSchemaAuto(dupSQL, "/work/doris-migrations/patients_starrocks.sql")
+	iceSQL := `CREATE TABLE azra_lake.tenant_a.t (id BIGINT NOT NULL) PROPERTIES ("compression_codec" = "zstd");`
+	sIceInDorisDir, err := doris.ParseSchemaAuto(iceSQL, "/work/doris-migrations/patients_iceberg.sql")
 	if err != nil {
-		t.Fatalf("ParseSchemaAuto(patients_starrocks.sql): %v", err)
+		t.Fatalf("ParseSchemaAuto(patients_iceberg.sql): %v", err)
 	}
-	if !sSRInDorisDir.Tables[0].IsStarRocksTable() || sSRInDorisDir.Tables[0].Dialect != "starrocks" {
-		t.Errorf("expected /work/doris-migrations/patients_starrocks.sql to have Dialect=starrocks, got %q", sSRInDorisDir.Tables[0].Dialect)
+	if !sIceInDorisDir.Tables[0].IsIcebergTable() || sIceInDorisDir.Tables[0].Dialect != "iceberg" {
+		t.Errorf("expected /work/doris-migrations/patients_iceberg.sql to have Dialect=iceberg, got %q", sIceInDorisDir.Tables[0].Dialect)
 	}
 
 	// Verify partitionStrategyEqual in LintTableEvolution does not false-positive when HCL PartitionsRaw is "()"

@@ -367,6 +367,8 @@ PROPERTIES (
 	}
 }
 
+// TestProto2TypeCrossRepoGoldenContract verifies SQL/HCL equivalence, CheckSchemaParity
+// (including non-key and expression Iceberg partition rules), and live proto2type contract parity.
 func TestProto2TypeCrossRepoGoldenContract(t *testing.T) {
 	dorisSQL := `
 CREATE DATABASE IF NOT EXISTS internal.tenant_${TENANT_SLUG};
@@ -740,6 +742,50 @@ table "patient_note_chunks" {
 	driftMismatches := strings.Join(CheckSchemaParity(sDorisSQL, driftIce), "\n")
 	if !strings.Contains(driftMismatches, "Iceberg partition columns mismatch") {
 		t.Errorf("expected drift CheckSchemaParity to report Iceberg partition columns mismatch, got:\n%s", driftMismatches)
+	}
+
+	// Verify Doris UNIQUE KEY table with non-key Iceberg-only partition spec (e.g. event_month not in UNIQUE KEY) passes parity
+	nonKeyPartDoris := sDorisSQL.Clone()
+	nonKeyPartDoris.Tables[0].Partition = nil
+	nonKeyPartIce := sIcebergSQL.Clone()
+	nonKeyPartIce.Tables[0].Partition.Columns = []string{"status"}
+	if m := CheckSchemaParity(nonKeyPartDoris, nonKeyPartIce); len(m) != 0 {
+		t.Errorf("expected Doris UNIQUE KEY table with non-key Iceberg partition column to pass parity, got: %v", m)
+	}
+	// Verify mixed Iceberg partition containing a Doris key column and a non-key column still flags the missing Doris partition
+	mixedKeyPartIce := sIcebergSQL.Clone()
+	mixedKeyPartIce.Tables[0].Partition.Columns = []string{"tenant_id", "status"}
+	if m := CheckSchemaParity(nonKeyPartDoris, mixedKeyPartIce); len(m) == 0 {
+		t.Errorf("expected mixed key + non-key Iceberg partition (tenant_id, status) on unpartitioned Doris UNIQUE KEY table to fail parity")
+	}
+	// Verify Iceberg expression partition (RawExpr) on non-key column passes parity, while expression partition on key column fails
+	exprNonKeyIce := sIcebergSQL.Clone()
+	exprNonKeyIce.Tables[0].Partition = &doris.PartitionClause{
+		Kind:    "EXPR",
+		RawExpr: "day(`status`)",
+	}
+	if m := CheckSchemaParity(nonKeyPartDoris, exprNonKeyIce); len(m) != 0 {
+		t.Errorf("expected Doris UNIQUE KEY table with non-key Iceberg expression partition to pass parity, got: %v", m)
+	}
+	exprKeyIce := sIcebergSQL.Clone()
+	exprKeyIce.Tables[0].Partition = &doris.PartitionClause{
+		Kind:    "EXPR",
+		RawExpr: "bucket(16, tenant_id)",
+	}
+	if m := CheckSchemaParity(nonKeyPartDoris, exprKeyIce); len(m) == 0 {
+		t.Errorf("expected Doris UNIQUE KEY table with key-column Iceberg expression partition to fail parity")
+	}
+	// Verify keyless Doris table (dt.Key == nil) with partitioned Iceberg table fails parity without panicking
+	keylessDoris := nonKeyPartDoris.Clone()
+	keylessDoris.Tables[0].Key = nil
+	if m := CheckSchemaParity(keylessDoris, nonKeyPartIce); len(m) == 0 {
+		t.Errorf("expected keyless Doris table with partitioned Iceberg table to fail parity")
+	}
+	// Whereas DUPLICATE KEY table with dt.Partition == nil && it.Partition != nil fails parity
+	unpartDupDoris := sDorisSQL.Clone()
+	unpartDupDoris.Tables[1].Partition = nil
+	if m := CheckSchemaParity(unpartDupDoris, sIcebergSQL); len(m) == 0 {
+		t.Errorf("expected Doris DUPLICATE KEY table with Iceberg-only partition spec to fail parity")
 	}
 
 	// 5. Exercise live ../proto2type plugin binary when sibling repository is present

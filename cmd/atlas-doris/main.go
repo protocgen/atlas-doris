@@ -621,20 +621,118 @@ func CheckSchemaParity(dorisSchema, icebergSchema *doris.Schema) []string {
 	return mismatches
 }
 
+// isNonKeyIcebergPartition reports whether an unpartitioned Doris UNIQUE KEY table
+// is paired with an Iceberg partition clause whose referenced columns are all
+// non-key columns on the Doris table (which Doris DORIS002 forbids in PARTITION BY
+// on UNIQUE KEY tables).
 func isNonKeyIcebergPartition(dt *doris.TableDef, icePart *doris.PartitionClause) bool {
-	if dt == nil || icePart == nil || dt.Key.Kind != doris.KeyUnique || len(icePart.Columns) == 0 {
+	if dt == nil || icePart == nil || dt.Key == nil || dt.Key.Kind != doris.KeyUnique {
+		return false
+	}
+	partCols := partitionReferencedColumns(dt, icePart)
+	if len(partCols) == 0 {
 		return false
 	}
 	keySet := make(map[string]bool, len(dt.Key.Columns))
 	for _, kc := range dt.Key.Columns {
 		keySet[kc] = true
 	}
-	for _, pc := range icePart.Columns {
-		if !keySet[pc] {
-			return true
+	for _, pc := range partCols {
+		if _, exists := dt.ColumnByName(pc); !exists {
+			return false
+		}
+		if keySet[pc] {
+			return false
 		}
 	}
-	return false
+	return true
+}
+
+// partitionReferencedColumns returns the column names referenced by icePart,
+// resolving expression partitions (icePart.RawExpr) against dt when icePart.Columns is empty.
+func partitionReferencedColumns(dt *doris.TableDef, icePart *doris.PartitionClause) []string {
+	if icePart == nil {
+		return nil
+	}
+	if len(icePart.Columns) > 0 {
+		return icePart.Columns
+	}
+	if strings.TrimSpace(icePart.RawExpr) == "" || dt == nil {
+		return nil
+	}
+	return extractExprColumnRefs(dt, icePart.RawExpr)
+}
+
+// extractExprColumnRefs extracts table column identifiers referenced in an Iceberg
+// partition expression such as "day(event_date)" or "bucket(16, patient_id)".
+func extractExprColumnRefs(dt *doris.TableDef, expr string) []string {
+	var cols []string
+	seen := make(map[string]bool)
+	n := len(expr)
+	for i := 0; i < n; {
+		ch := expr[i]
+		if ch == '\'' || ch == '"' {
+			quote := ch
+			i++
+			for i < n && expr[i] != quote {
+				if expr[i] == '\\' && i+1 < n {
+					i += 2
+					continue
+				}
+				i++
+			}
+			if i < n {
+				i++
+			}
+			continue
+		}
+		if ch == '`' {
+			i++
+			start := i
+			for i < n && expr[i] != '`' {
+				i++
+			}
+			ident := expr[start:i]
+			if i < n {
+				i++
+			}
+			if ident != "" {
+				if _, exists := dt.ColumnByName(ident); exists && !seen[ident] {
+					seen[ident] = true
+					cols = append(cols, ident)
+				}
+			}
+			continue
+		}
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' {
+			start := i
+			i++
+			for i < n {
+				c := expr[i]
+				if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
+					i++
+				} else {
+					break
+				}
+			}
+			ident := expr[start:i]
+			j := i
+			for j < n && (expr[j] == ' ' || expr[j] == '\t' || expr[j] == '\n' || expr[j] == '\r') {
+				j++
+			}
+			// Skip function names immediately followed by '('
+			if j < n && expr[j] == '(' {
+				continue
+			}
+			if _, exists := dt.ColumnByName(ident); exists && !seen[ident] {
+				seen[ident] = true
+				cols = append(cols, ident)
+			}
+			continue
+		}
+		i++
+	}
+	return cols
 }
 
 func parityTableKey(t *doris.TableDef) string {

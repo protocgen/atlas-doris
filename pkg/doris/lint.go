@@ -306,7 +306,7 @@ func LintTableEvolution(before, after *TableDef, opts LintOptions) []Violation {
 		})
 	}
 
-	// DORIS002_IMMUTABLE_SEQUENCE: Block mutating "function_column.sequence_col".
+	// DORIS002_IMMUTABLE_SEQUENCE: Block mutating "function_column.sequence_col" or "enable_unique_key_merge_on_write".
 	beforeSeq := strings.TrimSpace(before.SequenceCol())
 	afterSeq := strings.TrimSpace(after.SequenceCol())
 	if beforeSeq != afterSeq {
@@ -319,6 +319,15 @@ func LintTableEvolution(before, after *TableDef, opts LintOptions) []Violation {
 			TableName:  tblName,
 			ColumnName: seqCol,
 			Message:    fmt.Sprintf("function_column.sequence_col cannot be mutated on existing table (before=%q, after=%q)", beforeSeq, afterSeq),
+		})
+	}
+	beforeMoW, hasBeforeMoW := before.GetProperty("enable_unique_key_merge_on_write")
+	afterMoW, hasAfterMoW := after.GetProperty("enable_unique_key_merge_on_write")
+	if hasBeforeMoW && hasAfterMoW && !strings.EqualFold(strings.TrimSpace(beforeMoW), strings.TrimSpace(afterMoW)) {
+		violations = append(violations, Violation{
+			Rule:      DORIS002_IMMUTABLE_SEQUENCE,
+			TableName: tblName,
+			Message:   fmt.Sprintf("enable_unique_key_merge_on_write cannot be mutated on existing table (before=%q, after=%q)", beforeMoW, afterMoW),
 		})
 	}
 
@@ -603,10 +612,10 @@ func partitionStrategyEqual(a, b *PartitionClause) bool {
 	return true
 }
 
-// IsForbiddenColumnType reports whether rawType is or contains JSONB or VARIANT.
+// IsForbiddenColumnType reports whether rawType is or contains JSON, JSONB, or VARIANT.
 func IsForbiddenColumnType(rawType string) bool {
 	dt := NormalizeType(rawType)
-	if dt == "JSONB" || dt == "VARIANT" {
+	if dt == "JSON" || dt == "JSONB" || dt == "VARIANT" {
 		return true
 	}
 	if strings.HasPrefix(dt, "ARRAY<") && strings.HasSuffix(dt, ">") {

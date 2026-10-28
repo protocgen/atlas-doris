@@ -198,6 +198,10 @@ PROPERTIES (
 		after.Tables[0].SetProperty("function_column.sequence_col", "age")
 		violations := doris.LintSchemaEvolution(baseSchema, after, doris.LintOptions{})
 		assertHasRule(t, violations, doris.DORIS002_IMMUTABLE_SEQUENCE)
+
+		afterMoW := baseSchema.Clone()
+		afterMoW.Tables[0].SetProperty("enable_unique_key_merge_on_write", "false")
+		assertHasRule(t, doris.LintSchemaEvolution(baseSchema, afterMoW, doris.LintOptions{}), doris.DORIS002_IMMUTABLE_SEQUENCE)
 	})
 
 	t.Run("DORIS003_IMMUTABLE_DISTRIBUTION", func(t *testing.T) {
@@ -344,7 +348,7 @@ PROPERTIES (
 	})
 
 	t.Run("DORIS007_FORBIDDEN_TYPE", func(t *testing.T) {
-		for _, forbidden := range []string{"JSONB", "VARIANT", "ARRAY<JSONB>", "ARRAY<VARIANT>"} {
+		for _, forbidden := range []string{"JSON", "JSONB", "VARIANT", "ARRAY<JSON>", "ARRAY<JSONB>", "ARRAY<VARIANT>"} {
 			after := baseSchema.Clone()
 			after.Tables[0].Columns = append(after.Tables[0].Columns, &doris.ColumnDef{
 				Name:     "raw_payload",

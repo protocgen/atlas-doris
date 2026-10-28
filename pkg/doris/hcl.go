@@ -24,6 +24,16 @@ func IsHCLContent(raw string) bool {
 	return rest == "" || rest[0] == '"' || rest[0] == '{'
 }
 
+// IsHCLDocument is an alias for IsHCLContent.
+func IsHCLDocument(raw string) bool {
+	return IsHCLContent(raw)
+}
+
+// ParseHCLSchema is an alias for ParseHCL.
+func ParseHCLSchema(hclText string) (*Schema, error) {
+	return ParseHCL(hclText)
+}
+
 // ParseSchemaAuto parses content as Atlas HCL if filename ends with .hcl or
 // IsHCLContent(content) is true; otherwise parses content as Doris/Iceberg SQL DDL.
 func ParseSchemaAuto(content, filename string) (*Schema, error) {

@@ -349,7 +349,6 @@ func isMutableTableProperty(key string) bool {
 	case "file_cache_ttl_seconds",
 		"group_commit_interval_ms",
 		"bloom_filter_columns",
-		"colocate_with",
 		"compression_codec",
 		"replication_num",
 		"enable_single_replica_compaction":

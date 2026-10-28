@@ -347,10 +347,22 @@ func loadFromProtoURL(ctx context.Context, rawURL string, opts LoadOptions) (*do
 		dorisMode = "ddl"
 	}
 
+	optParts := []string{
+		"lang=go",
+		"backend=doris",
+		"doris_mode=" + dorisMode,
+	}
+	if vault := strings.TrimSpace(queryValues.Get("doris_storage_vault")); vault != "" {
+		optParts = append(optParts, "doris_storage_vault="+vault)
+	}
+	if catalog := strings.TrimSpace(queryValues.Get("iceberg_catalog")); catalog != "" {
+		optParts = append(optParts, "iceberg_catalog="+catalog)
+	}
+
 	var args []string
 	args = append(args, "--plugin=protoc-gen-proto2type="+resolvedPlugin)
 	args = append(args, "--proto2type_out="+tmpOut)
-	args = append(args, "--proto2type_opt=lang=go,backend=doris,doris_mode="+dorisMode)
+	args = append(args, "--proto2type_opt="+strings.Join(optParts, ","))
 	seenInc := make(map[string]bool)
 	for _, inc := range append([]string{rootInclude}, includes...) {
 		cleanInc := filepath.Clean(inc)

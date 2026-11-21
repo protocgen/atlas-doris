@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/protocgen/atlas-doris/pkg/doris"
@@ -1055,4 +1057,597 @@ func TestInspectSchemaFromDB_AndInfoSchemaFallback(t *testing.T) {
 	}); err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Errorf("expected poll timeout error, got %v", err)
 	}
+}
+
+func buildTestMigrationFS(t *testing.T, sqlFiles map[string]string) fstest.MapFS {
+	t.Helper()
+	dir := t.TempDir()
+	mfs := make(fstest.MapFS, len(sqlFiles)+1)
+	for name, content := range sqlFiles {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s): %v", name, err)
+		}
+		mfs[name] = &fstest.MapFile{Data: []byte(content)}
+	}
+	if err := migrate.HashDir(dir); err != nil {
+		t.Fatalf("HashDir: %v", err)
+	}
+	sumData, err := os.ReadFile(filepath.Join(dir, "atlas.sum"))
+	if err != nil {
+		t.Fatalf("read atlas.sum: %v", err)
+	}
+	mfs["atlas.sum"] = &fstest.MapFile{Data: sumData}
+	return mfs
+}
+
+func TestFSPrimitives_VerifySumReplayValidateAndLint(t *testing.T) {
+	mfs := buildTestMigrationFS(t, map[string]string{
+		"00000000000000_tenant.sql": "",
+		"20261115000000_init.sql": `
+CREATE TABLE IF NOT EXISTS internal.tenant_${TENANT_SLUG}.patients (
+    patient_id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(32) NULL
+) UNIQUE KEY(patient_id) DISTRIBUTED BY HASH(patient_id) BUCKETS 4;
+
+CREATE TABLE IF NOT EXISTS azra_lake.tenant_${TENANT_SLUG}.obs (
+    id STRING,
+    tags ARRAY<VARCHAR(65533)>
+) ENGINE=iceberg;
+`,
+		"20261116000000_iceberg_array.sql": `
+ALTER TABLE azra_lake.tenant_${TENANT_SLUG}.obs MODIFY COLUMN tags ARRAY<STRING>;
+`,
+	})
+
+	sum, err := migrate.VerifySumFS(mfs)
+	if err != nil || !strings.HasPrefix(sum, "h1:") {
+		t.Fatalf("VerifySumFS failed: sum=%q err=%v", sum, err)
+	}
+	if err := migrate.ValidateFS(mfs, doris.LintOptions{}); err != nil {
+		t.Fatalf("ValidateFS failed on Iceberg ARRAY<VARCHAR> -> ARRAY<STRING>: %v", err)
+	}
+	schema, files, err := migrate.ReplayFS(mfs)
+	if err != nil {
+		t.Fatalf("ReplayFS failed: %v", err)
+	}
+	if len(files) != 3 || len(schema.Tables) != 2 {
+		t.Fatalf("unexpected ReplayFS output: files=%d tables=%d", len(files), len(schema.Tables))
+	}
+	vs, err := migrate.LintFS(mfs, nil, doris.LintOptions{})
+	if err != nil || len(vs) != 0 {
+		t.Fatalf("expected 0 LintFS violations on Iceberg ARRAY<VARCHAR> -> ARRAY<STRING>, got vs=%v err=%v", vs, err)
+	}
+
+	// Null tightening in SQL migration must violate DORIS006
+	tightFS := buildTestMigrationFS(t, map[string]string{
+		"20261115000000_init.sql":    "CREATE TABLE IF NOT EXISTS internal.tenant_a.patients (id VARCHAR(64) NOT NULL, mrn VARCHAR(32) NULL) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;\n",
+		"20261116000000_tighten.sql": "ALTER TABLE internal.tenant_a.patients MODIFY COLUMN mrn VARCHAR(32) NOT NULL DEFAULT \"\";\n",
+	})
+	if err := migrate.ValidateFS(tightFS, doris.LintOptions{}); err == nil || !strings.Contains(err.Error(), "DORIS006") {
+		t.Fatalf("expected DORIS006 error on NULL -> NOT NULL MODIFY COLUMN, got %v", err)
+	}
+
+	// Tampering detection and missing atlas.sum
+	tampered := fstest.MapFS{
+		"20261115000000_init.sql": &fstest.MapFile{Data: []byte("CREATE TABLE internal.t.a (id INT);")},
+		"atlas.sum":               mfs["atlas.sum"],
+	}
+	if _, err := migrate.VerifySumFS(tampered); err == nil {
+		t.Errorf("expected VerifySumFS to reject tampered migration fs")
+	}
+	if _, err := migrate.VerifySumFS(nil); err == nil {
+		t.Errorf("expected VerifySumFS(nil) error")
+	}
+	if _, err := migrate.VerifySumFS(fstest.MapFS{}); err == nil {
+		t.Errorf("expected VerifySumFS without atlas.sum to fail")
+	}
+	if _, _, err := migrate.ReplayFS(nil); err == nil {
+		t.Errorf("expected ReplayFS(nil) error")
+	}
+	if _, err := migrate.LintFS(nil, nil, doris.LintOptions{}); err == nil {
+		t.Errorf("expected LintFS(nil) error")
+	}
+}
+
+type mockQueryRows struct {
+	cols []string
+	rows [][]any
+	idx  int
+}
+
+func (r *mockQueryRows) Columns() ([]string, error) { return r.cols, nil }
+func (r *mockQueryRows) Next() bool                 { return r.idx < len(r.rows) }
+func (r *mockQueryRows) Err() error                 { return nil }
+func (r *mockQueryRows) Close() error               { return nil }
+func (r *mockQueryRows) Scan(dest ...any) error {
+	row := r.rows[r.idx]
+	r.idx++
+	for i := range dest {
+		if i >= len(row) {
+			continue
+		}
+		switch d := dest[i].(type) {
+		case *string:
+			*d = fmt.Sprint(row[i])
+		case *int:
+			*d = row[i].(int)
+		case *int64:
+			*d = row[i].(int64)
+		case *any:
+			*d = row[i]
+		case *sql.RawBytes:
+			switch v := row[i].(type) {
+			case []byte:
+				*d = sql.RawBytes(v)
+			default:
+				*d = sql.RawBytes(fmt.Sprint(v))
+			}
+		}
+	}
+	return nil
+}
+
+type mockQuerier struct {
+	mu               sync.Mutex
+	revisionsMissing bool
+	missingDB        bool
+	revisions        []migrate.RevisionRecord
+	execLog          []string
+	queryLog         []string
+	failOnSubstr     string
+	coupledReject    bool
+	showErr          error
+	showState        string
+	showStateSeq     []string
+	showIndexName    string
+	showMsg          string
+}
+
+func (m *mockQuerier) ExecContext(_ context.Context, query string, args ...any) (sql.Result, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.execLog = append(m.execLog, query)
+
+	if m.coupledReject && (strings.Contains(query, "storage_vault_name") || strings.Contains(query, "file_cache_ttl_seconds")) {
+		return nil, errors.New("Error 1105: Unknown properties: {storage_vault_name=v1, file_cache_ttl_seconds=3600}")
+	}
+	if m.failOnSubstr != "" && strings.Contains(query, m.failOnSubstr) {
+		return nil, fmt.Errorf("exec error matching %s", m.failOnSubstr)
+	}
+	if strings.HasPrefix(query, "INSERT INTO ") && strings.Contains(query, "atlas_schema_revisions") && len(args) >= 11 {
+		rec := migrate.RevisionRecord{
+			Version:         fmt.Sprint(args[0]),
+			Description:     fmt.Sprint(args[1]),
+			Type:            args[2].(int),
+			Applied:         args[3].(int),
+			Total:           args[4].(int),
+			ExecutedAt:      time.Now().UTC(),
+			ExecutionTimeNs: args[6].(int64),
+			Hash:            fmt.Sprint(args[9]),
+			OperatorVersion: fmt.Sprint(args[10]),
+		}
+		if ns, ok := args[7].(sql.NullString); ok && ns.Valid {
+			rec.Error = ns.String
+		}
+		if ns, ok := args[8].(sql.NullString); ok && ns.Valid {
+			rec.ErrorStmt = ns.String
+		}
+		replaced := false
+		for i, existing := range m.revisions {
+			if existing.Version == rec.Version {
+				m.revisions[i] = rec
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			m.revisions = append(m.revisions, rec)
+		}
+		m.revisionsMissing = false
+	}
+	if strings.HasPrefix(query, "DELETE FROM ") && strings.Contains(query, "atlas_schema_revisions") && len(args) >= 1 {
+		target := fmt.Sprint(args[0])
+		kept := m.revisions[:0]
+		for _, r := range m.revisions {
+			if r.Version != target {
+				kept = append(kept, r)
+			}
+		}
+		m.revisions = kept
+	}
+	return driver.RowsAffected(1), nil
+}
+
+func (m *mockQuerier) QueryRowsContext(_ context.Context, query string, _ ...any) (migrate.QueryRows, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.queryLog = append(m.queryLog, query)
+
+	if strings.Contains(query, "atlas_schema_revisions") {
+		if m.missingDB {
+			return nil, errors.New("Error 1049 (42000): Unknown database 'internal.tenant_duke'")
+		}
+		if m.revisionsMissing {
+			return nil, errors.New("Error 1146 (42S02): Table 'internal.tenant_duke.atlas_schema_revisions' doesn't exist")
+		}
+		rows := make([][]any, 0, len(m.revisions))
+		for _, r := range m.revisions {
+			rows = append(rows, []any{
+				r.Version,
+				r.Description,
+				r.Type,
+				r.Applied,
+				r.Total,
+				r.ExecutedAt.Format("2006-01-02 15:04:05.000000"),
+				r.ExecutionTimeNs,
+				r.Error,
+				r.ErrorStmt,
+				r.Hash,
+				r.OperatorVersion,
+			})
+		}
+		return &mockQueryRows{
+			cols: []string{"version", "description", "type", "applied", "total", "executed_at", "execution_time", "error", "error_stmt", "hash", "operator_version"},
+			rows: rows,
+		}, nil
+	}
+
+	if strings.HasPrefix(query, "SHOW BUILD INDEX") || strings.HasPrefix(query, "SHOW ALTER TABLE COLUMN") {
+		if m.showErr != nil {
+			return nil, m.showErr
+		}
+		st := m.showState
+		if len(m.showStateSeq) > 0 {
+			st = m.showStateSeq[0]
+			m.showStateSeq = m.showStateSeq[1:]
+		}
+		if st == "" {
+			st = "FINISHED"
+		}
+		idxName := m.showIndexName
+		if idxName == "" {
+			idxName = "idx_mrn"
+		}
+		return &mockQueryRows{
+			cols: []string{"JobId", "TableName", "IndexName", "State", "Msg"},
+			rows: [][]any{{"3001", "patients", idxName, st, m.showMsg}},
+		}, nil
+	}
+	return &mockQueryRows{cols: []string{"ok"}}, nil
+}
+
+func TestExecutor_ReadOnlyStatus_EmptyTenantBaseline_And_ChainScope(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("status_is_strictly_read_only_when_revisions_missing", func(t *testing.T) {
+		mfs := buildTestMigrationFS(t, map[string]string{
+			"00000000000000_tenant.sql": "",
+			"20261115000000_init.sql":   "CREATE TABLE IF NOT EXISTS internal.tenant_duke.patients (id VARCHAR(64) NOT NULL) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;\n",
+		})
+		q := &mockQuerier{revisionsMissing: true}
+		exec := migrate.NewExecutorWithQuerier(q, "internal.tenant_duke", migrate.WithChainScope("hl7-ingest"))
+
+		st, err := exec.StatusFS(ctx, mfs)
+		if err != nil {
+			t.Fatalf("StatusFS failed: %v", err)
+		}
+		if st.Status != "PENDING" || len(st.Pending) != 1 || st.Pending[0].Version != "20261115000000" {
+			t.Fatalf("unexpected scoped StatusFS with empty tenant baseline: %+v", st)
+		}
+		if len(q.execLog) != 0 {
+			t.Fatalf("expected 0 mutating ExecContext calls during StatusFS, got %v", q.execLog)
+		}
+
+		// Also verify missing DB error 1049 is tolerated read-only
+		q.revisionsMissing = false
+		q.missingDB = true
+		revs, err := exec.AppliedRevisions(ctx)
+		if err != nil || len(revs) != 0 {
+			t.Fatalf("expected empty AppliedRevisions on missing DB, got revs=%+v err=%v", revs, err)
+		}
+		if len(q.execLog) != 0 {
+			t.Fatalf("expected 0 mutating ExecContext calls during AppliedRevisions, got %v", q.execLog)
+		}
+	})
+
+	t.Run("empty_00000000000000_tenant_skip_without_recording", func(t *testing.T) {
+		mfs := buildTestMigrationFS(t, map[string]string{
+			"00000000000000_tenant.sql": "",
+			"20261115000000_init.sql":   "CREATE TABLE IF NOT EXISTS internal.tenant_${TENANT_SLUG}.patients (id VARCHAR(64) NOT NULL) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS ${TENANT_BUCKETS};\n",
+		})
+		q := &mockQuerier{}
+		exec := migrate.NewExecutorWithQuerier(q, "internal.tenant_duke")
+
+		// Apply with BaselineVersion == "" skips empty 00000000000000_tenant.sql without inserting into revisions
+		res, err := exec.Apply(ctx, migrate.ApplyOptions{
+			FS:   mfs,
+			Vars: map[string]string{"TENANT_SLUG": "duke", "TENANT_BUCKETS": "4"},
+		})
+		if err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+		if len(res.SkippedBaseline) != 1 || res.SkippedBaseline[0] != "00000000000000_tenant.sql" {
+			t.Fatalf("expected 00000000000000_tenant.sql in SkippedBaseline, got %+v", res.SkippedBaseline)
+		}
+		if len(q.revisions) != 1 || q.revisions[0].Version != "20261115000000" {
+			t.Fatalf("expected ONLY 20261115000000 recorded in revisions (not 00000000000000), got %+v", q.revisions)
+		}
+
+		// Subsequent Status & Apply are up to date (maxAppliedVersion > 00000000000000)
+		st, err := exec.StatusFS(ctx, mfs)
+		if err != nil {
+			t.Fatalf("StatusFS after apply: %v", err)
+		}
+		if st.Status != "OK" || len(st.Pending) != 0 {
+			t.Fatalf("expected Status=OK with 0 pending, got %+v", st)
+		}
+		res2, err := exec.Apply(ctx, migrate.ApplyOptions{
+			FS:   mfs,
+			Vars: map[string]string{"TENANT_SLUG": "duke", "TENANT_BUCKETS": "4"},
+		})
+		if err != nil || !res2.AlreadyUpToDate {
+			t.Fatalf("expected idempotent AlreadyUpToDate on re-apply, got res=%+v err=%v", res2, err)
+		}
+	})
+
+	t.Run("multi_chain_scope_isolation_and_delete", func(t *testing.T) {
+		mfsA := buildTestMigrationFS(t, map[string]string{
+			"00000000000000_tenant.sql": "",
+			"20261115000000_a.sql":      "CREATE TABLE IF NOT EXISTS internal.tenant_duke.tbl_a (id VARCHAR(64) NOT NULL) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;\n",
+		})
+		mfsB := buildTestMigrationFS(t, map[string]string{
+			"00000000000000_tenant.sql": "",
+			"20261115000000_b.sql":      "CREATE TABLE IF NOT EXISTS internal.tenant_duke.tbl_b (id VARCHAR(64) NOT NULL) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;\n",
+		})
+		q := &mockQuerier{}
+		sharedExec := migrate.NewExecutorWithQuerier(q, "internal.tenant_duke")
+
+		// Apply chain A and chain B sharing identical timestamp version 20261115000000
+		if _, err := sharedExec.Apply(ctx, migrate.ApplyOptions{FS: mfsA, ChainScope: "svc-a"}); err != nil {
+			t.Fatalf("Apply svc-a: %v", err)
+		}
+		if _, err := sharedExec.Apply(ctx, migrate.ApplyOptions{FS: mfsB, ChainScope: "svc-b"}); err != nil {
+			t.Fatalf("Apply svc-b: %v", err)
+		}
+		if len(q.revisions) != 2 || q.revisions[0].Version != "svc-a:20261115000000" || q.revisions[1].Version != "svc-b:20261115000000" {
+			t.Fatalf("expected <service>:<version> scoped rows, got %+v", q.revisions)
+		}
+
+		// Scoped status for svc-a ignores svc-b and vice versa; unscoped ignores both scoped rows
+		execA := migrate.NewExecutorWithQuerier(q, "internal.tenant_duke", migrate.WithChainScope("svc-a"))
+		stA, err := execA.StatusFS(ctx, mfsA)
+		if err != nil || stA.Status != "OK" || len(stA.Applied) != 1 || stA.Applied[0].Version != "20261115000000" {
+			t.Fatalf("unexpected svc-a StatusFS: st=%+v err=%v", stA, err)
+		}
+		unscopedRevs, err := sharedExec.AppliedRevisions(ctx)
+		if err != nil || len(unscopedRevs) != 0 {
+			t.Fatalf("expected unscoped reader to ignore scoped rows, got %+v err=%v", unscopedRevs, err)
+		}
+
+		// DeleteRevision removes only svc-a's revision
+		if err := execA.DeleteRevision(ctx, "20261115000000"); err != nil {
+			t.Fatalf("DeleteRevision svc-a: %v", err)
+		}
+		if len(q.revisions) != 1 || q.revisions[0].Version != "svc-b:20261115000000" {
+			t.Fatalf("expected only svc-b revision left after DeleteRevision(svc-a), got %+v", q.revisions)
+		}
+
+		// Invalid ChainScope rejected
+		if _, err := sharedExec.Apply(ctx, migrate.ApplyOptions{FS: mfsA, ChainScope: "bad:scope"}); err == nil {
+			t.Errorf("expected error for invalid ChainScope containing ':'")
+		}
+	})
+}
+
+func TestExecutor_NonBlocking_ShowBuildIndex1Part_SyntaxError_And_RuntimeNormalizers(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("show_build_index_uses_1_part_db_and_propagates_syntax_error", func(t *testing.T) {
+		mfs := buildTestMigrationFS(t, map[string]string{
+			"20261115000000_idx.sql": strings.Join([]string{
+				"CREATE TABLE IF NOT EXISTS internal.tenant_duke.patients (id VARCHAR(64) NOT NULL, mrn VARCHAR(64) NOT NULL DEFAULT \"\", INDEX idx_mrn (mrn) USING INVERTED) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;",
+				"BUILD INDEX idx_mrn ON internal.tenant_duke.patients;",
+			}, "\n"),
+		})
+		q := &mockQuerier{}
+		exec := migrate.NewExecutorWithQuerier(q, "internal.tenant_duke", migrate.WithNonBlocking(true))
+		if _, err := exec.Apply(ctx, migrate.ApplyOptions{FS: mfs, ChainScope: "idx-svc"}); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+		found1PartShow := false
+		for _, sqlQ := range q.queryLog {
+			if strings.HasPrefix(sqlQ, "SHOW BUILD INDEX FROM tenant_duke WHERE TableName = 'patients'") {
+				found1PartShow = true
+			}
+			if strings.Contains(sqlQ, "SHOW BUILD INDEX FROM internal.tenant_duke") {
+				t.Fatalf("SHOW BUILD INDEX must NOT use 2-part catalog.db syntax: %s", sqlQ)
+			}
+		}
+		if !found1PartShow {
+			t.Fatalf("expected 1-part SHOW BUILD INDEX FROM tenant_duke query, got %v", q.queryLog)
+		}
+
+		// Real SQL syntax error from SHOW must propagate (no longer suppressed!)
+		qErr := &mockQuerier{showErr: errors.New("Error 1064: syntax error in SQL statement")}
+		execErr := migrate.NewExecutorWithQuerier(qErr, "internal.tenant_duke")
+		if _, err := execErr.Apply(ctx, migrate.ApplyOptions{
+			FS:           mfs,
+			PollInterval: time.Millisecond,
+			PollTimeout:  5 * time.Millisecond,
+		}); err == nil || !strings.Contains(err.Error(), "syntax error") {
+			t.Fatalf("expected SHOW syntax error to propagate instead of being suppressed, got %v", err)
+		}
+	})
+
+	t.Run("non_blocking_pending_resume_and_async_failed_error", func(t *testing.T) {
+		mfs := buildTestMigrationFS(t, map[string]string{
+			"20261115000000_build.sql": strings.Join([]string{
+				"CREATE TABLE IF NOT EXISTS internal.tenant_duke.patients (id VARCHAR(64) NOT NULL, mrn VARCHAR(64) NOT NULL DEFAULT \"\", INDEX idx_mrn (mrn) USING INVERTED) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;",
+				"BUILD INDEX idx_mrn ON internal.tenant_duke.patients;",
+				"ALTER TABLE internal.tenant_duke.patients ADD COLUMN extra VARCHAR(32);",
+			}, "\n"),
+		})
+		q := &mockQuerier{
+			showStateSeq: []string{"RUNNING", "RUNNING", "FINISHED"},
+		}
+		exec := migrate.NewExecutorWithQuerier(
+			q,
+			"internal.tenant_duke",
+			migrate.WithChainScope("async-svc"),
+			migrate.WithNonBlocking(true),
+			migrate.WithPollConfig(10*time.Second, 20*time.Second), // proves NonBlocking does NOT sleep PollInterval
+		)
+
+		// Tick 1: executes CREATE TABLE & BUILD INDEX, polls ONCE -> RUNNING -> returns ErrAsyncJobPending
+		_, err := exec.Apply(ctx, migrate.ApplyOptions{FS: mfs})
+		if !errors.Is(err, migrate.ErrAsyncJobPending) {
+			t.Fatalf("tick 1 expected ErrAsyncJobPending, got %v", err)
+		}
+
+		// Tick 2: skips ExecContext for BUILD INDEX, polls -> still RUNNING -> returns ErrAsyncJobPending
+		_, err = exec.Apply(ctx, migrate.ApplyOptions{FS: mfs})
+		if !errors.Is(err, migrate.ErrAsyncJobPending) {
+			t.Fatalf("tick 2 expected ErrAsyncJobPending, got %v", err)
+		}
+
+		// Tick 3: polls BUILD INDEX -> FINISHED, continues to ADD COLUMN extra -> completes
+		res3, err := exec.Apply(ctx, migrate.ApplyOptions{FS: mfs})
+		if err != nil {
+			t.Fatalf("tick 3 failed: %v", err)
+		}
+		if len(res3.AppliedFiles) != 1 || len(res3.ExecutedSQL) != 1 || !strings.Contains(res3.ExecutedSQL[0], "ADD COLUMN extra") {
+			t.Fatalf("expected tick 3 to execute only ADD COLUMN extra without re-executing BUILD INDEX, got %+v", res3)
+		}
+		buildExecCount := 0
+		for _, sqlStmt := range q.execLog {
+			if strings.HasPrefix(sqlStmt, "BUILD INDEX") {
+				buildExecCount++
+			}
+		}
+		if buildExecCount != 1 {
+			t.Fatalf("expected BUILD INDEX to execute exactly once across retries, got %d executions: %v", buildExecCount, q.execLog)
+		}
+
+		// Async FAILED / CANCELLED returns *AsyncJobFailedError with Table, Index, State, Message
+		qFail := &mockQuerier{
+			showState:     "CANCELLED",
+			showIndexName: "idx_mrn",
+			showMsg:       "build index cancelled by FE",
+		}
+		execFail := migrate.NewExecutorWithQuerier(qFail, "internal.tenant_duke", migrate.WithNonBlocking(true))
+		_, err = execFail.Apply(ctx, migrate.ApplyOptions{FS: mfs})
+		var asyncFail *migrate.AsyncJobFailedError
+		if !errors.As(err, &asyncFail) {
+			t.Fatalf("expected *AsyncJobFailedError, got %v", err)
+		}
+		if asyncFail.State != "CANCELLED" || asyncFail.Index != "idx_mrn" || !strings.Contains(asyncFail.Message, "cancelled by FE") {
+			t.Fatalf("unexpected AsyncJobFailedError details: %+v", asyncFail)
+		}
+	})
+
+	t.Run("runtime_normalizers_coupled_iceberg_and_view_order_keys", func(t *testing.T) {
+		mfs := buildTestMigrationFS(t, map[string]string{
+			"20261115000000_all.sql": strings.Join([]string{
+				`CREATE TABLE IF NOT EXISTS internal.tenant_duke.t1 (id VARCHAR(64) NOT NULL) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4 PROPERTIES ("enable_unique_key_merge_on_write" = "true", "storage_vault_name" = "v1");`,
+				`CREATE TABLE IF NOT EXISTS internal.tenant_duke.t2 (id VARCHAR(64) NOT NULL) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4 PROPERTIES ("storage_vault_name" = "v1");`,
+				`CREATE TABLE IF NOT EXISTS custom_lake.tenant_duke.ice_t (flag TINYINT, code SMALLINT(6)) ENGINE=iceberg;`,
+				`CREATE OR REPLACE VIEW internal.tenant_duke.vw_t AS SELECT id, MAX_BY(id, STRUCT(ts, seq)) AS x FROM internal.tenant_duke.t1 GROUP BY id;`,
+			}, "\n"),
+		})
+		q := &mockQuerier{coupledReject: true}
+		exec := migrate.NewExecutorWithQuerier(q, "internal.tenant_duke", migrate.WithIcebergCatalog("custom_lake"))
+		res, err := exec.Apply(ctx, migrate.ApplyOptions{FS: mfs})
+		if err != nil {
+			t.Fatalf("Apply with coupled/iceberg/view normalizers failed: %v", err)
+		}
+		joined := strings.Join(res.ExecutedSQL, "\n")
+		if strings.Contains(joined, "storage_vault_name") {
+			t.Errorf("expected coupled properties stripped on retry & cached on t2:\n%s", joined)
+		}
+		if !strings.Contains(joined, "flag INT") || !strings.Contains(joined, "code INT") {
+			t.Errorf("expected Iceberg TINYINT/SMALLINT widened to INT:\n%s", joined)
+		}
+		if !strings.Contains(joined, "CONCAT_WS(CHAR(1)") || strings.Contains(joined, "STRUCT(ts") {
+			t.Errorf("expected Nereids view MAX_BY STRUCT order key normalized:\n%s", joined)
+		}
+		// Ensure t2 never even attempted storage_vault_name because coupledMode cached true after t1
+		for _, sqlStmt := range q.execLog {
+			if strings.Contains(sqlStmt, "tenant_duke.t2") && strings.Contains(sqlStmt, "storage_vault_name") {
+				t.Errorf("expected t2 to pre-strip coupled properties using cached coupledMode: %s", sqlStmt)
+			}
+		}
+	})
+
+	t.Run("error_paths_and_async_error_formatting", func(t *testing.T) {
+		var nilAsyncErr *migrate.AsyncJobFailedError
+		if nilAsyncErr.Error() == "" {
+			t.Errorf("expected non-empty string for nil AsyncJobFailedError")
+		}
+		noMsgErr := &migrate.AsyncJobFailedError{Table: "internal.t.p", State: "FAILED"}
+		if !strings.Contains(noMsgErr.Error(), "was FAILED") {
+			t.Errorf("unexpected noMsgErr: %q", noMsgErr.Error())
+		}
+
+		// DialExecutorWithOptions valid & invalid URL
+		dExec, err := migrate.DialExecutorWithOptions("doris://root@127.0.0.1:9030/tenant_a", "internal", migrate.WithChainScope("svc-x"))
+		if err != nil {
+			t.Fatalf("DialExecutorWithOptions failed: %v", err)
+		}
+		_ = dExec.Close()
+		if _, err := migrate.DialExecutorWithOptions("doris://", "internal"); err == nil {
+			t.Errorf("expected invalid URL error in DialExecutorWithOptions")
+		}
+
+		// Nil executor / bad args / invalid schema guards across StatusFS, AppliedRevisions, DeleteRevision, RecordRevision
+		nilExec := migrate.NewExecutorWithQuerier(nil, "internal")
+		if _, err := nilExec.AppliedRevisions(ctx); err == nil {
+			t.Errorf("expected nil querier error from AppliedRevisions")
+		}
+		if err := nilExec.DeleteRevision(ctx, "20261115000000"); err == nil {
+			t.Errorf("expected nil querier error from DeleteRevision")
+		}
+
+		q := &mockQuerier{}
+		badScopeExec := migrate.NewExecutorWithQuerier(q, "internal", migrate.WithChainScope("bad:scope"))
+		if err := badScopeExec.RecordRevision(ctx, migrate.RevisionRecord{Version: "20261115000000"}); err == nil {
+			t.Errorf("expected invalid chain scope error in RecordRevision")
+		}
+		if err := badScopeExec.DeleteRevision(ctx, "20261115000000"); err == nil {
+			t.Errorf("expected invalid chain scope error in DeleteRevision")
+		}
+		mfs := buildTestMigrationFS(t, map[string]string{
+			"20261115000000_init.sql": "CREATE TABLE internal.t.p (id VARCHAR(64) NOT NULL) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;\n",
+		})
+		if _, err := badScopeExec.StatusFS(ctx, mfs); err == nil {
+			t.Errorf("expected invalid chain scope error in StatusFS")
+		}
+
+		goodExec := migrate.NewExecutorWithQuerier(q, "internal.tenant_a", migrate.WithChainScope("svc-a"))
+		if err := goodExec.RecordRevision(ctx, migrate.RevisionRecord{}); err == nil {
+			t.Errorf("expected empty version error in RecordRevision")
+		}
+		if err := goodExec.DeleteRevision(ctx, ""); err == nil {
+			t.Errorf("expected empty version error in DeleteRevision")
+		}
+		if _, err := goodExec.StatusFS(ctx, nil); err == nil {
+			t.Errorf("expected error for StatusFS(nil)")
+		}
+		if _, err := goodExec.StatusFS(ctx, fstest.MapFS{"atlas.sum": mfs["atlas.sum"]}); err == nil {
+			t.Errorf("expected error for StatusFS with mismatched atlas.sum")
+		}
+
+		badSchemaExec := migrate.NewExecutorWithQuerier(q, "bad;schema")
+		if _, err := badSchemaExec.AppliedRevisions(ctx); err == nil {
+			t.Errorf("expected invalid schema error in AppliedRevisions")
+		}
+		if err := badSchemaExec.DeleteRevision(ctx, "20261115000000"); err == nil {
+			t.Errorf("expected invalid schema error in DeleteRevision")
+		}
+		if err := badSchemaExec.RecordRevision(ctx, migrate.RevisionRecord{Version: "20261115000000"}); err == nil {
+			t.Errorf("expected invalid schema error in RecordRevision")
+		}
+		if _, err := badSchemaExec.Apply(ctx, migrate.ApplyOptions{FS: mfs}); err == nil {
+			t.Errorf("expected invalid schema error in Apply")
+		}
+	})
 }

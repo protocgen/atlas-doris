@@ -387,6 +387,7 @@ func LintTableEvolution(before, after *TableDef, opts LintOptions) []Violation {
 	}
 
 	// DORIS005, DORIS006, and DORIS007 on after columns.
+	isIcebergPair := before.IsIcebergTable() && after.IsIcebergTable()
 	isIcebergV2 := after.IsIcebergTable() && strings.TrimSpace(after.PropertyMap()["format-version"]) != "3"
 	for _, ac := range after.Columns {
 		if IsForbiddenColumnType(ac.Type) {
@@ -414,12 +415,22 @@ func LintTableEvolution(before, after *TableDef, opts LintOptions) []Violation {
 		}
 
 		// Existing column: check DORIS006_SAFE_TYPE_EVOLUTION.
-		if !IsSafeTypeEvolution(bc.Type, ac.Type) {
+		typeSafe := IsSafeTypeEvolution(bc.Type, ac.Type) ||
+			(isIcebergPair && IsIcebergArrayVarcharStringCompatible(bc.Type, ac.Type))
+		if !typeSafe {
 			violations = append(violations, Violation{
 				Rule:       DORIS006_SAFE_TYPE_EVOLUTION,
 				TableName:  tblName,
 				ColumnName: ac.Name,
 				Message:    fmt.Sprintf("unsafe type evolution on column %q from %q to %q", ac.Name, bc.Type, ac.Type),
+			})
+		}
+		if !isIcebergV2 && bc.Nullable && !ac.Nullable {
+			violations = append(violations, Violation{
+				Rule:       DORIS006_SAFE_TYPE_EVOLUTION,
+				TableName:  tblName,
+				ColumnName: ac.Name,
+				Message:    fmt.Sprintf("cannot tighten column %q from NULL to NOT NULL", ac.Name),
 			})
 		}
 	}
@@ -569,6 +580,23 @@ func IsSafeTypeEvolution(beforeType, afterType string) bool {
 	default:
 		return false
 	}
+}
+
+// IsIcebergArrayVarcharStringCompatible reports whether t1 and t2 represent an
+// Apache Iceberg-equivalent pair of ARRAY<VARCHAR(N)> and ARRAY<STRING> (or ARRAY<TEXT>).
+func IsIcebergArrayVarcharStringCompatible(t1, t2 string) bool {
+	c1 := CanonicalSemanticType(t1)
+	c2 := CanonicalSemanticType(t2)
+	return (isArrayVarcharType(c1) && c2 == "ARRAY<STRING>") ||
+		(c1 == "ARRAY<STRING>" && isArrayVarcharType(c2))
+}
+
+func isArrayVarcharType(canonicalType string) bool {
+	if !strings.HasPrefix(canonicalType, "ARRAY<") || !strings.HasSuffix(canonicalType, ">") {
+		return false
+	}
+	_, ok := parseVarcharLength(canonicalType[6 : len(canonicalType)-1])
+	return ok
 }
 
 func parseDatetimePrecision(t string) (int, bool) {

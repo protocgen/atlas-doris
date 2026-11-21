@@ -630,3 +630,69 @@ message PatientProfile {
 		t.Fatalf("Diff(sAll, sAll) on proto2type doris_mode=both failed: stmts=%d err=%v", len(stmts), err)
 	}
 }
+
+func TestLoadFromPaths_And_LoadSchemas(t *testing.T) {
+	dir := t.TempDir()
+	f1 := filepath.Join(dir, "patients.sql")
+	f2 := filepath.Join(dir, "obs_iceberg.sql")
+	if err := os.WriteFile(f1, []byte("CREATE TABLE internal.tenant_duke.patients (id VARCHAR(64) NOT NULL) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;\n"), 0o644); err != nil {
+		t.Fatalf("write f1: %v", err)
+	}
+	if err := os.WriteFile(f2, []byte("CREATE TABLE azra_lake.tenant_duke.obs (id STRING) ENGINE=iceberg;\n"), 0o644); err != nil {
+		t.Fatalf("write f2: %v", err)
+	}
+
+	// Single & multiple paths via LoadFromPaths
+	sSingle, err := external.LoadFromPaths([]string{f1}, external.TargetAll)
+	if err != nil || len(sSingle.Tables) != 1 {
+		t.Fatalf("LoadFromPaths single failed: s=%+v err=%v", sSingle, err)
+	}
+	sMulti, err := external.LoadFromPaths([]string{"  ", f1, f2}, external.TargetAll)
+	if err != nil || len(sMulti.Tables) != 2 {
+		t.Fatalf("LoadFromPaths multi failed: s=%+v err=%v", sMulti, err)
+	}
+	if _, err := external.LoadFromPaths([]string{"  "}, external.TargetAll); err == nil {
+		t.Errorf("expected empty path list error from LoadFromPaths")
+	}
+	if _, err := external.LoadFromPaths([]string{f1, filepath.Join(dir, "missing.sql")}, external.TargetAll); err == nil {
+		t.Errorf("expected missing second path error from LoadFromPaths")
+	}
+
+	// Single & multiple URLs via LoadSchemas (including file:// URLs and target filtering)
+	ctx := context.Background()
+	sURLSingle, err := external.LoadSchemas(ctx, []string{"file://" + f1}, external.LoadOptions{Target: external.TargetDoris})
+	if err != nil || len(sURLSingle.Tables) != 1 {
+		t.Fatalf("LoadSchemas single failed: s=%+v err=%v", sURLSingle, err)
+	}
+	sURLMulti, err := external.LoadSchemas(ctx, []string{"file://" + f1, f2}, external.LoadOptions{Target: external.TargetAll})
+	if err != nil || len(sURLMulti.Tables) != 2 {
+		t.Fatalf("LoadSchemas multi failed: s=%+v err=%v", sURLMulti, err)
+	}
+	sFilteredDoris, err := external.LoadSchemas(ctx, []string{f1, f2}, external.LoadOptions{Target: external.TargetDoris})
+	if err != nil || len(sFilteredDoris.Tables) != 1 || !sFilteredDoris.Tables[0].IsDorisInternalTable() {
+		t.Fatalf("LoadSchemas TargetDoris filter failed: s=%+v err=%v", sFilteredDoris, err)
+	}
+	if _, err := external.LoadSchemas(ctx, nil, external.LoadOptions{}); err == nil {
+		t.Errorf("expected empty URL list error from LoadSchemas")
+	}
+	if _, err := external.LoadSchemas(ctx, []string{f1, filepath.Join(dir, "missing.sql")}, external.LoadOptions{}); err == nil {
+		t.Errorf("expected missing second URL error from LoadSchemas")
+	}
+
+	// atlas.sum migration dir target filtering
+	migDir := filepath.Join(dir, "mig")
+	if err := os.MkdirAll(migDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	combined := "CREATE TABLE internal.tenant_duke.patients (id VARCHAR(64) NOT NULL) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;\nCREATE TABLE azra_lake.tenant_duke.obs (id STRING) ENGINE=iceberg;\n"
+	if err := os.WriteFile(filepath.Join(migDir, "20261115000000_init.sql"), []byte(combined), 0o644); err != nil {
+		t.Fatalf("write migration: %v", err)
+	}
+	if err := migrate.HashDir(migDir); err != nil {
+		t.Fatalf("HashDir: %v", err)
+	}
+	sMigIce, err := external.LoadFromPath(migDir, external.TargetIceberg)
+	if err != nil || len(sMigIce.Tables) != 1 || !sMigIce.Tables[0].IsIcebergTable() {
+		t.Fatalf("expected TargetIceberg migration dir load to retain only Iceberg table, got s=%+v err=%v", sMigIce, err)
+	}
+}

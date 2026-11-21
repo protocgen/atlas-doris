@@ -4,9 +4,11 @@ package migrate
 
 import (
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -56,6 +58,72 @@ func ResolvePath(raw string) (string, error) {
 	return filepath.Clean(s), nil
 }
 
+type fsDir struct {
+	fsys fs.FS
+}
+
+func (d fsDir) Open(name string) (fs.File, error) {
+	return d.fsys.Open(name)
+}
+
+func (d fsDir) WriteFile(string, []byte) error {
+	return fmt.Errorf("read-only migration filesystem")
+}
+
+func (d fsDir) Files() ([]migrate.File, error) {
+	names, err := fs.Glob(d.fsys, "*.sql")
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(names)
+	files := make([]migrate.File, 0, len(names))
+	for _, n := range names {
+		b, err := fs.ReadFile(d.fsys, n)
+		if err != nil {
+			return nil, fmt.Errorf("sql/migrate: read file %q: %w", n, err)
+		}
+		files = append(files, migrate.NewLocalFile(n, b))
+	}
+	return files, nil
+}
+
+func (d fsDir) Checksum() (migrate.HashFile, error) {
+	files, err := d.Files()
+	if err != nil {
+		return nil, err
+	}
+	return migrate.NewHashFile(files)
+}
+
+// VerifySumFS validates the integrity of an Atlas migration filesystem against its
+// atlas.sum file and returns the canonical "h1:<base64>" directory checksum.
+func VerifySumFS(fsys fs.FS) (string, error) {
+	if fsys == nil {
+		return "", fmt.Errorf("nil migration filesystem")
+	}
+	rawSum, err := fs.ReadFile(fsys, migrate.HashFileName)
+	if err != nil {
+		return "", fmt.Errorf("missing %s: %w", migrate.HashFileName, err)
+	}
+	var hf migrate.HashFile
+	if err := hf.UnmarshalText(rawSum); err != nil {
+		return "", fmt.Errorf("invalid %s: %w", migrate.HashFileName, err)
+	}
+	if err := migrate.Validate(fsDir{fsys: fsys}); err != nil {
+		return "", fmt.Errorf("atlas.sum validation failed: %w", err)
+	}
+	return "h1:" + hf.Sum(), nil
+}
+
+// ReplayFS reads all migration .sql files from fsys in lexical version order
+// and replays them offline to construct the current doris.Schema state.
+func ReplayFS(fsys fs.FS) (*doris.Schema, []MigrationFile, error) {
+	if fsys == nil {
+		return nil, nil, fmt.Errorf("nil migration filesystem")
+	}
+	return replayAtlasDir(fsDir{fsys: fsys}, "fs")
+}
+
 // ReplayDir reads all migration .sql files from dirPath in lexical version order
 // and replays them offline to construct the current doris.Schema state.
 func ReplayDir(dirPath string) (*doris.Schema, []MigrationFile, error) {
@@ -67,11 +135,15 @@ func ReplayDir(dirPath string) (*doris.Schema, []MigrationFile, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("open migration directory %q: %w", cleanPath, err)
 	}
-	files, err := localDir.Files()
+	return replayAtlasDir(localDir, fmt.Sprintf("%q", cleanPath))
+}
+
+func replayAtlasDir(dir migrate.Dir, label string) (*doris.Schema, []MigrationFile, error) {
+	files, err := dir.Files()
 	if err != nil {
-		return nil, nil, fmt.Errorf("read migration files in %q: %w", cleanPath, err)
+		return nil, nil, fmt.Errorf("read migration files in %s: %w", label, err)
 	}
-	hf, _ := localDir.Checksum()
+	hf, _ := dir.Checksum()
 
 	schema := doris.NewSchema()
 	var migFiles []MigrationFile
@@ -104,6 +176,15 @@ func ReplayDir(dirPath string) (*doris.Schema, []MigrationFile, error) {
 	return schema, migFiles, nil
 }
 
+// LintFS replays all migrations in fsys step-by-step, validating each step
+// (and optional desired target schema) against Doris/Iceberg evolution lint rules.
+func LintFS(fsys fs.FS, desired *doris.Schema, opts doris.LintOptions) ([]doris.Violation, error) {
+	if fsys == nil {
+		return nil, fmt.Errorf("nil migration filesystem")
+	}
+	return lintAtlasDir(fsDir{fsys: fsys}, desired, opts, "fs")
+}
+
 // LintDir replays all migrations in dirPath step-by-step, validating each step
 // (and optional desired target schema) against Doris/Iceberg evolution lint rules.
 func LintDir(dirPath string, desired *doris.Schema, opts doris.LintOptions) ([]doris.Violation, error) {
@@ -115,9 +196,13 @@ func LintDir(dirPath string, desired *doris.Schema, opts doris.LintOptions) ([]d
 	if err != nil {
 		return nil, fmt.Errorf("open migration directory %q: %w", cleanPath, err)
 	}
-	files, err := localDir.Files()
+	return lintAtlasDir(localDir, desired, opts, fmt.Sprintf("%q", cleanPath))
+}
+
+func lintAtlasDir(dir migrate.Dir, desired *doris.Schema, opts doris.LintOptions, label string) ([]doris.Violation, error) {
+	files, err := dir.Files()
 	if err != nil {
-		return nil, fmt.Errorf("read migration files in %q: %w", cleanPath, err)
+		return nil, fmt.Errorf("read migration files in %s: %w", label, err)
 	}
 
 	current := doris.NewSchema()
@@ -160,12 +245,23 @@ func LintDir(dirPath string, desired *doris.Schema, opts doris.LintOptions) ([]d
 			if st.Kind == doris.StmtAlterTableModifyColumn && st.Column != nil {
 				if tbl, ok := current.TableByName(st.TargetTable); ok {
 					if origCol, ok := tbl.ColumnByName(st.Column.Name); ok {
-						if !doris.IsSafeTypeEvolution(origCol.Type, st.Column.Type) {
+						typeSafe := doris.IsSafeTypeEvolution(origCol.Type, st.Column.Type)
+						if !typeSafe && tbl.IsIcebergTable() && doris.IsIcebergArrayVarcharStringCompatible(origCol.Type, st.Column.Type) {
+							typeSafe = true
+						}
+						if !typeSafe {
 							violations = append(violations, doris.Violation{
 								Rule:       doris.DORIS006_SAFE_TYPE_EVOLUTION,
 								TableName:  st.TargetTable,
 								ColumnName: st.Column.Name,
 								Message:    fmt.Sprintf("migration %s performs unsafe type evolution on column %q from %q to %q", f.Name(), st.Column.Name, origCol.Type, st.Column.Type),
+							})
+						} else if origCol.Nullable && !st.Column.Nullable {
+							violations = append(violations, doris.Violation{
+								Rule:       doris.DORIS006_SAFE_TYPE_EVOLUTION,
+								TableName:  st.TargetTable,
+								ColumnName: st.Column.Name,
+								Message:    fmt.Sprintf("migration %s tightens column %q nullability from NULL to NOT NULL", f.Name(), st.Column.Name),
 							})
 						}
 					}
@@ -212,6 +308,19 @@ func HashDir(dirPath string) error {
 	return nil
 }
 
+// ValidateFS verifies the atlas.sum checksum integrity in fsys and replays
+// all migrations to validate SQL syntax and Doris/Iceberg lint rules.
+func ValidateFS(fsys fs.FS, opts doris.LintOptions) error {
+	if _, err := VerifySumFS(fsys); err != nil {
+		return err
+	}
+	violations, err := LintFS(fsys, nil, opts)
+	if err != nil {
+		return err
+	}
+	return doris.ViolationsToError(violations)
+}
+
 // ValidateDir verifies the atlas.sum checksum integrity in dirPath and replays
 // all migrations to validate SQL syntax and Doris/Iceberg lint rules.
 func ValidateDir(dirPath string, opts doris.LintOptions) error {
@@ -219,22 +328,12 @@ func ValidateDir(dirPath string, opts doris.LintOptions) error {
 	if err != nil {
 		return err
 	}
-	sumPath := filepath.Join(cleanPath, migrate.HashFileName)
-	if _, err := os.Stat(sumPath); err != nil {
-		return fmt.Errorf("missing %s in %q: %w", migrate.HashFileName, cleanPath, err)
-	}
 	localDir, err := migrate.NewLocalDir(cleanPath)
 	if err != nil {
 		return fmt.Errorf("open migration directory %q: %w", cleanPath, err)
 	}
-	if err := migrate.Validate(localDir); err != nil {
-		return fmt.Errorf("atlas.sum validation failed in %q: %w", cleanPath, err)
-	}
-	violations, err := LintDir(cleanPath, nil, opts)
-	if err != nil {
-		return err
-	}
-	return doris.ViolationsToError(violations)
+	_ = localDir
+	return ValidateFS(os.DirFS(cleanPath), opts)
 }
 
 // DiffAndWrite replays dirPath, computes the migration diff to reach desired,

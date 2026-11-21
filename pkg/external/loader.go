@@ -48,6 +48,58 @@ type ExternalSchemaOptions struct {
 	PluginPath    string
 }
 
+// LoadSchemas loads one or more schema sources (file paths, directories, file://,
+// doris://, mysql://, or proto:// URLs) and merges them cleanly in order.
+func LoadSchemas(ctx context.Context, targetURLs []string, opts LoadOptions) (*doris.Schema, error) {
+	var cleaned []string
+	for _, u := range targetURLs {
+		if s := strings.TrimSpace(u); s != "" {
+			cleaned = append(cleaned, s)
+		}
+	}
+	if len(cleaned) == 0 {
+		return nil, fmt.Errorf("empty schema URL or path")
+	}
+	if len(cleaned) == 1 {
+		return LoadSchema(ctx, cleaned[0], opts)
+	}
+	merged := doris.NewSchema()
+	for _, raw := range cleaned {
+		sub, err := LoadSchema(ctx, raw, opts)
+		if err != nil {
+			return nil, err
+		}
+		merged.Merge(sub)
+	}
+	return merged, nil
+}
+
+// LoadFromPaths loads and merges one or more local schema files, directories,
+// or Atlas migration directories (with atlas.sum).
+func LoadFromPaths(paths []string, target TargetFilter) (*doris.Schema, error) {
+	var cleaned []string
+	for _, p := range paths {
+		if s := strings.TrimSpace(p); s != "" {
+			cleaned = append(cleaned, s)
+		}
+	}
+	if len(cleaned) == 0 {
+		return nil, fmt.Errorf("empty schema path")
+	}
+	if len(cleaned) == 1 {
+		return LoadFromPath(cleaned[0], target)
+	}
+	merged := doris.NewSchema()
+	for _, p := range cleaned {
+		sub, err := LoadFromPath(p, target)
+		if err != nil {
+			return nil, err
+		}
+		merged.Merge(sub)
+	}
+	return merged, nil
+}
+
 // LoadSchema loads a doris.Schema from a file:// URL, local file/directory path,
 // doris:// or mysql:// live database URL, or proto:// URL.
 func LoadSchema(ctx context.Context, targetURL string, opts LoadOptions) (*doris.Schema, error) {
@@ -120,7 +172,7 @@ func LoadFromPath(localPath string, target TargetFilter) (*doris.Schema, error) 
 		if err != nil {
 			return nil, fmt.Errorf("parse schema file %q: %w", localPath, err)
 		}
-		return s, nil
+		return FilterSchemaByTarget(s, target), nil
 	}
 
 	// If the directory is an Atlas migration chain (contains atlas.sum), replay it.
@@ -129,7 +181,7 @@ func LoadFromPath(localPath string, target TargetFilter) (*doris.Schema, error) 
 		if err != nil {
 			return nil, err
 		}
-		return s, nil
+		return FilterSchemaByTarget(s, target), nil
 	}
 
 	var schemaFiles []string

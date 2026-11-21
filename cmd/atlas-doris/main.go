@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the semantic version reported by atlas-doris.
-var Version = "v0.1.0"
+var Version = "v0.3.0"
 
 var exitFunc = os.Exit
 
@@ -82,11 +82,11 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) in
 func runMigrateDiff(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("migrate diff", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	var dirURL, toURL, target, pluginPath, versionOverride string
+	var dirURL, target, pluginPath, versionOverride string
 	var allowDestructive bool
-	var includes multiStringFlag
+	var toURLs, includes multiStringFlag
 	fs.StringVar(&dirURL, "dir", "", "migration directory URL (file://path/to/migrations)")
-	fs.StringVar(&toURL, "to", "", "desired schema URL (file://path or proto://path)")
+	fs.Var(&toURLs, "to", "desired schema URL (file://path or proto://path, repeatable)")
 	fs.StringVar(&target, "target", "all", "target filter: all | doris | iceberg")
 	fs.StringVar(&pluginPath, "plugin", "", "path to protoc-gen-proto2type binary")
 	fs.StringVar(&versionOverride, "version", "", "optional explicit 14-digit migration version")
@@ -101,7 +101,7 @@ func runMigrateDiff(ctx context.Context, args []string, stdout, stderr io.Writer
 	if err := fs.Parse(reordered); err != nil {
 		return 1
 	}
-	if dirURL == "" || toURL == "" {
+	if dirURL == "" || len(toURLs) == 0 {
 		_, _ = fmt.Fprintln(stderr, "migrate diff requires --dir and --to")
 		return 1
 	}
@@ -110,7 +110,7 @@ func runMigrateDiff(ctx context.Context, args []string, stdout, stderr io.Writer
 		migName = fs.Arg(0)
 	}
 
-	desired, err := external.LoadSchema(ctx, toURL, external.LoadOptions{
+	desired, err := external.LoadSchemas(ctx, toURLs, external.LoadOptions{
 		Target:        external.TargetFilter(strings.ToLower(target)),
 		ProtoIncludes: includes,
 		PluginPath:    pluginPath,
@@ -188,11 +188,11 @@ func runMigrateHash(args []string, stdout, stderr io.Writer) int {
 func runMigrateLint(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("migrate lint", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	var dirURL, toURL, target, pluginPath string
+	var dirURL, target, pluginPath string
 	var allowDestructive bool
-	var includes multiStringFlag
+	var toURLs, includes multiStringFlag
 	fs.StringVar(&dirURL, "dir", "", "migration directory URL (file://path/to/migrations)")
-	fs.StringVar(&toURL, "to", "", "optional desired target schema URL (file:// or proto://)")
+	fs.Var(&toURLs, "to", "optional desired target schema URL (file:// or proto://, repeatable)")
 	fs.StringVar(&target, "target", "all", "target filter: all | doris | iceberg")
 	fs.StringVar(&pluginPath, "plugin", "", "path to protoc-gen-proto2type binary")
 	fs.BoolVar(&allowDestructive, "allow-drop-column", false, "allow destructive column/table drops")
@@ -212,9 +212,9 @@ func runMigrateLint(ctx context.Context, args []string, stdout, stderr io.Writer
 	}
 
 	var desired *doris.Schema
-	if toURL != "" {
+	if len(toURLs) > 0 {
 		var err error
-		desired, err = external.LoadSchema(ctx, toURL, external.LoadOptions{
+		desired, err = external.LoadSchemas(ctx, toURLs, external.LoadOptions{
 			Target:        external.TargetFilter(strings.ToLower(target)),
 			ProtoIncludes: includes,
 			PluginPath:    pluginPath,
@@ -243,11 +243,12 @@ func runMigrateLint(ctx context.Context, args []string, stdout, stderr io.Writer
 func runMigrateStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("migrate status", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	var dirURL, dbURL, revisionsSchema string
+	var dirURL, dbURL, revisionsSchema, chainScope string
 	fs.StringVar(&dirURL, "dir", "", "migration directory URL (file://path/to/migrations)")
 	fs.StringVar(&dbURL, "url", "", "Doris FE URL (doris://user:pass@host:9030/db)")
 	fs.StringVar(&revisionsSchema, "revisions-table", "", "optional database/schema or table for atlas_schema_revisions")
 	fs.StringVar(&revisionsSchema, "revisions-schema", "", "optional database/schema for atlas_schema_revisions")
+	fs.StringVar(&chainScope, "chain-scope", "", "optional migration chain scope prefix (<service>:<version>)")
 
 	if err := fs.Parse(reorderFlagsFirst(args, nil)); err != nil {
 		return 1
@@ -257,7 +258,7 @@ func runMigrateStatus(ctx context.Context, args []string, stdout, stderr io.Writ
 		return 1
 	}
 
-	exec, err := migrate.DialExecutor(dbURL, revisionsSchema)
+	exec, err := migrate.DialExecutorWithOptions(dbURL, revisionsSchema, migrate.WithChainScope(chainScope))
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "connect to Doris: %v\n", err)
 		return 1
@@ -282,21 +283,24 @@ func runMigrateStatus(ctx context.Context, args []string, stdout, stderr io.Writ
 func runMigrateApply(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("migrate apply", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	var dirURL, dbURL, baseline, revisionsSchema string
-	var dryRun, allowDestructive bool
+	var dirURL, dbURL, baseline, revisionsSchema, chainScope string
+	var dryRun, allowDestructive, nonBlocking bool
 	var varPairs multiStringFlag
 	fs.StringVar(&dirURL, "dir", "", "migration directory URL (file://path/to/migrations)")
 	fs.StringVar(&dbURL, "url", "", "Doris FE URL (doris://user:pass@host:9030/db)")
 	fs.StringVar(&baseline, "baseline", "", "optional baseline version to mark as already applied")
 	fs.StringVar(&revisionsSchema, "revisions-table", "", "optional database/schema or table for atlas_schema_revisions")
 	fs.StringVar(&revisionsSchema, "revisions-schema", "", "optional database/schema for atlas_schema_revisions")
+	fs.StringVar(&chainScope, "chain-scope", "", "optional migration chain scope prefix (<service>:<version>)")
 	fs.BoolVar(&dryRun, "dry-run", false, "validate and render SQL without executing against Doris")
+	fs.BoolVar(&nonBlocking, "non-blocking", false, "return immediately on pending async Doris jobs instead of polling")
 	fs.BoolVar(&allowDestructive, "allow-drop-column", false, "allow destructive column/table drops")
 	fs.BoolVar(&allowDestructive, "allow-destructive", false, "allow destructive column/table drops")
 	fs.Var(&varPairs, "var", "template variable KEY=VALUE (repeatable)")
 
 	reordered := reorderFlagsFirst(args, map[string]bool{
 		"--dry-run":           true,
+		"--non-blocking":      true,
 		"--allow-drop-column": true,
 		"--allow-destructive": true,
 	})
@@ -336,6 +340,8 @@ func runMigrateApply(ctx context.Context, args []string, stdout, stderr io.Write
 		DryRun:           dryRun,
 		BaselineVersion:  baseline,
 		RevisionsSchema:  revisionsSchema,
+		ChainScope:       chainScope,
+		NonBlocking:      nonBlocking,
 		AllowDestructive: allowDestructive,
 	})
 	if err != nil {
@@ -422,11 +428,11 @@ func runSchemaInspect(ctx context.Context, args []string, stdout, stderr io.Writ
 func runSchemaDiff(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("schema diff", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	var fromURL, toURL, target, pluginPath string
+	var target, pluginPath string
 	var allowDestructive bool
-	var includes multiStringFlag
-	fs.StringVar(&fromURL, "from", "", "source schema URL (file://path or proto://path)")
-	fs.StringVar(&toURL, "to", "", "target schema URL (file://path or proto://path)")
+	var fromURLs, toURLs, includes multiStringFlag
+	fs.Var(&fromURLs, "from", "source schema URL (file://path or proto://path, repeatable)")
+	fs.Var(&toURLs, "to", "target schema URL (file://path or proto://path, repeatable)")
 	fs.StringVar(&target, "target", "all", "target filter: all | doris | iceberg")
 	fs.StringVar(&pluginPath, "plugin", "", "path to protoc-gen-proto2type binary")
 	fs.BoolVar(&allowDestructive, "allow-drop-column", false, "allow destructive column/table drops")
@@ -440,7 +446,7 @@ func runSchemaDiff(ctx context.Context, args []string, stdout, stderr io.Writer)
 	if err := fs.Parse(reordered); err != nil {
 		return 1
 	}
-	if fromURL == "" || toURL == "" {
+	if len(fromURLs) == 0 || len(toURLs) == 0 {
 		_, _ = fmt.Fprintln(stderr, "schema diff requires --from and --to")
 		return 1
 	}
@@ -450,12 +456,12 @@ func runSchemaDiff(ctx context.Context, args []string, stdout, stderr io.Writer)
 		ProtoIncludes: includes,
 		PluginPath:    pluginPath,
 	}
-	fromSchema, err := external.LoadSchema(ctx, fromURL, loadOpts)
+	fromSchema, err := external.LoadSchemas(ctx, fromURLs, loadOpts)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "load --from schema: %v\n", err)
 		return 1
 	}
-	toSchema, err := external.LoadSchema(ctx, toURL, loadOpts)
+	toSchema, err := external.LoadSchemas(ctx, toURLs, loadOpts)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "load --to schema: %v\n", err)
 		return 1
@@ -479,11 +485,11 @@ func runSchemaDiff(ctx context.Context, args []string, stdout, stderr io.Writer)
 func runSchemaParity(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("schema parity", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	var dorisURL, icebergURL, dirPath, pluginPath string
-	var includes multiStringFlag
-	fs.StringVar(&dorisURL, "doris", "", "Doris schema URL or path")
-	fs.StringVar(&icebergURL, "iceberg", "", "Iceberg schema URL or path")
-	fs.StringVar(&dirPath, "dir", "", "directory containing *_doris.sql / *_iceberg.sql files")
+	var pluginPath string
+	var dorisURLs, icebergURLs, dirPaths, includes multiStringFlag
+	fs.Var(&dorisURLs, "doris", "Doris schema URL or path (repeatable)")
+	fs.Var(&icebergURLs, "iceberg", "Iceberg schema URL or path (repeatable)")
+	fs.Var(&dirPaths, "dir", "directory containing *_doris.sql / *_iceberg.sql files (repeatable)")
 	fs.StringVar(&pluginPath, "plugin", "", "path to protoc-gen-proto2type binary")
 	fs.Var(&includes, "include", "proto include directory (repeatable)")
 
@@ -491,21 +497,21 @@ func runSchemaParity(ctx context.Context, args []string, stdout, stderr io.Write
 		return 1
 	}
 
-	if dirPath != "" {
-		if dorisURL == "" {
-			dorisURL = dirPath
+	if len(dirPaths) > 0 {
+		if len(dorisURLs) == 0 {
+			dorisURLs = append([]string(nil), dirPaths...)
 		}
-		if icebergURL == "" {
-			icebergURL = dirPath
+		if len(icebergURLs) == 0 {
+			icebergURLs = append([]string(nil), dirPaths...)
 		}
 	}
 
-	if dorisURL == "" || icebergURL == "" {
+	if len(dorisURLs) == 0 || len(icebergURLs) == 0 {
 		_, _ = fmt.Fprintln(stderr, "schema parity requires --dir or both --doris and --iceberg")
 		return 1
 	}
 
-	dorisSchema, err := external.LoadSchema(ctx, dorisURL, external.LoadOptions{
+	dorisSchema, err := external.LoadSchemas(ctx, dorisURLs, external.LoadOptions{
 		Target:        external.TargetDoris,
 		ProtoIncludes: includes,
 		PluginPath:    pluginPath,
@@ -515,7 +521,7 @@ func runSchemaParity(ctx context.Context, args []string, stdout, stderr io.Write
 		return 1
 	}
 
-	icebergSchema, err := external.LoadSchema(ctx, icebergURL, external.LoadOptions{
+	icebergSchema, err := external.LoadSchemas(ctx, icebergURLs, external.LoadOptions{
 		Target:        external.TargetIceberg,
 		ProtoIncludes: includes,
 		PluginPath:    pluginPath,
@@ -938,14 +944,14 @@ func printUsage(w io.Writer) {
 	_, _ = fmt.Fprint(w, `atlas-doris - Atlas-compatible schema migration driver, differ, linter, and executor for Apache Doris 4.x & Apache Iceberg v2
 
 Usage:
-  atlas-doris migrate diff [name] --dir file://... --to file://...
+  atlas-doris migrate diff [name] --dir file://... --to file://... [--to ...]
   atlas-doris migrate validate --dir file://...
   atlas-doris migrate hash --dir file://...
-  atlas-doris migrate lint --dir file://... [--to file://...]
-  atlas-doris migrate status --dir file://... --url doris://...
-  atlas-doris migrate apply --dir file://... --url doris://... [--var K=V] [--dry-run]
+  atlas-doris migrate lint --dir file://... [--to file://... --to ...]
+  atlas-doris migrate status --dir file://... --url doris://... [--chain-scope ...]
+  atlas-doris migrate apply --dir file://... --url doris://... [--var K=V] [--dry-run] [--chain-scope ...] [--non-blocking]
   atlas-doris schema inspect --url file://... [--format sql|hcl]
-  atlas-doris schema diff --from file://... --to file://...
+  atlas-doris schema diff --from file://... [--from ...] --to file://... [--to ...]
   atlas-doris schema parity [--dir ... | --doris ... --iceberg ...]
   atlas-doris external-schema [--sql-dir ... | --sql-file ... | --hcl-dir ... | --hcl-file ... | --proto ...]
   atlas-doris version

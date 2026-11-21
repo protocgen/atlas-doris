@@ -941,3 +941,104 @@ func TestReorderFlagsFirst_PreservesTerminator(t *testing.T) {
 		}
 	}
 }
+
+func TestCLI_Stage1B_RepeatableToAndV030(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Version must report v0.3.0
+	if out, errOut, code := runCLI(ctx, "version"); code != 0 || strings.TrimSpace(out) != "atlas-doris v0.3.0" {
+		t.Fatalf("expected 'atlas-doris v0.3.0', got out=%q err=%q code=%d", out, errOut, code)
+	}
+
+	tmpDir := t.TempDir()
+	dorisA := filepath.Join(tmpDir, "a_doris.sql")
+	dorisB := filepath.Join(tmpDir, "b_doris.sql")
+	iceA := filepath.Join(tmpDir, "a_iceberg.sql")
+	iceB := filepath.Join(tmpDir, "b_iceberg.sql")
+
+	if err := os.WriteFile(dorisA, []byte("CREATE TABLE internal.tenant_duke.patients (patient_id VARCHAR(64) NOT NULL) UNIQUE KEY(patient_id) DISTRIBUTED BY HASH(patient_id) BUCKETS 4;\n"), 0o644); err != nil {
+		t.Fatalf("write dorisA: %v", err)
+	}
+	if err := os.WriteFile(dorisB, []byte("CREATE TABLE internal.tenant_duke.encounters (encounter_id VARCHAR(64) NOT NULL) UNIQUE KEY(encounter_id) DISTRIBUTED BY HASH(encounter_id) BUCKETS 4;\n"), 0o644); err != nil {
+		t.Fatalf("write dorisB: %v", err)
+	}
+	if err := os.WriteFile(iceA, []byte("CREATE TABLE azra_lake.tenant_duke.patients (patient_id STRING NOT NULL) ENGINE=iceberg;\n"), 0o644); err != nil {
+		t.Fatalf("write iceA: %v", err)
+	}
+	if err := os.WriteFile(iceB, []byte("CREATE TABLE azra_lake.tenant_duke.encounters (encounter_id STRING NOT NULL) ENGINE=iceberg;\n"), 0o644); err != nil {
+		t.Fatalf("write iceB: %v", err)
+	}
+
+	// 2. Repeatable --to on migrate diff merges multiple files cleanly
+	migDir := filepath.Join(tmpDir, "migrations")
+	if err := os.MkdirAll(migDir, 0o755); err != nil {
+		t.Fatalf("mkdir migrations: %v", err)
+	}
+	out, errOut, code := runCLI(ctx,
+		"migrate", "diff", "multi_source",
+		"--dir", "file://"+migDir,
+		"--to", "file://"+dorisA,
+		"--to", "file://"+dorisB,
+		"--version", "20261115000000",
+	)
+	if code != 0 || !strings.Contains(out, "Created migration 20261115000000_multi_source.sql") {
+		t.Fatalf("migrate diff repeatable --to failed: code=%d out=%q err=%s", code, out, errOut)
+	}
+
+	// 3. Repeatable --to on migrate lint matches merged target
+	out, errOut, code = runCLI(ctx,
+		"migrate", "lint",
+		"--dir", "file://"+migDir,
+		"--to", "file://"+dorisA,
+		"--to", "file://"+dorisB,
+	)
+	if code != 0 || !strings.Contains(out, "migrate lint passed") {
+		t.Fatalf("migrate lint repeatable --to failed: code=%d out=%q err=%s", code, out, errOut)
+	}
+
+	// 4. Repeatable --from / --to on schema diff
+	out, errOut, code = runCLI(ctx,
+		"schema", "diff",
+		"--from", "file://"+dorisA,
+		"--from", "file://"+dorisB,
+		"--to", "file://"+dorisA,
+		"--to", "file://"+dorisB,
+	)
+	if code != 0 || !strings.Contains(out, "Schemas are identical") {
+		t.Fatalf("schema diff repeatable --from/--to failed: code=%d out=%q err=%s", code, out, errOut)
+	}
+
+	// 5. Repeatable --doris / --iceberg on schema parity
+	out, errOut, code = runCLI(ctx,
+		"schema", "parity",
+		"--doris", "file://"+dorisA,
+		"--doris", "file://"+dorisB,
+		"--iceberg", "file://"+iceA,
+		"--iceberg", "file://"+iceB,
+	)
+	if code != 0 || !strings.Contains(out, "2 table(s) verified") {
+		t.Fatalf("schema parity repeatable flags failed: code=%d out=%q err=%s", code, out, errOut)
+	}
+
+	// 6. --chain-scope and --non-blocking on migrate apply --dry-run
+	out, errOut, code = runCLI(ctx,
+		"migrate", "apply",
+		"--dir", "file://"+migDir,
+		"--chain-scope", "hl7-ingest",
+		"--non-blocking",
+		"--dry-run",
+	)
+	if code != 0 || !strings.Contains(out, "patients") || !strings.Contains(out, "encounters") {
+		t.Fatalf("migrate apply --chain-scope --non-blocking --dry-run failed: code=%d out=%q err=%s", code, out, errOut)
+	}
+
+	// Invalid --chain-scope fails cleanly
+	if _, errOut, code = runCLI(ctx,
+		"migrate", "apply",
+		"--dir", "file://"+migDir,
+		"--chain-scope", "bad:scope",
+		"--dry-run",
+	); code == 0 || !strings.Contains(errOut, "invalid chain scope") {
+		t.Fatalf("expected invalid chain scope error, got code=%d err=%s", code, errOut)
+	}
+}

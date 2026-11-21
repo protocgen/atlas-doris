@@ -3,11 +3,14 @@ package migrate
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -15,7 +18,63 @@ import (
 )
 
 // OperatorVersion is recorded in atlas_schema_revisions.operator_version.
-const OperatorVersion = "atlas-doris/v0.1.0"
+const OperatorVersion = "atlas-doris/v0.3.0"
+
+// ErrAsyncJobPending is returned in NonBlocking mode when an asynchronous Doris
+// schema change or index build job is still in progress (PENDING, WAITING_TXN, or RUNNING).
+var ErrAsyncJobPending = errors.New("doris async job still pending")
+
+// AsyncJobFailedError describes a failed or cancelled asynchronous Doris schema change
+// or index build job detected during migration polling.
+type AsyncJobFailedError struct {
+	Table   string
+	Index   string
+	State   string
+	Message string
+}
+
+// Error implements the error interface.
+func (e *AsyncJobFailedError) Error() string {
+	if e == nil {
+		return "doris async job failed"
+	}
+	target := e.Table
+	if e.Index != "" {
+		target += "." + e.Index
+	}
+	if e.Message != "" {
+		return fmt.Sprintf("doris async schema change job for %q was %s: %s", target, e.State, e.Message)
+	}
+	return fmt.Sprintf("doris async schema change job for %q was %s", target, e.State)
+}
+
+// QueryRows abstracts *sql.Rows for callers integrating custom query hooks or connection wrappers.
+type QueryRows interface {
+	Columns() ([]string, error)
+	Next() bool
+	Scan(dest ...any) error
+	Err() error
+	Close() error
+}
+
+// QueryExecutor abstracts SQL execution and row queries so callers can supply
+// custom wrappers (e.g., tenant isolation query hooks) or delegate to *sql.DB.
+type QueryExecutor interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowsContext(ctx context.Context, query string, args ...any) (QueryRows, error)
+}
+
+type sqlDBQuerier struct {
+	db *sql.DB
+}
+
+func (q sqlDBQuerier) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return q.db.ExecContext(ctx, query, args...)
+}
+
+func (q sqlDBQuerier) QueryRowsContext(ctx context.Context, query string, args ...any) (QueryRows, error) {
+	return q.db.QueryContext(ctx, query, args...)
+}
 
 // RevisionsTableName is the standard Atlas revisions table name.
 const RevisionsTableName = "atlas_schema_revisions"
@@ -68,10 +127,14 @@ type MigrationStatus struct {
 // ApplyOptions configures Executor.Apply.
 type ApplyOptions struct {
 	DirPath          string
+	FS               fs.FS
 	Vars             map[string]string
 	DryRun           bool
 	BaselineVersion  string
 	RevisionsSchema  string
+	ChainScope       string
+	IcebergCatalog   string
+	NonBlocking      bool
 	AllowDestructive bool
 	PollInterval     time.Duration
 	PollTimeout      time.Duration
@@ -86,22 +149,86 @@ type ApplyResult struct {
 	TotalExecutionDur time.Duration
 }
 
+// ExecutorOption customizes an Executor created by NewExecutorWithQuerier.
+type ExecutorOption func(*Executor)
+
+// WithChainScope scopes revision reads, writes, and deletes to "<scope>:<version>".
+func WithChainScope(scope string) ExecutorOption {
+	return func(e *Executor) {
+		e.chainScope = strings.TrimSpace(scope)
+	}
+}
+
+// WithNonBlocking configures Executor to return ErrAsyncJobPending instead of sleeping on unfinished Doris jobs.
+func WithNonBlocking(nonBlocking bool) ExecutorOption {
+	return func(e *Executor) {
+		e.nonBlocking = nonBlocking
+	}
+}
+
+// WithIcebergCatalog configures the Iceberg catalog name used by NormalizeIcebergCatalogDDL.
+func WithIcebergCatalog(catalog string) ExecutorOption {
+	return func(e *Executor) {
+		e.icebergCatalog = strings.TrimSpace(catalog)
+	}
+}
+
+// WithPollConfig overrides async job poll interval and timeout.
+func WithPollConfig(interval, timeout time.Duration) ExecutorOption {
+	return func(e *Executor) {
+		if interval > 0 {
+			e.pollInterval = interval
+		}
+		if timeout > 0 {
+			e.pollTimeout = timeout
+		}
+	}
+}
+
 // Executor manages migration status and execution against an Apache Doris FE endpoint.
 type Executor struct {
 	db              *sql.DB
+	querier         QueryExecutor
 	revisionsSchema string
+	chainScope      string
+	icebergCatalog  string
+	nonBlocking     bool
+	coupledMode     *atomic.Bool
 	pollInterval    time.Duration
 	pollTimeout     time.Duration
 }
 
 // NewExecutor creates an Executor wrapping an existing *sql.DB connection.
 func NewExecutor(db *sql.DB, revisionsSchema string) *Executor {
+	var q QueryExecutor
+	if db != nil {
+		q = sqlDBQuerier{db: db}
+	}
 	return &Executor{
 		db:              db,
+		querier:         q,
 		revisionsSchema: strings.TrimSpace(revisionsSchema),
+		coupledMode:     &atomic.Bool{},
 		pollInterval:    200 * time.Millisecond,
 		pollTimeout:     2 * time.Minute,
 	}
+}
+
+// NewExecutorWithQuerier creates an Executor backed by a custom QueryExecutor.
+func NewExecutorWithQuerier(q QueryExecutor, revisionsSchema string, opts ...ExecutorOption) *Executor {
+	exec := &Executor{
+		querier:         q,
+		revisionsSchema: strings.TrimSpace(revisionsSchema),
+		coupledMode:     &atomic.Bool{},
+		pollInterval:    200 * time.Millisecond,
+		pollTimeout:     2 * time.Minute,
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(exec)
+		}
+	}
+	return exec
 }
 
 // DefaultSQLDriver is the database/sql driver name used by DialExecutor and InspectLiveSchema.
@@ -110,6 +237,12 @@ var DefaultSQLDriver = "mysql"
 // DialExecutor parses rawURL ("doris://user:pass@host:port/db" or "mysql://..."),
 // opens a MySQL wire-protocol connection to Apache Doris FE, and returns an Executor.
 func DialExecutor(rawURL, revisionsSchema string) (*Executor, error) {
+	return DialExecutorWithOptions(rawURL, revisionsSchema)
+}
+
+// DialExecutorWithOptions opens a MySQL wire-protocol connection to Apache Doris FE
+// and configures the resulting Executor with opts.
+func DialExecutorWithOptions(rawURL, revisionsSchema string, opts ...ExecutorOption) (*Executor, error) {
 	dsn, _, err := ParseDorisDSN(rawURL)
 	if err != nil {
 		return nil, err
@@ -118,7 +251,13 @@ func DialExecutor(rawURL, revisionsSchema string) (*Executor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open doris connection: %w", err)
 	}
-	return NewExecutor(db, revisionsSchema), nil
+	exec := NewExecutor(db, revisionsSchema)
+	for _, opt := range opts {
+		if opt != nil {
+			opt(exec)
+		}
+	}
+	return exec, nil
 }
 
 // Close closes the underlying database connection if present.
@@ -213,7 +352,7 @@ func (e *Executor) RevisionsTableCreateSQL() string {
 // EnsureRevisionsTable creates the revisions schema (if configured) and the
 // atlas_schema_revisions table in Apache Doris if it does not already exist.
 func (e *Executor) EnsureRevisionsTable(ctx context.Context) error {
-	if e == nil || e.db == nil {
+	if e == nil || e.querier == nil {
 		return fmt.Errorf("executor has no database connection")
 	}
 	if e.revisionsSchema != "" {
@@ -221,27 +360,58 @@ func (e *Executor) EnsureRevisionsTable(ctx context.Context) error {
 			return fmt.Errorf("invalid revisions schema identifier %q", e.revisionsSchema)
 		}
 		createDB := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s;", e.revisionsSchema)
-		if _, err := e.db.ExecContext(ctx, createDB); err != nil {
+		if _, err := e.querier.ExecContext(ctx, createDB); err != nil {
 			return fmt.Errorf("create revisions database %q: %w", e.revisionsSchema, err)
 		}
 	}
-	if _, err := e.db.ExecContext(ctx, e.RevisionsTableCreateSQL()); err != nil {
+	if _, err := e.querier.ExecContext(ctx, e.RevisionsTableCreateSQL()); err != nil {
 		return fmt.Errorf("create %s: %w", e.RevisionsTableQualifiedName(), err)
 	}
 	return nil
 }
 
-// AppliedRevisions queries atlas_schema_revisions ordered by version ascending.
+// AppliedRevisions performs a read-only query of atlas_schema_revisions ordered by version ascending.
+// If the revisions database or table does not yet exist, it returns an empty slice without mutating the database.
 func (e *Executor) AppliedRevisions(ctx context.Context) ([]RevisionRecord, error) {
-	if err := e.EnsureRevisionsTable(ctx); err != nil {
+	if e == nil || e.querier == nil {
+		return nil, fmt.Errorf("executor has no database connection")
+	}
+	return e.queryAppliedRevisions(ctx)
+}
+
+func (e *Executor) queryAppliedRevisions(ctx context.Context) ([]RevisionRecord, error) {
+	if e == nil || e.querier == nil {
+		return nil, nil
+	}
+	if e.revisionsSchema != "" && !isSafeQualifiedIdentifier(e.revisionsSchema) {
+		return nil, fmt.Errorf("invalid revisions schema identifier %q", e.revisionsSchema)
+	}
+	if err := validateChainScope(e.chainScope); err != nil {
 		return nil, err
 	}
-	query := fmt.Sprintf(
-		"SELECT version, description, `type`, applied, total, executed_at, execution_time, COALESCE(error, ''), COALESCE(error_stmt, ''), hash, operator_version FROM %s ORDER BY version ASC;",
-		e.RevisionsTableQualifiedName(),
+
+	var (
+		query string
+		args  []any
 	)
-	rows, err := e.db.QueryContext(ctx, query)
+	if e.chainScope != "" {
+		query = fmt.Sprintf(
+			"SELECT version, description, `type`, applied, total, executed_at, execution_time, COALESCE(error, ''), COALESCE(error_stmt, ''), hash, operator_version FROM %s WHERE version LIKE ? ORDER BY version ASC;",
+			e.RevisionsTableQualifiedName(),
+		)
+		args = []any{e.chainScope + ":%"}
+	} else {
+		query = fmt.Sprintf(
+			"SELECT version, description, `type`, applied, total, executed_at, execution_time, COALESCE(error, ''), COALESCE(error_stmt, ''), hash, operator_version FROM %s ORDER BY version ASC;",
+			e.RevisionsTableQualifiedName(),
+		)
+	}
+
+	rows, err := e.querier.QueryRowsContext(ctx, query, args...)
 	if err != nil {
+		if isMissingTableOrDatabaseError(err) {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("query %s: %w", e.RevisionsTableQualifiedName(), err)
 	}
 	defer func() { _ = rows.Close() }()
@@ -265,6 +435,11 @@ func (e *Executor) AppliedRevisions(ctx context.Context) ([]RevisionRecord, erro
 		); err != nil {
 			return nil, fmt.Errorf("scan %s row: %w", e.RevisionsTableQualifiedName(), err)
 		}
+		unscopedVer, ok := parseScopedVersion(e.chainScope, r.Version)
+		if !ok {
+			continue
+		}
+		r.Version = unscopedVer
 		r.ExecutedAt = parseScannedTime(execAtRaw)
 		records = append(records, r)
 	}
@@ -276,9 +451,20 @@ func (e *Executor) AppliedRevisions(ctx context.Context) ([]RevisionRecord, erro
 
 // RecordRevision inserts or updates a revision record in atlas_schema_revisions.
 func (e *Executor) RecordRevision(ctx context.Context, r RevisionRecord) error {
-	if e == nil || e.db == nil {
+	if e == nil || e.querier == nil {
 		return fmt.Errorf("executor has no database connection")
 	}
+	if e.revisionsSchema != "" && !isSafeQualifiedIdentifier(e.revisionsSchema) {
+		return fmt.Errorf("invalid revisions schema identifier %q", e.revisionsSchema)
+	}
+	if err := validateChainScope(e.chainScope); err != nil {
+		return err
+	}
+	if strings.TrimSpace(r.Version) == "" {
+		return fmt.Errorf("revision version cannot be empty")
+	}
+
+	storedVersion := formatScopedVersion(e.chainScope, r.Version)
 	execAt := r.ExecutedAt
 	if execAt.IsZero() {
 		execAt = time.Now().UTC()
@@ -299,10 +485,10 @@ func (e *Executor) RecordRevision(ctx context.Context, r RevisionRecord) error {
 		"INSERT INTO %s (version, description, `type`, applied, total, executed_at, execution_time, error, error_stmt, hash, partial_hashes, operator_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?);",
 		e.RevisionsTableQualifiedName(),
 	)
-	_, err := e.db.ExecContext(
+	_, err := e.querier.ExecContext(
 		ctx,
 		insertSQL,
-		r.Version,
+		storedVersion,
 		r.Description,
 		recType,
 		r.Applied,
@@ -315,12 +501,48 @@ func (e *Executor) RecordRevision(ctx context.Context, r RevisionRecord) error {
 		opVer,
 	)
 	if err != nil {
-		return fmt.Errorf("insert revision %s into %s: %w", r.Version, e.RevisionsTableQualifiedName(), err)
+		return fmt.Errorf("insert revision %s into %s: %w", storedVersion, e.RevisionsTableQualifiedName(), err)
 	}
 	return nil
 }
 
-// Status validates the migration directory and computes applied vs pending migrations.
+// DeleteRevision removes a revision record matching version (within e.chainScope when configured)
+// from atlas_schema_revisions.
+func (e *Executor) DeleteRevision(ctx context.Context, version string) error {
+	if e == nil || e.querier == nil {
+		return fmt.Errorf("executor has no database connection")
+	}
+	if e.revisionsSchema != "" && !isSafeQualifiedIdentifier(e.revisionsSchema) {
+		return fmt.Errorf("invalid revisions schema identifier %q", e.revisionsSchema)
+	}
+	if err := validateChainScope(e.chainScope); err != nil {
+		return err
+	}
+	cleanVer := strings.TrimSpace(version)
+	if cleanVer == "" {
+		return fmt.Errorf("revision version cannot be empty")
+	}
+	storedVersion := formatScopedVersion(e.chainScope, cleanVer)
+	delSQL := fmt.Sprintf("DELETE FROM %s WHERE version = ?;", e.RevisionsTableQualifiedName())
+	if _, err := e.querier.ExecContext(ctx, delSQL, storedVersion); err != nil {
+		return fmt.Errorf("delete revision %s from %s: %w", storedVersion, e.RevisionsTableQualifiedName(), err)
+	}
+	return nil
+}
+
+// StatusFS validates the migration fs.FS and computes applied vs pending migrations without mutating the database.
+func (e *Executor) StatusFS(ctx context.Context, fsys fs.FS) (*MigrationStatus, error) {
+	if err := ValidateFS(fsys, doris.LintOptions{AllowDestructive: true}); err != nil {
+		return nil, err
+	}
+	_, files, err := ReplayFS(fsys)
+	if err != nil {
+		return nil, err
+	}
+	return e.statusFromFiles(ctx, files)
+}
+
+// Status validates the migration directory and computes applied vs pending migrations without mutating the database.
 func (e *Executor) Status(ctx context.Context, dirPath string) (*MigrationStatus, error) {
 	if err := ValidateDir(dirPath, doris.LintOptions{AllowDestructive: true}); err != nil {
 		return nil, err
@@ -329,18 +551,38 @@ func (e *Executor) Status(ctx context.Context, dirPath string) (*MigrationStatus
 	if err != nil {
 		return nil, err
 	}
+	return e.statusFromFiles(ctx, files)
+}
 
-	var applied []RevisionRecord
-	if e != nil && e.db != nil {
-		applied, err = e.AppliedRevisions(ctx)
-		if err != nil {
+func (e *Executor) statusFromFiles(ctx context.Context, files []MigrationFile) (*MigrationStatus, error) {
+	var (
+		applied []RevisionRecord
+		err     error
+	)
+	if e != nil {
+		if err := validateChainScope(e.chainScope); err != nil {
 			return nil, err
+		}
+		if e.querier != nil {
+			applied, err = e.queryAppliedRevisions(ctx)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
 	appliedByVersion := make(map[string]RevisionRecord, len(applied))
+	maxAppliedVersion := ""
 	for _, r := range applied {
 		appliedByVersion[r.Version] = r
+		if r.Error == "" && r.Version > maxAppliedVersion {
+			maxAppliedVersion = r.Version
+		}
+	}
+
+	chainScope := ""
+	if e != nil {
+		chainScope = e.chainScope
 	}
 
 	var pending []MigrationFile
@@ -352,6 +594,8 @@ func (e *Executor) Status(ctx context.Context, dirPath string) (*MigrationStatus
 			if rev.Error == "" {
 				continue
 			}
+		} else if isEmptyTenantBaseline(f) && (chainScope != "" || maxAppliedVersion > f.Version) {
+			continue
 		}
 		pending = append(pending, f)
 	}
@@ -372,34 +616,87 @@ func (e *Executor) Status(ctx context.Context, dirPath string) (*MigrationStatus
 	return st, nil
 }
 
+func (e *Executor) withApplyOptions(opts ApplyOptions) (*Executor, error) {
+	var cfg Executor
+	if e != nil {
+		cfg = *e
+	}
+	if cfg.coupledMode == nil {
+		cfg.coupledMode = &atomic.Bool{}
+	}
+	if s := strings.TrimSpace(opts.RevisionsSchema); s != "" && cfg.revisionsSchema == "" {
+		cfg.revisionsSchema = s
+	}
+	if s := strings.TrimSpace(opts.ChainScope); s != "" {
+		cfg.chainScope = s
+	}
+	if s := strings.TrimSpace(opts.IcebergCatalog); s != "" {
+		cfg.icebergCatalog = s
+	}
+	if opts.NonBlocking {
+		cfg.nonBlocking = true
+	}
+	if opts.PollInterval > 0 {
+		cfg.pollInterval = opts.PollInterval
+	}
+	if opts.PollTimeout > 0 {
+		cfg.pollTimeout = opts.PollTimeout
+	}
+	if err := validateChainScope(cfg.chainScope); err != nil {
+		return nil, err
+	}
+	if cfg.revisionsSchema != "" && !isSafeQualifiedIdentifier(cfg.revisionsSchema) {
+		return nil, fmt.Errorf("invalid revisions schema identifier %q", cfg.revisionsSchema)
+	}
+	return &cfg, nil
+}
+
 // Apply validates atlas.sum, substitutes template variables, executes pending migrations
 // in version order against Doris FE, polls async schema change / index build jobs, and
 // records each applied migration in atlas_schema_revisions.
 func (e *Executor) Apply(ctx context.Context, opts ApplyOptions) (*ApplyResult, error) {
-	if opts.RevisionsSchema != "" && e != nil && e.revisionsSchema == "" {
-		e.revisionsSchema = strings.TrimSpace(opts.RevisionsSchema)
-	}
-	if opts.PollInterval > 0 && e != nil {
-		e.pollInterval = opts.PollInterval
-	}
-	if opts.PollTimeout > 0 && e != nil {
-		e.pollTimeout = opts.PollTimeout
-	}
-
-	if err := ValidateDir(opts.DirPath, doris.LintOptions{AllowDestructive: opts.AllowDestructive}); err != nil {
-		return nil, err
-	}
-	_, files, err := ReplayDir(opts.DirPath)
+	execCfg, err := e.withApplyOptions(opts)
 	if err != nil {
 		return nil, err
 	}
 
+	lintOpts := doris.LintOptions{AllowDestructive: opts.AllowDestructive}
+	var files []MigrationFile
+	if opts.FS != nil {
+		if err := ValidateFS(opts.FS, lintOpts); err != nil {
+			return nil, err
+		}
+		_, files, err = ReplayFS(opts.FS)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		if err := ValidateDir(opts.DirPath, lintOpts); err != nil {
+			return nil, err
+		}
+		_, files, err = ReplayDir(opts.DirPath)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	appliedByVersion := make(map[string]RevisionRecord)
-	if !opts.DryRun || (e != nil && e.db != nil) {
-		if e == nil || e.db == nil {
+	if !opts.DryRun {
+		if execCfg.querier == nil {
 			return nil, fmt.Errorf("migrate apply requires a live Doris connection unless --dry-run is used")
 		}
-		revs, err := e.AppliedRevisions(ctx)
+		if err := execCfg.EnsureRevisionsTable(ctx); err != nil {
+			return nil, err
+		}
+		revs, err := execCfg.queryAppliedRevisions(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range revs {
+			appliedByVersion[r.Version] = r
+		}
+	} else if execCfg.querier != nil {
+		revs, err := execCfg.queryAppliedRevisions(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -413,6 +710,7 @@ func (e *Executor) Apply(ctx context.Context, opts ApplyOptions) (*ApplyResult, 
 
 	for _, f := range files {
 		resumeOffset := 0
+		pendingAsyncWait := false
 		if rev, ok := appliedByVersion[f.Version]; ok {
 			if rev.Hash != "" && f.Hash != "" && rev.Hash != f.Hash {
 				return nil, fmt.Errorf("applied migration %s (%s) checksum mismatch: db has %s, atlas.sum has %s", f.Version, f.Name, rev.Hash, f.Hash)
@@ -423,13 +721,14 @@ func (e *Executor) Apply(ctx context.Context, opts ApplyOptions) (*ApplyResult, 
 			if rev.Applied > 0 {
 				resumeOffset = rev.Applied
 			}
+			pendingAsyncWait = isPendingAsyncError(rev.Error)
 		}
 
-		// Handle --baseline (or empty 00000000000000_* baseline file)
+		// Explicit --baseline skips and records the baseline version.
 		if opts.BaselineVersion != "" && f.Version <= opts.BaselineVersion {
 			res.SkippedBaseline = append(res.SkippedBaseline, f.Name)
 			if !opts.DryRun {
-				if err := e.RecordRevision(ctx, RevisionRecord{
+				if err := execCfg.RecordRevision(ctx, RevisionRecord{
 					Version:         f.Version,
 					Description:     f.Description,
 					Type:            2,
@@ -443,6 +742,12 @@ func (e *Executor) Apply(ctx context.Context, opts ApplyOptions) (*ApplyResult, 
 					return nil, err
 				}
 			}
+			continue
+		}
+
+		// Skip empty 00000000000000_tenant.sql without executing or recording in atlas_schema_revisions.
+		if isEmptyTenantBaseline(f) {
+			res.SkippedBaseline = append(res.SkippedBaseline, f.Name)
 			continue
 		}
 
@@ -460,21 +765,61 @@ func (e *Executor) Apply(ctx context.Context, opts ApplyOptions) (*ApplyResult, 
 
 		if opts.DryRun {
 			res.AppliedFiles = append(res.AppliedFiles, f.Name)
-			for _, st := range stmts[resumeOffset:] {
-				res.ExecutedSQL = append(res.ExecutedSQL, st.SQL())
+			for idx, st := range stmts[resumeOffset:] {
+				if pendingAsyncWait && idx == 0 && requiresAsyncJobWait(st) {
+					pendingAsyncWait = false
+					continue
+				}
+				stmtSQL := execCfg.normalizeRuntimeStatement(st.SQL())
+				if stmtSQL != "" {
+					res.ExecutedSQL = append(res.ExecutedSQL, stmtSQL)
+				}
 			}
 			continue
 		}
 
 		fileStart := time.Now()
 		appliedCount := resumeOffset
-		for _, st := range stmts[resumeOffset:] {
-			stmtSQL := st.SQL()
+		for idx, st := range stmts[resumeOffset:] {
+			stmtSQL := execCfg.normalizeRuntimeStatement(st.SQL())
 			if stmtSQL == "" {
 				continue
 			}
-			if _, execErr := e.db.ExecContext(ctx, stmtSQL); execErr != nil {
-				_ = e.RecordRevision(ctx, RevisionRecord{
+			if pendingAsyncWait && idx == 0 && requiresAsyncJobWait(st) {
+				pendingAsyncWait = false
+				if err := execCfg.waitForStatementJobCompletion(ctx, st); err != nil {
+					_ = execCfg.RecordRevision(ctx, RevisionRecord{
+						Version:         f.Version,
+						Description:     f.Description,
+						Type:            2,
+						Applied:         appliedCount,
+						Total:           len(stmts),
+						ExecutedAt:      time.Now().UTC(),
+						ExecutionTimeNs: time.Since(fileStart).Nanoseconds(),
+						Error:           err.Error(),
+						ErrorStmt:       stmtSQL,
+						Hash:            f.Hash,
+						OperatorVersion: OperatorVersion,
+					})
+					return nil, fmt.Errorf("migration %s async schema change on %s: %w", f.Name, st.TargetTable, err)
+				}
+				appliedCount++
+				continue
+			}
+
+			_, execErr := execCfg.querier.ExecContext(ctx, stmtSQL)
+			if execErr != nil && doris.IsCoupledModeUnknownPropertiesErr(execErr) {
+				stripped := doris.StripCoupledModeCreateTableProperties(stmtSQL)
+				if stripped != stmtSQL {
+					if execCfg.coupledMode != nil {
+						execCfg.coupledMode.Store(true)
+					}
+					stmtSQL = stripped
+					_, execErr = execCfg.querier.ExecContext(ctx, stmtSQL)
+				}
+			}
+			if execErr != nil {
+				_ = execCfg.RecordRevision(ctx, RevisionRecord{
 					Version:         f.Version,
 					Description:     f.Description,
 					Type:            2,
@@ -493,8 +838,8 @@ func (e *Executor) Apply(ctx context.Context, opts ApplyOptions) (*ApplyResult, 
 			res.ExecutedSQL = append(res.ExecutedSQL, stmtSQL)
 
 			if requiresAsyncJobWait(st) {
-				if err := e.waitForStatementJobCompletion(ctx, st); err != nil {
-					_ = e.RecordRevision(ctx, RevisionRecord{
+				if err := execCfg.waitForStatementJobCompletion(ctx, st); err != nil {
+					_ = execCfg.RecordRevision(ctx, RevisionRecord{
 						Version:         f.Version,
 						Description:     f.Description,
 						Type:            2,
@@ -512,7 +857,7 @@ func (e *Executor) Apply(ctx context.Context, opts ApplyOptions) (*ApplyResult, 
 			}
 		}
 
-		if err := e.RecordRevision(ctx, RevisionRecord{
+		if err := execCfg.RecordRevision(ctx, RevisionRecord{
 			Version:         f.Version,
 			Description:     f.Description,
 			Type:            2,
@@ -533,6 +878,21 @@ func (e *Executor) Apply(ctx context.Context, opts ApplyOptions) (*ApplyResult, 
 	return res, nil
 }
 
+func (e *Executor) normalizeRuntimeStatement(stmtSQL string) string {
+	s := strings.TrimSpace(stmtSQL)
+	if s == "" {
+		return ""
+	}
+	s = doris.NormalizeIcebergCatalogDDL(s, e.icebergCatalog)
+	if doris.IsCreateOrAlterViewStatement(s) {
+		s = doris.NormalizeNereidsViewOrderKeys(s)
+	}
+	if e.coupledMode != nil && e.coupledMode.Load() {
+		s = doris.StripCoupledModeCreateTableProperties(s)
+	}
+	return s
+}
+
 func requiresAsyncJobWait(st doris.Statement) bool {
 	switch st.Kind {
 	case doris.StmtAlterTableModifyColumn, doris.StmtAlterTableAddIndex, doris.StmtAlterTableDropIndex, doris.StmtBuildIndex:
@@ -542,26 +902,39 @@ func requiresAsyncJobWait(st doris.Statement) bool {
 	}
 }
 
+func statementIndexName(st doris.Statement) string {
+	if st.DropIndexName != "" {
+		return st.DropIndexName
+	}
+	if st.Index != nil {
+		return st.Index.Name
+	}
+	return ""
+}
+
 func (e *Executor) waitForStatementJobCompletion(ctx context.Context, st doris.Statement) error {
 	if st.Kind == doris.StmtBuildIndex {
-		return e.waitForAsyncDorisJob(ctx, st.TargetTable, "SHOW BUILD INDEX")
+		return e.waitForAsyncDorisJob(ctx, st.TargetTable, statementIndexName(st), "SHOW BUILD INDEX")
 	}
-	return e.waitForTableAlterCompletion(ctx, st.TargetTable)
+	return e.waitForAsyncDorisJob(ctx, st.TargetTable, statementIndexName(st), "SHOW ALTER TABLE COLUMN")
 }
 
-func (e *Executor) waitForTableAlterCompletion(ctx context.Context, fullTableName string) error {
-	return e.waitForAsyncDorisJob(ctx, fullTableName, "SHOW ALTER TABLE COLUMN")
-}
-
-func (e *Executor) waitForAsyncDorisJob(ctx context.Context, fullTableName, showPrefix string) error {
-	if e == nil || e.db == nil {
+func (e *Executor) waitForAsyncDorisJob(ctx context.Context, fullTableName, indexName, showPrefix string) error {
+	if e == nil || e.querier == nil {
 		return nil
 	}
 	parts := strings.Split(fullTableName, ".")
-	shortTable := parts[len(parts)-1]
+	shortTable := strings.Trim(strings.TrimSpace(parts[len(parts)-1]), "`")
 	dbPrefix := ""
 	if len(parts) >= 2 {
-		dbPrefix = " FROM " + strings.Join(parts[:len(parts)-1], ".")
+		if showPrefix == "SHOW BUILD INDEX" {
+			dbName := strings.Trim(strings.TrimSpace(parts[len(parts)-2]), "`")
+			if dbName != "" {
+				dbPrefix = " FROM " + dbName
+			}
+		} else {
+			dbPrefix = " FROM " + strings.Join(parts[:len(parts)-1], ".")
+		}
 	}
 	query := fmt.Sprintf("%s%s WHERE TableName = '%s';", showPrefix, dbPrefix, shortTable)
 
@@ -576,22 +949,34 @@ func (e *Executor) waitForAsyncDorisJob(ctx context.Context, fullTableName, show
 	deadline := time.Now().Add(timeout)
 
 	for {
-		state, err := e.queryLatestAlterState(ctx, query)
+		status, err := e.queryLatestAlterState(ctx, query)
 		if err != nil {
 			if isUnsupportedShowQueryError(err) {
 				return nil
 			}
 			return err
 		}
-		upperState := strings.ToUpper(strings.TrimSpace(state))
+		upperState := strings.ToUpper(strings.TrimSpace(status.state))
 		switch upperState {
 		case "", "FINISHED":
 			return nil
 		case "CANCELLED", "CANCELED", "FAILED":
-			return fmt.Errorf("doris async schema change job for table %q was %s", fullTableName, upperState)
+			idx := indexName
+			if idx == "" {
+				idx = status.indexName
+			}
+			return &AsyncJobFailedError{
+				Table:   fullTableName,
+				Index:   idx,
+				State:   upperState,
+				Message: status.msg,
+			}
+		}
+		if e.nonBlocking {
+			return fmt.Errorf("%w: table %q state=%s", ErrAsyncJobPending, fullTableName, upperState)
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out waiting for Doris schema change job on %q (last state=%q)", fullTableName, state)
+			return fmt.Errorf("timed out waiting for Doris schema change job on %q (last state=%q)", fullTableName, status.state)
 		}
 		select {
 		case <-ctx.Done():
@@ -608,39 +993,110 @@ func isUnsupportedShowQueryError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "unsupported") ||
 		strings.Contains(msg, "not supported") ||
-		strings.Contains(msg, "syntax error") ||
 		strings.Contains(msg, "unknown command") ||
 		strings.Contains(msg, "unrecognized")
 }
 
-func (e *Executor) queryLatestAlterState(ctx context.Context, query string) (string, error) {
-	rows, err := e.db.QueryContext(ctx, query)
+func isMissingTableOrDatabaseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "doesn't exist") ||
+		strings.Contains(msg, "does not exist") ||
+		strings.Contains(msg, "unknown database") ||
+		strings.Contains(msg, "unknown table") ||
+		strings.Contains(msg, "error 1146") ||
+		strings.Contains(msg, "error 1049")
+}
+
+func isEmptyTenantBaseline(f MigrationFile) bool {
+	return f.Name == "00000000000000_tenant.sql" && len(f.Statements) == 0
+}
+
+func isPendingAsyncError(errStr string) bool {
+	return strings.Contains(strings.ToLower(errStr), strings.ToLower(ErrAsyncJobPending.Error()))
+}
+
+var chainScopeRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+func validateChainScope(scope string) error {
+	if scope == "" {
+		return nil
+	}
+	if !chainScopeRe.MatchString(scope) {
+		return fmt.Errorf("invalid chain scope %q: must match ^[A-Za-z0-9._-]+$", scope)
+	}
+	return nil
+}
+
+func formatScopedVersion(scope, version string) string {
+	if scope == "" {
+		return version
+	}
+	prefix := scope + ":"
+	if strings.HasPrefix(version, prefix) {
+		return version
+	}
+	return prefix + version
+}
+
+func parseScopedVersion(scope, stored string) (string, bool) {
+	if scope == "" {
+		if strings.Contains(stored, ":") {
+			return "", false
+		}
+		return stored, true
+	}
+	prefix := scope + ":"
+	if !strings.HasPrefix(stored, prefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(stored, prefix), true
+}
+
+type asyncJobStatus struct {
+	state     string
+	indexName string
+	msg       string
+}
+
+func (e *Executor) queryLatestAlterState(ctx context.Context, query string) (asyncJobStatus, error) {
+	rows, err := e.querier.QueryRowsContext(ctx, query)
 	if err != nil {
-		return "", err
+		return asyncJobStatus{}, err
 	}
 	defer func() { _ = rows.Close() }()
 
 	cols, err := rows.Columns()
 	if err != nil {
-		return "", err
+		return asyncJobStatus{}, err
 	}
 	stateIdx := -1
 	jobIDIdx := -1
+	msgIdx := -1
+	indexNameIdx := -1
 	for i, c := range cols {
 		switch {
 		case strings.EqualFold(c, "State"):
 			stateIdx = i
 		case strings.EqualFold(c, "JobId"):
 			jobIDIdx = i
+		case strings.EqualFold(c, "Msg"):
+			msgIdx = i
+		case strings.EqualFold(c, "IndexName"):
+			indexNameIdx = i
 		}
 	}
 	if stateIdx < 0 {
-		return "FINISHED", nil
+		return asyncJobStatus{state: "FINISHED"}, nil
 	}
 
 	type jobRow struct {
-		jobID string
-		state string
+		jobID     string
+		state     string
+		indexName string
+		msg       string
 	}
 	var allRows []jobRow
 	vals := make([]sql.RawBytes, len(cols))
@@ -650,22 +1106,32 @@ func (e *Executor) queryLatestAlterState(ctx context.Context, query string) (str
 	}
 	for rows.Next() {
 		if err := rows.Scan(scanArgs...); err != nil {
-			return "", err
+			return asyncJobStatus{}, err
 		}
 		jid := ""
 		if jobIDIdx >= 0 {
 			jid = strings.TrimSpace(string(vals[jobIDIdx]))
 		}
+		idxName := ""
+		if indexNameIdx >= 0 {
+			idxName = strings.TrimSpace(string(vals[indexNameIdx]))
+		}
+		msg := ""
+		if msgIdx >= 0 {
+			msg = strings.TrimSpace(string(vals[msgIdx]))
+		}
 		allRows = append(allRows, jobRow{
-			jobID: jid,
-			state: strings.TrimSpace(string(vals[stateIdx])),
+			jobID:     jid,
+			state:     strings.TrimSpace(string(vals[stateIdx])),
+			indexName: idxName,
+			msg:       msg,
 		})
 	}
 	if err := rows.Err(); err != nil {
-		return "", err
+		return asyncJobStatus{}, err
 	}
 	if len(allRows) == 0 {
-		return "", nil
+		return asyncJobStatus{}, nil
 	}
 
 	targetJobID := allRows[len(allRows)-1].jobID
@@ -683,28 +1149,29 @@ func (e *Executor) queryLatestAlterState(ctx context.Context, query string) (str
 		}
 	}
 
-	var nonFinishedState string
-	latestState := ""
+	var nonFinishedStatus asyncJobStatus
+	var latestStatus asyncJobStatus
 	for _, r := range allRows {
 		if jobIDIdx >= 0 && targetJobID != "" && r.jobID != targetJobID {
 			continue
 		}
-		latestState = r.state
+		st := asyncJobStatus{state: r.state, indexName: r.indexName, msg: r.msg}
+		latestStatus = st
 		upper := strings.ToUpper(r.state)
 		switch upper {
 		case "CANCELLED", "CANCELED", "FAILED":
-			return r.state, nil
+			return st, nil
 		case "FINISHED":
 		default:
-			if nonFinishedState == "" {
-				nonFinishedState = r.state
+			if nonFinishedStatus.state == "" {
+				nonFinishedStatus = st
 			}
 		}
 	}
-	if nonFinishedState != "" {
-		return nonFinishedState, nil
+	if nonFinishedStatus.state != "" {
+		return nonFinishedStatus, nil
 	}
-	return latestState, nil
+	return latestStatus, nil
 }
 
 var templateVarPlaceholderRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)

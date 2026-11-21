@@ -365,6 +365,41 @@ PROPERTIES (
 			t.Errorf("expected inner complex type mismatch on %s, got:\n%s", colName, innerMismatches)
 		}
 	}
+
+	// 7. Test TINYINT / SMALLINT / ARRAY<SMALLINT> <-> Iceberg INT / ARRAY<INT> parity
+	sSmallIntDoris, err := doris.ParseSchema(`
+CREATE TABLE IF NOT EXISTS internal.tenant_a.small_int_items (
+    item_id VARCHAR(64) NOT NULL,
+    score TINYINT,
+    part_index SMALLINT,
+    scores ARRAY<SMALLINT>
+)
+UNIQUE KEY(item_id)
+DISTRIBUTED BY HASH(item_id) BUCKETS 4;`)
+	if err != nil {
+		t.Fatalf("ParseSchema(sSmallIntDoris): %v", err)
+	}
+	sSmallIntIce, err := doris.ParseSchema(`
+CREATE TABLE IF NOT EXISTS azra_lake.tenant_a.small_int_items (
+    item_id VARCHAR(64) NOT NULL,
+    score INT,
+    part_index INT,
+    scores ARRAY<INT>
+)
+PROPERTIES (
+    "compression_codec" = "zstd"
+);`)
+	if err != nil {
+		t.Fatalf("ParseSchema(sSmallIntIce): %v", err)
+	}
+	if m := CheckSchemaParity(sSmallIntDoris, sSmallIntIce); len(m) != 0 {
+		t.Fatalf("expected 0 parity mismatches for TINYINT/SMALLINT/ARRAY<SMALLINT> <-> INT/ARRAY<INT>, got: %v", m)
+	}
+	sBadSmallIntIce := sSmallIntIce.Clone()
+	sBadSmallIntIce.Tables[0].Columns[2].Type = "STRING"
+	if m := strings.Join(CheckSchemaParity(sSmallIntDoris, sBadSmallIntIce), "\n"); !strings.Contains(m, `column "part_index": Iceberg type mismatch`) {
+		t.Errorf("expected Iceberg type mismatch for SMALLINT <-> STRING, got:\n%s", m)
+	}
 }
 
 // TestProto2TypeCrossRepoGoldenContract verifies SQL/HCL equivalence, CheckSchemaParity

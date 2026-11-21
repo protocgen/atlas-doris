@@ -777,6 +777,9 @@ func parityIcebergTypesCompatible(dorisType, icebergType string) bool {
 	if dt == "LARGEINT" && (it == "DECIMALV3(38, 0)" || it == "DECIMAL(38, 0)") {
 		return true
 	}
+	if (dt == "TINYINT" || dt == "SMALLINT") && it == "INT" {
+		return true
+	}
 	if strings.HasPrefix(dt, "ARRAY<") && strings.HasSuffix(dt, ">") &&
 		strings.HasPrefix(it, "ARRAY<") && strings.HasSuffix(it, ">") {
 		return parityIcebergTypesCompatible(dt[6:len(dt)-1], it[6:len(it)-1])

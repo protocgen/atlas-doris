@@ -1831,11 +1831,26 @@ func TestStage1B_ParserAstFormatDiffLintFixes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ParseSchema failed: %v", err)
 		}
-		if _, ok := s1.TableByName("internal.tenant_${TENANT_SLUG}.patients"); !ok {
-			t.Errorf("expected case-insensitive TableByName lookup while preserving ${TENANT_SLUG}")
+		if _, ok := s1.TableByName("internal.tenant_${TENANT_SLUG}.Patients"); !ok {
+			t.Errorf("expected case-insensitive catalog/db lookup with exact table case while preserving ${TENANT_SLUG}")
+		}
+		if _, ok := s1.TableByName("internal.tenant_${TENANT_SLUG}.patients"); ok {
+			t.Errorf("expected case-sensitive table-name lookup not to match Patients with patients")
 		}
 		if len(s1.Databases) != 1 || s1.Databases[0].LookupKey() != "tenant_${TENANT_SLUG}" {
 			t.Errorf("expected DatabaseDef.LookupKey()='tenant_${TENANT_SLUG}', got %q", s1.Databases[0].LookupKey())
+		}
+
+		// Distinct case-sensitive table identities (lower_case_table_names = 0)
+		sCase, err := doris.ParseSchema(`
+CREATE TABLE internal.db.Patients (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;
+CREATE TABLE internal.db.patients (id INT, note VARCHAR(32)) DISTRIBUTED BY HASH(id) BUCKETS 1;
+DROP TABLE internal.db.patients;`)
+		if err != nil {
+			t.Fatalf("ParseSchema(case-sensitive DROP TABLE) failed: %v", err)
+		}
+		if len(sCase.Tables) != 1 || sCase.Tables[0].Name != "Patients" {
+			t.Errorf("expected DROP TABLE internal.db.patients to leave Patients intact, got %+v", sCase.Tables)
 		}
 	})
 

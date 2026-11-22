@@ -2,6 +2,9 @@ package doris_test
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -431,6 +434,179 @@ func TestStage1B_NormalizeSecurityAndEdgeCases(t *testing.T) {
 		} {
 			_ = doris.StripCoupledModeCreateTableProperties(mal)
 			_ = doris.NormalizeNereidsViewOrderKeys(mal)
+		}
+	})
+}
+
+func TestCodeRabbitPR7_NormalizeFixes(t *testing.T) {
+	t.Run("qualified_table_ownership_isolation", func(t *testing.T) {
+		seenTables := make(map[string]bool)
+		seenViews := make(map[string]bool)
+		var ownedTables []string
+
+		createInternal := "CREATE TABLE internal.tenant_${TENANT_SLUG}.events (id VARCHAR(64) NOT NULL, ts BIGINT) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;"
+		if err := doris.ValidateTenantChainStatement(createInternal, seenTables, seenViews, &ownedTables); err != nil {
+			t.Fatalf("create internal events failed: %v", err)
+		}
+		if len(ownedTables) != 1 || ownedTables[0] != "events" {
+			t.Fatalf("expected ownedTables=[events], got %v", ownedTables)
+		}
+
+		// Same basename in a different catalog must NOT inherit ownership.
+		crossCatalog := []string{
+			"ALTER TABLE azra_lake.tenant_${TENANT_SLUG}.events ADD COLUMN x INT;",
+			"INSERT INTO azra_lake.tenant_${TENANT_SLUG}.events SELECT id, ts FROM internal.tenant_${TENANT_SLUG}.events;",
+			"BUILD INDEX idx_x ON azra_lake.tenant_${TENANT_SLUG}.events;",
+			"CREATE VIEW internal.tenant_${TENANT_SLUG}.vw_events AS SELECT * FROM azra_lake.tenant_${TENANT_SLUG}.events;",
+		}
+		for _, stmt := range crossCatalog {
+			if err := doris.ValidateTenantChainStatement(stmt, seenTables, seenViews, &ownedTables); err == nil {
+				t.Errorf("expected cross-catalog access on unowned azra_lake.events to be rejected: %s", stmt)
+			}
+		}
+
+		// Explicit CREATE TABLE in azra_lake registers that catalog+table while keeping ownedTables unique basenames.
+		createLake := "CREATE TABLE azra_lake.tenant_${TENANT_SLUG}.events (id STRING, ts BIGINT);"
+		if err := doris.ValidateTenantChainStatement(createLake, seenTables, seenViews, &ownedTables); err != nil {
+			t.Fatalf("create azra_lake events failed: %v", err)
+		}
+		if len(ownedTables) != 1 || ownedTables[0] != "events" {
+			t.Fatalf("expected deduplicated unique basenames in ownedTables, got %v", ownedTables)
+		}
+		alterLake := "ALTER TABLE azra_lake.tenant_${TENANT_SLUG}.events ADD COLUMN src STRING;"
+		if err := doris.ValidateTenantChainStatement(alterLake, seenTables, seenViews, &ownedTables); err != nil {
+			t.Fatalf("ALTER on now-owned azra_lake.events failed: %v", err)
+		}
+	})
+
+	t.Run("rejects_unqualified_base_tables_allows_ctes_and_aliases", func(t *testing.T) {
+		seenTables := map[string]bool{"internal:events": true}
+		seenViews := make(map[string]bool)
+		ownedTables := []string{"events"}
+
+		rejected := []string{
+			"CREATE VIEW internal.tenant_${TENANT_SLUG}.v_bad1 AS SELECT * FROM events;",
+			"CREATE VIEW internal.tenant_${TENANT_SLUG}.v_bad2 AS SELECT * FROM internal.tenant_${TENANT_SLUG}.events e JOIN other_tbl o ON e.id = o.id;",
+			"CREATE VIEW internal.tenant_${TENANT_SLUG}.v_bad3 AS SELECT * FROM internal.tenant_${TENANT_SLUG}.events e, other_tbl;",
+			"CREATE VIEW internal.tenant_${TENANT_SLUG}.v_bad4 AS SELECT * FROM (SELECT * FROM other_tbl) sub;",
+			"CREATE TABLE internal.tenant_${TENANT_SLUG}.events_copy LIKE events;",
+			"CREATE VIEW internal.tenant_${TENANT_SLUG}.v_bad_scope AS SELECT * FROM (WITH inner_cte AS (SELECT * FROM internal.tenant_${TENANT_SLUG}.events) SELECT * FROM inner_cte) s JOIN inner_cte ON 1=1;",
+		}
+		for _, stmt := range rejected {
+			if err := doris.ValidateTenantChainStatement(stmt, seenTables, seenViews, &ownedTables); err == nil {
+				t.Errorf("expected unqualified base table reference to be rejected: %s", stmt)
+			}
+		}
+
+		allowed := []string{
+			`CREATE OR REPLACE VIEW internal.tenant_${TENANT_SLUG}.v_cte AS
+			WITH
+				c1 AS (SELECT id, EXTRACT(YEAR FROM ts) AS yr FROM internal.tenant_${TENANT_SLUG}.events),
+				c2 (id, yr) AS (
+					SELECT id, yr FROM c1
+					JOIN (
+						WITH nested AS (SELECT id FROM internal.tenant_${TENANT_SLUG}.events)
+						SELECT id FROM nested
+					) sub ON sub.id = c1.id
+				)
+			SELECT c2.id, c2.yr, t1
+			FROM c2
+			LATERAL VIEW explode(ARRAY(1, 2)) lv AS t1, t2;`,
+		}
+		for _, stmt := range allowed {
+			if err := doris.ValidateTenantChainStatement(stmt, seenTables, seenViews, &ownedTables); err != nil {
+				t.Errorf("expected valid CTE / subquery alias / EXTRACT / LATERAL VIEW query to pass, got %v", err)
+			}
+		}
+	})
+
+	t.Run("nereids_order_keys_preserve_scalar_structs", func(t *testing.T) {
+		scalarOnly := "CREATE VIEW internal.db.v AS SELECT MAX_BY(v, ELEMENT_AT(STRUCT(ts, seq), 1)) FROM internal.db.t;"
+		if got := doris.NormalizeNereidsViewOrderKeys(scalarOnly); got != scalarOnly {
+			t.Errorf("expected scalar ELEMENT_AT(STRUCT(...), 1) to stay untouched:\ngot:  %s\nwant: %s", got, scalarOnly)
+		}
+
+		mixedOuter := "CREATE VIEW internal.db.v AS SELECT MAX_BY(v, STRUCT(ELEMENT_AT(STRUCT(ts, seq), 1), seq)) FROM internal.db.t;"
+		gotMixed := doris.NormalizeNereidsViewOrderKeys(mixedOuter)
+		if !strings.Contains(gotMixed, "ELEMENT_AT(STRUCT(ts, seq), 1)") || !strings.Contains(gotMixed, "CONCAT_WS(CHAR(1)") {
+			t.Errorf("expected outer STRUCT to rewrite while inner ELEMENT_AT(STRUCT(...), 1) stays untouched:\n%s", gotMixed)
+		}
+
+		branchExpr := `CREATE VIEW internal.db.v AS SELECT MAX_BY(v, (CASE
+			WHEN ELEMENT_AT(STRUCT(w_ts, w_id), 1) > 0 THEN STRUCT(a_ts, a_id)
+			WHEN flag = 1 THEN COALESCE(STRUCT(c_ts, c_id), IF(cond, STRUCT(e_ts, e_id), ELEMENT_AT(STRUCT(x_ts, x_id), 1)))
+			ELSE ELEMENT_AT(STRUCT(else_ts, else_id), 1)
+		END)) FROM internal.db.t;`
+		gotBranch := doris.NormalizeNereidsViewOrderKeys(branchExpr)
+		for _, wantStruct := range []string{
+			"ELEMENT_AT(STRUCT(w_ts, w_id), 1)",
+			"ELEMENT_AT(STRUCT(x_ts, x_id), 1)",
+			"ELEMENT_AT(STRUCT(else_ts, else_id), 1)",
+		} {
+			if !strings.Contains(gotBranch, wantStruct) {
+				t.Errorf("expected scalar call %s NOT to be rewritten:\n%s", wantStruct, gotBranch)
+			}
+		}
+		for _, rewrittenStruct := range []string{
+			"STRUCT(a_ts",
+			"STRUCT(c_ts",
+			"STRUCT(e_ts",
+		} {
+			if strings.Contains(gotBranch, rewrittenStruct) {
+				t.Errorf("expected value-returning branch %s TO be rewritten:\n%s", rewrittenStruct, gotBranch)
+			}
+		}
+	})
+
+	t.Run("platform_service_tenant_chains_regression", func(t *testing.T) {
+		root := "/Users/ab/code/azra/platform/schemas/doris/tenant"
+		if _, err := os.Stat(root); err != nil {
+			t.Skipf("platform schemas not present at %s: %v", root, err)
+		}
+		services := []string{"hl7-ingest-worker", "cohort-explorer-wk", "manage-providers-service"}
+		for _, svc := range services {
+			migDir := filepath.Join(root, svc, "migrations")
+			entries, err := os.ReadDir(migDir)
+			if err != nil {
+				t.Fatalf("ReadDir(%s): %v", migDir, err)
+			}
+			var sqlFiles []string
+			for _, ent := range entries {
+				if !ent.IsDir() && strings.HasSuffix(ent.Name(), ".sql") {
+					sqlFiles = append(sqlFiles, ent.Name())
+				}
+			}
+			sort.Strings(sqlFiles)
+			seenTables := make(map[string]bool)
+			seenViews := make(map[string]bool)
+			var ownedTables []string
+			for _, name := range sqlFiles {
+				raw, err := os.ReadFile(filepath.Join(migDir, name))
+				if err != nil {
+					t.Fatalf("ReadFile(%s): %v", name, err)
+				}
+				if strings.TrimSpace(string(raw)) == "" {
+					continue
+				}
+				stmts, err := doris.ParseStatements(string(raw))
+				if err != nil {
+					t.Fatalf("%s/%s ParseStatements failed: %v", svc, name, err)
+				}
+				for _, st := range stmts {
+					if err := doris.ValidateTenantChainStatement(st.RawSQL, seenTables, seenViews, &ownedTables); err != nil {
+						t.Fatalf("%s/%s ValidateTenantChainStatement failed: %v\nSQL:\n%s", svc, name, err, st.RawSQL)
+					}
+					if doris.IsCreateOrAlterViewStatement(st.RawSQL) {
+						rewritten := doris.NormalizeNereidsViewOrderKeys(st.RawSQL)
+						if rewritten == "" {
+							t.Fatalf("%s/%s NormalizeNereidsViewOrderKeys returned empty", svc, name)
+						}
+					}
+				}
+			}
+			if len(ownedTables) == 0 {
+				t.Errorf("%s expected non-empty ownedTables", svc)
+			}
 		}
 	})
 }

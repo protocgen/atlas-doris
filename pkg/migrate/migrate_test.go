@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -389,6 +390,12 @@ func (s *mockStmt) Query(args []driver.Value) (driver.Rows, error) {
 			if s.c.m.showPollError != "" {
 				return nil, fmt.Errorf("%s", s.c.m.showPollError)
 			}
+			if s.c.m.multiPartitionBuildIndex {
+				return &mockRows{
+					cols: []string{"JobId", "TableName", "PartitionName", "State"},
+					rows: [][]driver.Value{{"2000", "patients", "p_old", []byte("FINISHED")}},
+				}, nil
+			}
 			return &mockRows{cols: []string{"JobId", "TableName", "State"}}, nil
 		}
 		s.c.m.buildIndexPolls++
@@ -401,12 +408,13 @@ func (s *mockStmt) Query(args []driver.Value) (driver.Rows, error) {
 			if s.c.m.buildIndexPolls >= 2 {
 				p1State = "FINISHED"
 			}
+			p2JobID := fmt.Sprintf("%d", 2001+s.c.m.buildJobSeq)
 			return &mockRows{
 				cols: []string{"JobId", "TableName", "PartitionName", "State"},
 				rows: [][]driver.Value{
 					{"2000", "patients", "p_old", []byte("FINISHED")},
 					{jobID, "patients", "p1", []byte(p1State)},
-					{jobID, "patients", "p2", []byte("FINISHED")},
+					{p2JobID, "patients", "p2", []byte("FINISHED")},
 				},
 			}, nil
 		}
@@ -2251,4 +2259,320 @@ func (m *mySQLErrQuerier) ExecContext(context.Context, string, ...any) (sql.Resu
 }
 func (m *mySQLErrQuerier) QueryRowsContext(context.Context, string, ...any) (migrate.QueryRows, error) {
 	return nil, m.err
+}
+
+type pr7CustomQuerier struct {
+	*mockQuerier
+	activeDB        string
+	activeDBErr     error
+	multiPartPolls  int
+	multiPartFailP1 bool
+	failOnBaseline  bool
+}
+
+func (p *pr7CustomQuerier) QueryRowsContext(ctx context.Context, query string, args ...any) (migrate.QueryRows, error) {
+	if strings.EqualFold(strings.TrimSpace(query), "SELECT DATABASE();") {
+		p.mu.Lock()
+		p.queryLog = append(p.queryLog, query)
+		p.mu.Unlock()
+		if p.activeDBErr != nil {
+			return nil, p.activeDBErr
+		}
+		if p.activeDB == "" {
+			return &mockLegacyRows{cols: []string{"DATABASE()"}, rows: [][]any{{nil}}}, nil
+		}
+		return &mockLegacyRows{cols: []string{"DATABASE()"}, rows: [][]any{{p.activeDB}}}, nil
+	}
+	if strings.HasPrefix(query, "SHOW BUILD INDEX") && (p.multiPartFailP1 || p.failOnBaseline) {
+		p.mu.Lock()
+		p.queryLog = append(p.queryLog, query)
+		seq := p.jobSeq
+		p.mu.Unlock()
+		if seq == 0 {
+			return &mockLegacyRows{
+				cols: []string{"JobId", "TableName", "PartitionName", "IndexName", "State", "Msg"},
+				rows: [][]any{{"2000", "patients", "p_old", "idx_mrn", "CANCELLED", "stale cancelled partition"}},
+			}, nil
+		}
+		p.mu.Lock()
+		p.multiPartPolls++
+		poll := p.multiPartPolls
+		p.mu.Unlock()
+		p1State := "RUNNING"
+		if p.multiPartFailP1 {
+			p1State = "FAILED"
+		} else if poll >= 2 {
+			p1State = "FINISHED"
+		}
+		return &mockLegacyRows{
+			cols: []string{"JobId", "TableName", "PartitionName", "IndexName", "State", "Msg"},
+			rows: [][]any{
+				{"2000", "patients", "p_old", "idx_mrn", "CANCELLED", "stale cancelled partition"},
+				{"2001", "patients", "p1", "idx_mrn", p1State, "partition 1 status"},
+				{"2002", "patients", "p2", "idx_mrn", "FINISHED", ""},
+			},
+		}, nil
+	}
+	return p.mockQuerier.QueryRowsContext(ctx, query, args...)
+}
+
+type mutatingSnapshotFS struct {
+	mu       sync.Mutex
+	files    map[string][]byte
+	opens    map[string]int
+	mutateFn func(name string, openCount int, cur []byte) []byte
+}
+
+func (m *mutatingSnapshotFS) Open(name string) (fs.File, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.opens == nil {
+		m.opens = make(map[string]int)
+	}
+	m.opens[name]++
+	cnt := m.opens[name]
+	mapFS := make(fstest.MapFS, len(m.files))
+	for k, v := range m.files {
+		mapFS[k] = &fstest.MapFile{Data: append([]byte(nil), v...)}
+	}
+	if m.mutateFn != nil && name != "." {
+		if cur, ok := m.files[name]; ok {
+			m.files[name] = m.mutateFn(name, cnt, cur)
+		}
+	}
+	return mapFS.Open(name)
+}
+
+func (m *mutatingSnapshotFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	m.mu.Lock()
+	mapFS := make(fstest.MapFS, len(m.files))
+	for k, v := range m.files {
+		mapFS[k] = &fstest.MapFile{Data: append([]byte(nil), v...)}
+	}
+	m.mu.Unlock()
+	return fs.ReadDir(mapFS, name)
+}
+
+func TestCodeRabbitPR7_MigrateAndDirFixes(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("multi_partition_distinct_job_ids", func(t *testing.T) {
+		mfs := buildTestMigrationFS(t, map[string]string{
+			"20261115000000_build.sql": strings.Join([]string{
+				"CREATE TABLE internal.tenant_duke.patients (id VARCHAR(64) NOT NULL, mrn VARCHAR(32), INDEX idx_mrn (mrn) USING INVERTED) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;",
+				"BUILD INDEX idx_mrn ON internal.tenant_duke.patients;",
+			}, "\n"),
+		})
+
+		// p_old (2000) is stale CANCELLED (filtered by baselineJobID=2000),
+		// p1 (2001) is RUNNING then FINISHED, p2 (2002, higher JobId) is FINISHED.
+		qWait := &pr7CustomQuerier{
+			mockQuerier:    &mockQuerier{},
+			failOnBaseline: true,
+		}
+		execWait := migrate.NewExecutorWithQuerier(qWait, "internal.tenant_duke", migrate.WithPollConfig(2*time.Millisecond, time.Second))
+		if _, err := execWait.Apply(ctx, migrate.ApplyOptions{FS: mfs}); err != nil {
+			t.Fatalf("expected multi-partition distinct JobIds to wait for p1 and succeed, got %v", err)
+		}
+		if qWait.multiPartPolls < 2 {
+			t.Errorf("expected at least 2 post-submit SHOW polls while p1=2001 RUNNING and p2=2002 FINISHED, got %d", qWait.multiPartPolls)
+		}
+
+		// p1 (2001) FAILED while p2 (2002, higher JobId) is FINISHED -> must return *AsyncJobFailedError.
+		qFail := &pr7CustomQuerier{
+			mockQuerier:     &mockQuerier{},
+			multiPartFailP1: true,
+		}
+		execFail := migrate.NewExecutorWithQuerier(qFail, "internal.tenant_duke", migrate.WithPollConfig(2*time.Millisecond, time.Second))
+		var afErr *migrate.AsyncJobFailedError
+		if _, err := execFail.Apply(ctx, migrate.ApplyOptions{FS: mfs}); !errors.As(err, &afErr) || afErr.State != "FAILED" {
+			t.Fatalf("expected *AsyncJobFailedError when lower JobId p1=2001 FAILED and p2=2002 FINISHED, got %v", err)
+		}
+	})
+
+	t.Run("dsn_raw_at_password_no_leak", func(t *testing.T) {
+		dsn, db, err := migrate.ParseDorisDSN("doris://admin:p@ss@w0rd@doris-fe.internal:9030/tenant_duke")
+		if err != nil {
+			t.Fatalf("expected password containing @ to parse cleanly, got %v", err)
+		}
+		if db != "tenant_duke" || !strings.Contains(dsn, "admin:p@ss@w0rd@tcp(doris-fe.internal:9030)/tenant_duke") {
+			t.Errorf("unexpected parsed DSN (%q, %q)", dsn, db)
+		}
+
+		badInputs := []struct {
+			raw     string
+			secrets []string
+		}{
+			{"doris://admin:p@ss@bad host/db", []string{"p@ss", "ss@", "bad host"}},
+			{"doris://admin:p@ss@%zz/db", []string{"p@ss", "ss@", "%zz"}},
+			{"doris://admin:TopSecret123/db", []string{"TopSecret123"}},
+			{"postgres://admin:p@ss@w0rd@localhost/db", []string{"p@ss@w0rd", "w0rd"}},
+			{"doris://admin:p@ss@w0rd@/db", []string{"p@ss@w0rd", "w0rd"}},
+		}
+		for _, tc := range badInputs {
+			_, _, err := migrate.ParseDorisDSN(tc.raw)
+			if err == nil {
+				t.Fatalf("expected error for malformed/unsupported URL")
+			}
+			for _, sec := range tc.secrets {
+				if strings.Contains(err.Error(), sec) {
+					t.Errorf("ParseDorisDSN error leaked secret/fragment %q in: %v", sec, err)
+				}
+			}
+		}
+	})
+
+	t.Run("apply_preflight_stored_version_length", func(t *testing.T) {
+		longScope := "svc_" + strings.Repeat("s", 90)
+		longVer := "20261115000001" + strings.Repeat("x", 156) // 170 chars + 94 char scope + ":" = 265 > 255 bytes (while filename < 255)
+		mfs := buildTestMigrationFS(t, map[string]string{
+			"20261115000000_ok.sql": "CREATE TABLE internal.tenant_duke.a (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;\n",
+			longVer + "_long.sql":   "CREATE TABLE internal.tenant_duke.b (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;\n",
+		})
+		q := &mockQuerier{}
+		exec := migrate.NewExecutorWithQuerier(q, "internal.tenant_duke", migrate.WithChainScope(longScope))
+		if _, err := exec.Apply(ctx, migrate.ApplyOptions{FS: mfs}); err == nil || !strings.Contains(err.Error(), "exceeds maximum length") {
+			t.Fatalf("expected preflight max length error, got %v", err)
+		}
+		if len(q.execLog) != 0 {
+			t.Fatalf("expected zero SQL statements executed on preflight failure, got %v", q.execLog)
+		}
+
+		// Also rejects when version would be recorded via --baseline
+		if _, err := exec.Apply(ctx, migrate.ApplyOptions{FS: mfs, BaselineVersion: longVer}); err == nil || !strings.Contains(err.Error(), "exceeds maximum length") {
+			t.Fatalf("expected preflight max length error with BaselineVersion, got %v", err)
+		}
+		if len(q.execLog) != 0 {
+			t.Fatalf("expected zero SQL statements executed on baseline preflight failure, got %v", q.execLog)
+		}
+	})
+
+	t.Run("one_part_table_resolves_select_database_before_fallback", func(t *testing.T) {
+		mfs := buildTestMigrationFS(t, map[string]string{
+			"20261115000000_onepart.sql": strings.Join([]string{
+				"CREATE TABLE patients (id VARCHAR(64) NOT NULL, mrn VARCHAR(32), INDEX idx_mrn (mrn) USING INVERTED) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;",
+				"BUILD INDEX idx_mrn ON patients;",
+				"ALTER TABLE patients ADD COLUMN x INT;",
+			}, "\n"),
+		})
+
+		qLive := &pr7CustomQuerier{mockQuerier: &mockQuerier{}, activeDB: "tenant_live"}
+		if _, err := migrate.NewExecutorWithQuerier(qLive, "internal.tenant_revisions").Apply(ctx, migrate.ApplyOptions{FS: mfs}); err != nil {
+			t.Fatalf("Apply with SELECT DATABASE()=tenant_live failed: %v", err)
+		}
+		joinedLive := strings.Join(qLive.queryLog, "\n")
+		if !strings.Contains(joinedLive, "SHOW BUILD INDEX FROM `tenant_live` WHERE TableName = 'patients';") ||
+			!strings.Contains(joinedLive, "SHOW ALTER TABLE COLUMN FROM `tenant_live` WHERE TableName = 'patients';") {
+			t.Errorf("expected SELECT DATABASE() active DB used for 1-part SHOW queries, got:\n%s", joinedLive)
+		}
+
+		qErrFallback := &pr7CustomQuerier{mockQuerier: &mockQuerier{}, activeDBErr: errors.New("unsupported SELECT DATABASE()")}
+		if _, err := migrate.NewExecutorWithQuerier(qErrFallback, "internal.tenant_fallback").Apply(ctx, migrate.ApplyOptions{FS: mfs}); err != nil {
+			t.Fatalf("Apply with SELECT DATABASE() error fallback failed: %v", err)
+		}
+		joinedFB := strings.Join(qErrFallback.queryLog, "\n")
+		if !strings.Contains(joinedFB, "SHOW BUILD INDEX FROM `tenant_fallback` WHERE TableName = 'patients';") ||
+			!strings.Contains(joinedFB, "SHOW ALTER TABLE COLUMN FROM `internal`.`tenant_fallback` WHERE TableName = 'patients';") {
+			t.Errorf("expected fallback to revisionsSchema when SELECT DATABASE() errors, got:\n%s", joinedFB)
+		}
+	})
+
+	t.Run("dir_rejects_atlas_sum_ignore_and_missing_checksum", func(t *testing.T) {
+		validFS := buildTestMigrationFS(t, map[string]string{
+			"20261115000000_a.sql": "CREATE TABLE internal.t.a (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;\n",
+		})
+		// Replace atlas.sum with ignore-commented sum (even if valid header prefix present)
+		ignoredFS := fstest.MapFS{
+			"20261115000000_a.sql": validFS["20261115000000_a.sql"],
+			"atlas.sum":            &fstest.MapFile{Data: append(append([]byte(nil), validFS["atlas.sum"].Data...), []byte("# atlas:sum ignore\n")...)},
+		}
+		if _, err := migrate.VerifySumFS(ignoredFS); err == nil {
+			t.Errorf("expected VerifySumFS to reject atlas:sum ignore directive")
+		}
+		if err := migrate.ValidateFS(ignoredFS, doris.LintOptions{}); err == nil {
+			t.Errorf("expected ValidateFS to reject atlas:sum ignore directive")
+		}
+		qIgn := &mockQuerier{}
+		if _, err := migrate.NewExecutorWithQuerier(qIgn, "internal.t").Apply(ctx, migrate.ApplyOptions{FS: ignoredFS}); err == nil {
+			t.Errorf("expected Apply to reject atlas:sum ignore directive")
+		}
+
+		// File omitted from valid atlas.sum computed on a single-file dir
+		unhashedFS := fstest.MapFS{
+			"20261115000000_a.sql": validFS["20261115000000_a.sql"],
+			"20261115000001_b.sql": &fstest.MapFile{Data: []byte("CREATE TABLE internal.t.b (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;\n")},
+			"atlas.sum":            validFS["atlas.sum"],
+		}
+		if _, err := migrate.VerifySumFS(unhashedFS); err == nil {
+			t.Errorf("expected VerifySumFS to reject unhashed migration file")
+		}
+		if err := migrate.ValidateFS(unhashedFS, doris.LintOptions{}); err == nil {
+			t.Errorf("expected ValidateFS to reject unhashed migration file")
+		}
+		if _, err := migrate.NewExecutorWithQuerier(&mockQuerier{}, "internal.t").Apply(ctx, migrate.ApplyOptions{FS: unhashedFS}); err == nil {
+			t.Errorf("expected Apply to reject unhashed migration file")
+		}
+	})
+
+	t.Run("dir_rejects_duplicate_versions", func(t *testing.T) {
+		dupFS := buildTestMigrationFS(t, map[string]string{
+			"20261115000000_a.sql": "CREATE TABLE internal.t.a (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;\n",
+			"20261115000000_b.sql": "CREATE TABLE internal.t.b (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;\n",
+		})
+		if err := migrate.ValidateFS(dupFS, doris.LintOptions{}); err == nil || !strings.Contains(err.Error(), "duplicate migration version") {
+			t.Errorf("expected ValidateFS to reject duplicate migration version, got %v", err)
+		}
+		if _, _, err := migrate.ReplayFS(dupFS); err == nil || !strings.Contains(err.Error(), "duplicate migration version") {
+			t.Errorf("expected ReplayFS to reject duplicate migration version, got %v", err)
+		}
+		if _, err := migrate.LintFS(dupFS, nil, doris.LintOptions{}); err == nil || !strings.Contains(err.Error(), "duplicate migration version") {
+			t.Errorf("expected LintFS to reject duplicate migration version, got %v", err)
+		}
+		q := &mockQuerier{}
+		if _, err := migrate.NewExecutorWithQuerier(q, "internal.t").Apply(ctx, migrate.ApplyOptions{FS: dupFS}); err == nil || !strings.Contains(err.Error(), "duplicate migration version") {
+			t.Fatalf("expected Apply to reject duplicate migration version before execution, got %v", err)
+		}
+		if len(q.execLog) != 0 {
+			t.Fatalf("expected zero SQL executed on duplicate version error, got %v", q.execLog)
+		}
+	})
+
+	t.Run("dir_single_snapshot_eliminates_toctou", func(t *testing.T) {
+		baseFS := buildTestMigrationFS(t, map[string]string{
+			"20261115000000_init.sql": "CREATE TABLE internal.tenant_duke.a (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;\n",
+		})
+		mutFS := &mutatingSnapshotFS{
+			files: map[string][]byte{
+				"20261115000000_init.sql": baseFS["20261115000000_init.sql"].Data,
+				"atlas.sum":               baseFS["atlas.sum"].Data,
+			},
+			mutateFn: func(name string, openCount int, cur []byte) []byte {
+				// If ValidateFS/Apply reads the SQL file more than once, inject unapproved destructive DDL!
+				if name == "20261115000000_init.sql" && openCount == 1 {
+					return []byte("DROP TABLE internal.tenant_duke.a;\n")
+				}
+				return cur
+			},
+		}
+
+		q := &mockQuerier{}
+		res, err := migrate.NewExecutorWithQuerier(q, "internal.tenant_duke").Apply(ctx, migrate.ApplyOptions{FS: mutFS})
+		if err != nil {
+			t.Fatalf("expected Apply to use single in-memory snapshot unaffected by post-read TOCTOU mutation, got %v", err)
+		}
+		if len(res.AppliedFiles) != 1 || res.AppliedFiles[0] != "20261115000000_init.sql" {
+			t.Errorf("unexpected AppliedFiles: %+v", res)
+		}
+		for _, sqlStmt := range q.execLog {
+			if strings.Contains(sqlStmt, "DROP TABLE") {
+				t.Fatalf("TOCTOU payload leaked into executed SQL: %s", sqlStmt)
+			}
+		}
+		if got := mutFS.opens["20261115000000_init.sql"]; got != 1 {
+			t.Errorf("expected migration file opened exactly once into snapshot, got %d opens", got)
+		}
+		if got := mutFS.opens["atlas.sum"]; got != 1 {
+			t.Errorf("expected atlas.sum opened exactly once into snapshot, got %d opens", got)
+		}
+	})
 }

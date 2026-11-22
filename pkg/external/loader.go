@@ -247,6 +247,7 @@ func LoadFromPath(localPath string, target TargetFilter) (*doris.Schema, error) 
 
 	merged := doris.NewSchema()
 	loadedSubdir := false
+	matchedRootFile := false
 	var filteredFiles []string
 	var allFiles []string
 
@@ -277,6 +278,7 @@ func LoadFromPath(localPath string, target TargetFilter) (*doris.Schema, error) 
 		}
 		allFiles = append(allFiles, p)
 		if matchesTargetFilter(name, target) {
+			matchedRootFile = true
 			filteredFiles = append(filteredFiles, p)
 		}
 		return nil
@@ -286,7 +288,7 @@ func LoadFromPath(localPath string, target TargetFilter) (*doris.Schema, error) 
 	}
 
 	schemaFiles := filteredFiles
-	if len(schemaFiles) == 0 && len(allFiles) > 0 && !loadedSubdir {
+	if !matchedRootFile && len(allFiles) > 0 {
 		// Fall back to parsing all .sql/.hcl files and relying on FilterSchemaByTarget
 		// when filenames in an explicit directory do not carry _doris/_iceberg suffixes.
 		schemaFiles = allFiles

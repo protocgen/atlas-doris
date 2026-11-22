@@ -767,11 +767,11 @@ func applySchemaDialectHint(s *Schema, dialect string) {
 func normalizeTableLookupKey(raw string) string {
 	full, cat, db, short := splitQualifiedName(raw)
 	if short == "" {
-		return normalizeLookupKeyPart(full)
+		return strings.TrimSpace(full)
 	}
 	cat = normalizeLookupKeyPart(cat)
 	db = normalizeLookupKeyPart(db)
-	short = normalizeLookupKeyPart(short)
+	short = strings.TrimSpace(short)
 	if !isDefaultDorisCatalog(cat) && db != "" {
 		return cat + "." + db + "." + short
 	}

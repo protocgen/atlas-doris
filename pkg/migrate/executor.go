@@ -328,11 +328,10 @@ func ParseDorisDSN(rawURL string) (dsn string, dbName string, err error) {
 
 	u, err := url.Parse(s)
 	if err != nil {
-		var uErr *url.Error
-		if errors.As(err, &uErr) {
-			return "", "", fmt.Errorf("invalid Doris URL %q: %s: %w", redactRawURL(s), uErr.Op, uErr.Err)
+		if scheme := safeURLScheme(s); scheme != "" {
+			return "", "", fmt.Errorf("invalid %s URL: malformed URL", scheme)
 		}
-		return "", "", fmt.Errorf("invalid Doris URL %q", redactRawURL(s))
+		return "", "", fmt.Errorf("invalid Doris URL: malformed URL")
 	}
 	scheme := strings.ToLower(u.Scheme)
 	if scheme != "doris" && scheme != "mysql" {
@@ -379,17 +378,24 @@ func ParseDorisDSN(rawURL string) (dsn string, dbName string, err error) {
 	return cfg.FormatDSN(), dbName, nil
 }
 
-func redactRawURL(s string) string {
+func safeURLScheme(s string) string {
 	schemeSep := strings.Index(s, "://")
-	if schemeSep < 0 {
-		return "<redacted>"
+	if schemeSep <= 0 {
+		return ""
 	}
-	afterScheme := s[schemeSep+3:]
-	at := strings.IndexByte(afterScheme, '@')
-	if at < 0 {
-		return s
+	scheme := s[:schemeSep]
+	for i := 0; i < len(scheme); i++ {
+		c := scheme[i]
+		isAlpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		isDigit := c >= '0' && c <= '9'
+		if i == 0 && !isAlpha {
+			return ""
+		}
+		if !isAlpha && !isDigit && c != '+' && c != '.' && c != '-' {
+			return ""
+		}
 	}
-	return s[:schemeSep+3] + "***:***" + afterScheme[at:]
+	return scheme
 }
 
 // RevisionsTableQualifiedName returns the qualified name for atlas_schema_revisions.
@@ -523,17 +529,9 @@ func (e *Executor) RecordRevision(ctx context.Context, r RevisionRecord) error {
 	if err := validateChainScope(e.chainScope); err != nil {
 		return err
 	}
-	cleanVer := strings.TrimSpace(r.Version)
-	if cleanVer == "" {
-		return fmt.Errorf("revision version cannot be empty")
-	}
-	if e.chainScope == "" && strings.Contains(cleanVer, ":") {
-		return fmt.Errorf("unscoped revision version %q cannot contain ':'", cleanVer)
-	}
-
-	storedVersion := formatScopedVersion(e.chainScope, cleanVer)
-	if len(storedVersion) > maxStoredVersionLen {
-		return fmt.Errorf("stored revision version %q exceeds maximum length %d", storedVersion, maxStoredVersionLen)
+	storedVersion, err := validateStoredVersion(e.chainScope, r.Version)
+	if err != nil {
+		return err
 	}
 	execAt := r.ExecutedAt
 	if execAt.IsZero() {
@@ -555,7 +553,7 @@ func (e *Executor) RecordRevision(ctx context.Context, r RevisionRecord) error {
 		"INSERT INTO %s (version, description, `type`, applied, total, executed_at, execution_time, error, error_stmt, hash, partial_hashes, operator_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?);",
 		e.RevisionsTableQualifiedName(),
 	)
-	_, err := e.querier.ExecContext(
+	_, err = e.querier.ExecContext(
 		ctx,
 		insertSQL,
 		storedVersion,
@@ -588,16 +586,9 @@ func (e *Executor) DeleteRevision(ctx context.Context, version string) error {
 	if err := validateChainScope(e.chainScope); err != nil {
 		return err
 	}
-	cleanVer := strings.TrimSpace(version)
-	if cleanVer == "" {
-		return fmt.Errorf("revision version cannot be empty")
-	}
-	if e.chainScope == "" && strings.Contains(cleanVer, ":") {
-		return fmt.Errorf("unscoped revision version %q cannot contain ':'", cleanVer)
-	}
-	storedVersion := formatScopedVersion(e.chainScope, cleanVer)
-	if len(storedVersion) > maxStoredVersionLen {
-		return fmt.Errorf("stored revision version %q exceeds maximum length %d", storedVersion, maxStoredVersionLen)
+	storedVersion, err := validateStoredVersion(e.chainScope, version)
+	if err != nil {
+		return err
 	}
 	delSQL := fmt.Sprintf("DELETE FROM %s WHERE version = ?;", e.RevisionsTableQualifiedName())
 	if _, err := e.querier.ExecContext(ctx, delSQL, storedVersion); err != nil {
@@ -744,6 +735,16 @@ func (e *Executor) Apply(ctx context.Context, opts ApplyOptions) (*ApplyResult, 
 	} else {
 		_, files, err = validateAndReplayDir(opts.DirPath, lintOpts)
 		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Preflight all stored revision keys before EnsureRevisionsTable or executing any migration SQL.
+	for _, f := range files {
+		if isEmptyTenantBaseline(f) && (opts.BaselineVersion == "" || f.Version > opts.BaselineVersion) {
+			continue
+		}
+		if _, err := validateStoredVersion(execCfg.chainScope, f.Version); err != nil {
 			return nil, err
 		}
 	}
@@ -1264,18 +1265,51 @@ func statementIndexName(st doris.Statement) string {
 	return ""
 }
 
-func (e *Executor) showQueryForStatement(st doris.Statement) (showPrefix, indexName, query string, err error) {
+func (e *Executor) showQueryForStatement(ctx context.Context, st doris.Statement) (showPrefix, indexName, query string, err error) {
 	if st.Kind == doris.StmtBuildIndex {
 		showPrefix = "SHOW BUILD INDEX"
 	} else {
 		showPrefix = "SHOW ALTER TABLE COLUMN"
 	}
 	indexName = statementIndexName(st)
-	query, err = e.buildShowJobQuery(st.TargetTable, showPrefix)
+	query, err = e.buildShowJobQueryContext(ctx, st.TargetTable, showPrefix)
 	return showPrefix, indexName, query, err
 }
 
-func (e *Executor) buildShowJobQuery(fullTableName, showPrefix string) (string, error) {
+func (e *Executor) resolveActiveDatabase(ctx context.Context) string {
+	if e == nil || e.querier == nil {
+		return ""
+	}
+	rows, err := e.querier.QueryRowsContext(ctx, "SELECT DATABASE();")
+	if err != nil || rows == nil {
+		return ""
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		return ""
+	}
+	var raw sql.RawBytes
+	if err := rows.Scan(&raw); err != nil {
+		return ""
+	}
+	db := strings.TrimSpace(string(raw))
+	if db == "" || db == "<nil>" || strings.EqualFold(db, "NULL") {
+		return ""
+	}
+	parts := strings.Split(db, ".")
+	if len(parts) == 0 || len(parts) > 2 {
+		return ""
+	}
+	for i := range parts {
+		parts[i] = strings.Trim(strings.TrimSpace(parts[i]), "`")
+		if parts[i] == "" || !isSafeQualifiedIdentifier(parts[i]) {
+			return ""
+		}
+	}
+	return strings.Join(parts, ".")
+}
+
+func (e *Executor) buildShowJobQueryContext(ctx context.Context, fullTableName, showPrefix string) (string, error) {
 	rawParts := strings.Split(fullTableName, ".")
 	if len(rawParts) == 0 || len(rawParts) > 3 {
 		return "", fmt.Errorf("invalid target table %q", fullTableName)
@@ -1295,11 +1329,17 @@ func (e *Executor) buildShowJobQuery(fullTableName, showPrefix string) (string, 
 		var dbName string
 		if len(cleanParts) >= 2 {
 			dbName = cleanParts[len(cleanParts)-2]
-		} else if e != nil && e.revisionsSchema != "" {
-			revParts := strings.Split(e.revisionsSchema, ".")
-			dbName = strings.Trim(strings.TrimSpace(revParts[len(revParts)-1]), "`")
-			if dbName != "" && !isSafeQualifiedIdentifier(dbName) {
-				return "", fmt.Errorf("invalid revisions schema segment %q", dbName)
+		} else {
+			dbSource := e.resolveActiveDatabase(ctx)
+			if dbSource == "" && e != nil {
+				dbSource = e.revisionsSchema
+			}
+			if dbSource != "" {
+				revParts := strings.Split(dbSource, ".")
+				dbName = strings.Trim(strings.TrimSpace(revParts[len(revParts)-1]), "`")
+				if dbName != "" && !isSafeQualifiedIdentifier(dbName) {
+					return "", fmt.Errorf("invalid revisions schema segment %q", dbName)
+				}
 			}
 		}
 		if dbName != "" {
@@ -1312,8 +1352,12 @@ func (e *Executor) buildShowJobQuery(fullTableName, showPrefix string) (string, 
 		case 2:
 			dbPrefix = " FROM `" + cleanParts[0] + "`"
 		default:
-			if e != nil && e.revisionsSchema != "" {
-				revParts := strings.Split(e.revisionsSchema, ".")
+			dbSource := e.resolveActiveDatabase(ctx)
+			if dbSource == "" && e != nil {
+				dbSource = e.revisionsSchema
+			}
+			if dbSource != "" {
+				revParts := strings.Split(dbSource, ".")
 				quoted := make([]string, 0, len(revParts))
 				for _, rp := range revParts {
 					cleanRP := strings.Trim(strings.TrimSpace(rp), "`")
@@ -1335,7 +1379,7 @@ func (e *Executor) snapshotStatementBaselineJobID(ctx context.Context, st doris.
 	if e == nil || e.querier == nil {
 		return 0, nil
 	}
-	showPrefix, indexName, query, err := e.showQueryForStatement(st)
+	showPrefix, indexName, query, err := e.showQueryForStatement(ctx, st)
 	if err != nil {
 		return 0, err
 	}
@@ -1360,7 +1404,7 @@ func (e *Executor) waitForAsyncDorisJob(ctx context.Context, fullTableName, inde
 	if e == nil || e.querier == nil {
 		return nil
 	}
-	query, err := e.buildShowJobQuery(fullTableName, showPrefix)
+	query, err := e.buildShowJobQueryContext(ctx, fullTableName, showPrefix)
 	if err != nil {
 		return err
 	}
@@ -1504,6 +1548,21 @@ func validateChainScope(scope string) error {
 		return fmt.Errorf("invalid chain scope %q: must match ^[A-Za-z0-9._-]+$", scope)
 	}
 	return nil
+}
+
+func validateStoredVersion(chainScope, version string) (string, error) {
+	cleanVer := strings.TrimSpace(version)
+	if cleanVer == "" {
+		return "", fmt.Errorf("revision version cannot be empty")
+	}
+	if chainScope == "" && strings.Contains(cleanVer, ":") {
+		return "", fmt.Errorf("unscoped revision version %q cannot contain ':'", cleanVer)
+	}
+	storedVersion := formatScopedVersion(chainScope, cleanVer)
+	if len(storedVersion) > maxStoredVersionLen {
+		return "", fmt.Errorf("stored revision version %q exceeds maximum length %d", storedVersion, maxStoredVersionLen)
+	}
+	return storedVersion, nil
 }
 
 func formatScopedVersion(scope, version string) string {
@@ -1683,34 +1742,23 @@ func (e *Executor) queryLatestAlterState(ctx context.Context, query, showPrefix,
 		return asyncJobStatus{state: "FINISHED", maxJobID: maxJobID}, nil
 	}
 
-	targetJobID := filteredRows[len(filteredRows)-1].jobID
-	if jobIDIdx >= 0 {
-		var targetNum int64 = -1
-		for _, r := range filteredRows {
-			if r.hasNumericID {
-				if r.parsedJobID >= targetNum {
-					targetNum = r.parsedJobID
-					targetJobID = r.jobID
-				}
-			} else if targetNum < 0 && r.jobID != "" {
-				targetJobID = r.jobID
-			}
-		}
-	}
-
+	// Inspect all matching post-baseline rows across all partitions/jobs so multi-partition
+	// BUILD INDEX jobs with distinct per-partition JobIds never mask an in-progress or failed job.
 	var nonFinishedStatus asyncJobStatus
+	var finishedStatus asyncJobStatus
+	hasFinished := false
 	var latestStatus asyncJobStatus
 	for _, r := range filteredRows {
-		if jobIDIdx >= 0 && targetJobID != "" && r.jobID != targetJobID {
-			continue
-		}
 		st := asyncJobStatus{state: r.state, indexName: r.indexName, msg: r.msg, maxJobID: maxJobID}
 		latestStatus = st
-		upper := strings.ToUpper(r.state)
+		upper := strings.ToUpper(strings.TrimSpace(r.state))
 		switch upper {
 		case "CANCELLED", "CANCELED", "FAILED":
 			return st, nil
 		case "FINISHED":
+			finishedStatus = st
+			hasFinished = true
+		case "":
 		default:
 			if nonFinishedStatus.state == "" {
 				nonFinishedStatus = st
@@ -1719,6 +1767,9 @@ func (e *Executor) queryLatestAlterState(ctx context.Context, query, showPrefix,
 	}
 	if nonFinishedStatus.state != "" {
 		return nonFinishedStatus, nil
+	}
+	if hasFinished {
+		return finishedStatus, nil
 	}
 	return latestStatus, nil
 }

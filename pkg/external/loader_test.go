@@ -765,6 +765,20 @@ CREATE VIEW internal.tenant_a.vw_patients AS SELECT id FROM internal.tenant_a.pa
 			t.Fatalf("expected subdir atlas.sum walk to load 1 table, got tables=%v err=%v", loaded, err)
 		}
 
+		// Neutral root schema.sql alongside a migration subdir must still use neutral fallback
+		if err := os.WriteFile(filepath.Join(root, "schema.sql"), []byte("CREATE TABLE internal.tenant_a.root_doris (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;\nCREATE TABLE azra_lake.tenant_a.root_iceberg (id STRING) ENGINE=iceberg;\n"), 0o644); err != nil {
+			t.Fatalf("write root schema.sql: %v", err)
+		}
+		loadedMixedDoris, err := external.LoadFromPath(root, external.TargetDoris)
+		if err != nil || len(loadedMixedDoris.Tables) != 2 {
+			t.Fatalf("expected subdir + neutral root schema.sql to load 2 Doris tables, got tables=%+v err=%v", loadedMixedDoris, err)
+		}
+		loadedMixedIce, err := external.LoadFromPath(root, external.TargetIceberg)
+		if err != nil || len(loadedMixedIce.Tables) != 1 || loadedMixedIce.Tables[0].Name != "root_iceberg" {
+			t.Fatalf("expected subdir + neutral root schema.sql to load 1 Iceberg table, got tables=%+v err=%v", loadedMixedIce, err)
+		}
+		_ = os.Remove(filepath.Join(root, "schema.sql"))
+
 		// Tampered atlas.sum in subdir must be rejected
 		if err := os.WriteFile(filepath.Join(subA, "20261115000001_init.sql"), []byte("CREATE TABLE internal.tenant_a.tampered (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;\n"), 0o644); err != nil {
 			t.Fatalf("tamper sql: %v", err)

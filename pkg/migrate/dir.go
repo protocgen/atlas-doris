@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"testing/fstest"
 	"time"
 
 	"ariga.io/atlas/sql/migrate"
@@ -106,22 +107,84 @@ func (d fsDir) Checksum() (migrate.HashFile, error) {
 	return migrate.NewHashFile(files)
 }
 
+func snapshotMigrationFS(fsys fs.FS) (fstest.MapFS, error) {
+	if fsys == nil {
+		return nil, fmt.Errorf("nil migration filesystem")
+	}
+	snap := make(fstest.MapFS)
+	if rawSum, err := fs.ReadFile(fsys, migrate.HashFileName); err == nil {
+		snap[migrate.HashFileName] = &fstest.MapFile{Data: rawSum}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("read %s: %w", migrate.HashFileName, err)
+	}
+	names, err := fs.Glob(fsys, "*.sql")
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		if !fs.ValidPath(n) || strings.ContainsAny(n, "/\\") || path.Base(n) != n {
+			return nil, fmt.Errorf("sql/migrate: invalid migration filename %q", n)
+		}
+		b, err := fs.ReadFile(fsys, n)
+		if err != nil {
+			return nil, fmt.Errorf("sql/migrate: read file %q: %w", n, err)
+		}
+		snap[n] = &fstest.MapFile{Data: b}
+	}
+	return snap, nil
+}
+
+func validateUniqueMigrationVersions(files []migrate.File) error {
+	seen := make(map[string]string, len(files))
+	for _, f := range files {
+		ver := strings.TrimSpace(f.Version())
+		if ver == "" {
+			return fmt.Errorf("migration file %s has empty version", f.Name())
+		}
+		if prev, dup := seen[ver]; dup {
+			return fmt.Errorf("duplicate migration version %q in %s and %s", ver, prev, f.Name())
+		}
+		seen[ver] = f.Name()
+	}
+	return nil
+}
+
 // VerifySumFS validates the integrity of an Atlas migration filesystem against its
 // atlas.sum file and returns the canonical "h1:<base64>" directory checksum.
 func VerifySumFS(fsys fs.FS) (string, error) {
-	if fsys == nil {
-		return "", fmt.Errorf("nil migration filesystem")
+	snap, err := snapshotMigrationFS(fsys)
+	if err != nil {
+		return "", err
 	}
-	rawSum, err := fs.ReadFile(fsys, migrate.HashFileName)
+	return verifySumSnapshot(snap)
+}
+
+func verifySumSnapshot(snap fstest.MapFS) (string, error) {
+	rawSum, err := fs.ReadFile(snap, migrate.HashFileName)
 	if err != nil {
 		return "", fmt.Errorf("missing %s: %w", migrate.HashFileName, err)
+	}
+	if strings.Contains(string(rawSum), "atlas:sum ignore") {
+		return "", fmt.Errorf("atlas.sum validation failed: atlas:sum ignore directive is not permitted")
 	}
 	var hf migrate.HashFile
 	if err := hf.UnmarshalText(rawSum); err != nil {
 		return "", fmt.Errorf("invalid %s: %w", migrate.HashFileName, err)
 	}
-	if err := migrate.Validate(fsDir{fsys: fsys}); err != nil {
+	dir := fsDir{fsys: snap}
+	if err := migrate.Validate(dir); err != nil {
 		return "", fmt.Errorf("atlas.sum validation failed: %w", err)
+	}
+	files, err := dir.Files()
+	if err != nil {
+		return "", fmt.Errorf("atlas.sum validation failed: %w", err)
+	}
+	for _, f := range files {
+		h, err := hf.SumByName(f.Name())
+		if err != nil || strings.TrimSpace(h) == "" {
+			return "", fmt.Errorf("atlas.sum validation failed: migration %s is missing a valid checksum", f.Name())
+		}
 	}
 	return "h1:" + hf.Sum(), nil
 }
@@ -154,6 +217,9 @@ func replayAtlasDir(dir migrate.Dir, label string) (*doris.Schema, []MigrationFi
 	if err != nil {
 		return nil, nil, fmt.Errorf("read migration files in %s: %w", label, err)
 	}
+	if err := validateUniqueMigrationVersions(files); err != nil {
+		return nil, nil, err
+	}
 	hf, err := dir.Checksum()
 	if err != nil {
 		return nil, nil, fmt.Errorf("compute checksum in %s: %w", label, err)
@@ -172,17 +238,21 @@ func replayAtlasDir(dir migrate.Dir, label string) (*doris.Schema, []MigrationFi
 				return nil, nil, fmt.Errorf("migration %s statement %d: %w", f.Name(), i+1, err)
 			}
 		}
-		hashVal := ""
-		if hf != nil {
-			if h, err := hf.SumByName(f.Name()); err == nil {
-				hashVal = "h1:" + h
-			}
+		if hf == nil {
+			return nil, nil, fmt.Errorf("migration %s missing valid checksum in %s", f.Name(), migrate.HashFileName)
+		}
+		h, err := hf.SumByName(f.Name())
+		if err != nil {
+			return nil, nil, fmt.Errorf("migration %s missing valid checksum in %s: %w", f.Name(), migrate.HashFileName, err)
+		}
+		if strings.TrimSpace(h) == "" {
+			return nil, nil, fmt.Errorf("migration %s has empty checksum in %s", f.Name(), migrate.HashFileName)
 		}
 		migFiles = append(migFiles, MigrationFile{
 			Name:        f.Name(),
 			Version:     f.Version(),
 			Description: f.Desc(),
-			Hash:        hashVal,
+			Hash:        "h1:" + h,
 			SQL:         rawSQL,
 			Statements:  stmts,
 		})
@@ -222,6 +292,9 @@ func lintAndReplayAtlasDir(dir migrate.Dir, desired *doris.Schema, opts doris.Li
 	files, err := dir.Files()
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("read migration files in %s: %w", label, err)
+	}
+	if err := validateUniqueMigrationVersions(files); err != nil {
+		return nil, nil, nil, err
 	}
 	var hf migrate.HashFile
 	if computeHash {
@@ -311,17 +384,21 @@ func lintAndReplayAtlasDir(dir migrate.Dir, desired *doris.Schema, opts doris.Li
 			violations = append(violations, sv)
 		}
 		if computeHash {
-			hashVal := ""
-			if hf != nil {
-				if h, err := hf.SumByName(f.Name()); err == nil {
-					hashVal = "h1:" + h
-				}
+			if hf == nil {
+				return nil, nil, nil, fmt.Errorf("migration %s missing valid checksum in %s", f.Name(), migrate.HashFileName)
+			}
+			h, err := hf.SumByName(f.Name())
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("migration %s missing valid checksum in %s: %w", f.Name(), migrate.HashFileName, err)
+			}
+			if strings.TrimSpace(h) == "" {
+				return nil, nil, nil, fmt.Errorf("migration %s has empty checksum in %s", f.Name(), migrate.HashFileName)
 			}
 			migFiles = append(migFiles, MigrationFile{
 				Name:        f.Name(),
 				Version:     f.Version(),
 				Description: f.Desc(),
-				Hash:        hashVal,
+				Hash:        "h1:" + h,
 				SQL:         rawSQL,
 				Statements:  stmts,
 			})
@@ -363,10 +440,14 @@ func ValidateFS(fsys fs.FS, opts doris.LintOptions) error {
 }
 
 func validateAndReplayFS(fsys fs.FS, opts doris.LintOptions) (*doris.Schema, []MigrationFile, error) {
-	if _, err := VerifySumFS(fsys); err != nil {
+	snap, err := snapshotMigrationFS(fsys)
+	if err != nil {
 		return nil, nil, err
 	}
-	schema, files, violations, err := lintAndReplayAtlasDir(fsDir{fsys: fsys}, nil, opts, "fs", true)
+	if _, err := verifySumSnapshot(snap); err != nil {
+		return nil, nil, err
+	}
+	schema, files, violations, err := lintAndReplayAtlasDir(fsDir{fsys: snap}, nil, opts, "fs", true)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -408,16 +489,17 @@ func DiffAndWrite(dirPath, migrationName string, desired *doris.Schema, opts Dif
 	if err := os.MkdirAll(cleanPath, 0o755); err != nil {
 		return "", nil, fmt.Errorf("create migration directory %q: %w", cleanPath, err)
 	}
-	fsys := os.DirFS(cleanPath)
-	if _, statErr := fs.Stat(fsys, migrate.HashFileName); statErr == nil {
-		if _, err := VerifySumFS(fsys); err != nil {
+	snap, err := snapshotMigrationFS(os.DirFS(cleanPath))
+	if err != nil {
+		return "", nil, fmt.Errorf("snapshot migration directory %q: %w", cleanPath, err)
+	}
+	if _, hasSum := snap[migrate.HashFileName]; hasSum {
+		if _, err := verifySumSnapshot(snap); err != nil {
 			return "", nil, fmt.Errorf("verify atlas.sum in %q: %w", cleanPath, err)
 		}
-	} else if !errors.Is(statErr, fs.ErrNotExist) {
-		return "", nil, fmt.Errorf("stat %s in %q: %w", migrate.HashFileName, cleanPath, statErr)
 	}
 
-	current, existingFiles, err := ReplayDir(cleanPath)
+	current, existingFiles, err := ReplayFS(snap)
 	if err != nil {
 		return "", nil, err
 	}

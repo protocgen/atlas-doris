@@ -1804,3 +1804,93 @@ CREATE TABLE internal.tenant_duke.patients (
 		}
 	})
 }
+
+func TestStage1B_ParserAstFormatDiffLintFixes(t *testing.T) {
+	t.Run("strip_comments_and_split_statements_hardening", func(t *testing.T) {
+		if _, err := doris.StripCommentsAndSplitStatements("/*!40101 DROP TABLE x */;"); err == nil {
+			t.Errorf("expected /*! conditional comment to be rejected")
+		}
+		if _, err := doris.StripCommentsAndSplitStatements("CREATE TABLE t (`col` INT) /* unterminated;"); err == nil {
+			t.Errorf("expected unterminated /* comment to be rejected")
+		}
+		stmts, err := doris.StripCommentsAndSplitStatements("SELECT `a``b` FROM t # hash comment\n; CREATE TABLE t2 (id INT);")
+		if err != nil || len(stmts) != 2 || !strings.Contains(stmts[0], "`a``b`") {
+			t.Fatalf("expected # comment + doubled backticks to split cleanly into 2 statements, got (%v, %v)", stmts, err)
+		}
+	})
+
+	t.Run("ast_lookup_key_case_and_decimal_semantic", func(t *testing.T) {
+		if !doris.TypesSemanticallyEqual("DECIMAL(10)", "DECIMALV3(10, 0)") {
+			t.Errorf("expected DECIMAL(10) and DECIMALV3(10, 0) to be semantically equal")
+		}
+		if doris.CanonicalSemanticType("DECIMAL(10)") != "DECIMALV3(10, 0)" {
+			t.Errorf("expected CanonicalSemanticType(DECIMAL(10)) = DECIMALV3(10, 0), got %q", doris.CanonicalSemanticType("DECIMAL(10)"))
+		}
+
+		s1, err := doris.ParseSchema("CREATE DATABASE Internal.TENANT_${TENANT_SLUG};\nCREATE TABLE Internal.TENANT_${TENANT_SLUG}.Patients (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;")
+		if err != nil {
+			t.Fatalf("ParseSchema failed: %v", err)
+		}
+		if _, ok := s1.TableByName("internal.tenant_${TENANT_SLUG}.patients"); !ok {
+			t.Errorf("expected case-insensitive TableByName lookup while preserving ${TENANT_SLUG}")
+		}
+		if len(s1.Databases) != 1 || s1.Databases[0].LookupKey() != "tenant_${TENANT_SLUG}" {
+			t.Errorf("expected DatabaseDef.LookupKey()='tenant_${TENANT_SLUG}', got %q", s1.Databases[0].LookupKey())
+		}
+	})
+
+	t.Run("pair_table_indexes_claimed_name_and_comment", func(t *testing.T) {
+		before, err := doris.ParseSchema(`
+CREATE TABLE internal.db.t (
+    id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(64) NOT NULL DEFAULT "",
+    INDEX idx_a (mrn) USING INVERTED,
+    INDEX idx_b (mrn) USING INVERTED COMMENT 'old'
+) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;`)
+		if err != nil {
+			t.Fatalf("ParseSchema(before): %v", err)
+		}
+		after, err := doris.ParseSchema(`
+CREATE TABLE internal.db.t (
+    id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(64) NOT NULL DEFAULT "",
+    INDEX idx_renamed (mrn) USING INVERTED,
+    INDEX idx_b (mrn) USING INVERTED COMMENT 'new'
+) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;`)
+		if err != nil {
+			t.Fatalf("ParseSchema(after): %v", err)
+		}
+		stmts, err := doris.Diff(before, after)
+		if err != nil {
+			t.Fatalf("Diff: %v", err)
+		}
+		sqlOut := doris.FormatStatements(stmts)
+		// idx_b is claimed by desired idx_b (different comment), so idx_renamed pairs with idx_a,
+		// while idx_b is dropped + re-added with the new comment instead of wrongly stealing idx_a!
+		if !strings.Contains(sqlOut, "DROP INDEX idx_b") || !strings.Contains(sqlOut, "ADD INDEX idx_b") {
+			t.Errorf("expected comment change on claimed idx_b to drop+add idx_b cleanly:\n%s", sqlOut)
+		}
+		if strings.Contains(sqlOut, "DROP INDEX idx_a") {
+			t.Errorf("expected idx_renamed to pair with unclaimed idx_a:\n%s", sqlOut)
+		}
+	})
+
+	t.Run("recursive_iceberg_varchar_string_compatible", func(t *testing.T) {
+		if !doris.IsIcebergVarcharStringCompatible("VARCHAR(64)", "TEXT") ||
+			!doris.IsIcebergVarcharStringCompatible("MAP<VARCHAR(32), ARRAY<VARCHAR(64)>>", "MAP<STRING, ARRAY<STRING>>") ||
+			!doris.IsIcebergVarcharStringCompatible("STRUCT<a:VARCHAR(32), b:INT>", "STRUCT<a:STRING, b:INT>") ||
+			doris.IsIcebergVarcharStringCompatible("STRUCT<a:VARCHAR(32), b:INT>", "STRUCT<c:STRING, b:INT>") ||
+			doris.IsIcebergVarcharStringCompatible("INT", "STRING") {
+			t.Errorf("unexpected IsIcebergVarcharStringCompatible results")
+		}
+
+		ice1, _ := doris.ParseSchema("CREATE TABLE azra_lake.db.t (s VARCHAR(64), m MAP<VARCHAR(32), ARRAY<VARCHAR(64)>>) ENGINE=iceberg;")
+		ice2, _ := doris.ParseSchema("CREATE TABLE azra_lake.db.t (s STRING, m MAP<STRING, ARRAY<STRING>>) ENGINE=iceberg;")
+		if vs := doris.LintSchemaEvolution(ice1, ice2, doris.LintOptions{}); len(vs) != 0 {
+			t.Errorf("expected 0 lint violations for Iceberg nested VARCHAR<->STRING: %v", vs)
+		}
+		if stmts, err := doris.Diff(ice1, ice2); err != nil || len(stmts) != 0 {
+			t.Errorf("expected 0 diff stmts for Iceberg nested VARCHAR<->STRING: stmts=%d err=%v", len(stmts), err)
+		}
+	})
+}

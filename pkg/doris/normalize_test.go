@@ -299,3 +299,138 @@ GROUP BY patient_id;`
 		t.Errorf("expected ALTER TABLE IF EXISTS with backticks and parens to widen:\n%s", got)
 	}
 }
+
+func TestStage1B_NormalizeSecurityAndEdgeCases(t *testing.T) {
+	t.Run("validate_tenant_chain_security_hardening", func(t *testing.T) {
+		seenTables := map[string]bool{"patients": true}
+		seenViews := map[string]bool{"vw_patients": true}
+		var ownedTables = []string{"patients"}
+
+		badCases := []struct {
+			name string
+			stmt string
+		}{
+			{"mysql_conditional_comment", "/*!40101 GRANT ALL ON *.* TO root */;"},
+			{"trailing_conditional_comment", "CREATE TABLE internal.tenant_${TENANT_SLUG}.t (id INT); /*!50000 DROP DATABASE x */"},
+			{"unterminated_block_comment", "CREATE TABLE internal.tenant_${TENANT_SLUG}.t (id INT) /* open"},
+			{"unterminated_single_quote", "INSERT INTO internal.tenant_${TENANT_SLUG}.patients VALUES ('abc);"},
+			{"unterminated_double_quote", `INSERT INTO internal.tenant_${TENANT_SLUG}.patients VALUES ("abc);`},
+			{"unterminated_backtick", "CREATE TABLE internal.tenant_${TENANT_SLUG}.`bad (id INT);"},
+			{"multi_statement_smuggling", "CREATE TABLE internal.tenant_${TENANT_SLUG}.t (id INT); DROP DATABASE other_db;"},
+			{"double_semicolon", "CREATE TABLE internal.tenant_${TENANT_SLUG}.t (id INT);;"},
+			{"alter_table_rename", "ALTER TABLE internal.tenant_${TENANT_SLUG}.patients RENAME other_patients;"},
+			{"alter_table_replace_with_table", "ALTER TABLE internal.tenant_${TENANT_SLUG}.patients REPLACE WITH TABLE internal.tenant_${TENANT_SLUG}.patients;"},
+			{"two_part_after_from", "CREATE VIEW internal.tenant_${TENANT_SLUG}.v AS SELECT id FROM other_db.secret;"},
+			{"two_part_after_join", "CREATE VIEW internal.tenant_${TENANT_SLUG}.v AS SELECT p.id FROM internal.tenant_${TENANT_SLUG}.patients p JOIN other_db.secret s ON p.id = s.id;"},
+			{"two_part_after_into", "INSERT INTO other_db.secret SELECT id FROM internal.tenant_${TENANT_SLUG}.patients;"},
+			{"two_part_after_like", "CREATE TABLE internal.tenant_${TENANT_SLUG}.c LIKE other_db.secret;"},
+			{"two_part_after_using", "DELETE FROM internal.tenant_${TENANT_SLUG}.patients USING other_db.secret;"},
+			{"two_part_comma_from_list", "CREATE VIEW internal.tenant_${TENANT_SLUG}.v AS SELECT p.id FROM internal.tenant_${TENANT_SLUG}.patients p, other_db.secret s;"},
+			{"external_tvf_s3", `INSERT INTO internal.tenant_${TENANT_SLUG}.patients SELECT * FROM s3("uri" = "s3://bucket/k");`},
+			{"external_tvf_hdfs", `CREATE VIEW internal.tenant_${TENANT_SLUG}.v AS SELECT * FROM HDFS("uri" = "hdfs://x");`},
+			{"external_tvf_local", `CREATE VIEW internal.tenant_${TENANT_SLUG}.v AS SELECT * FROM local("file_path" = "/etc/passwd");`},
+			{"external_tvf_http_stream", `CREATE VIEW internal.tenant_${TENANT_SLUG}.v AS SELECT * FROM http_stream("format" = "csv");`},
+			{"backticked_other_tenant", "CREATE VIEW internal.tenant_${TENANT_SLUG}.v AS SELECT id FROM internal.`tenant-other`.patients;"},
+			{"non_tenant_slug_placeholder", "CREATE VIEW internal.tenant_${TENANT_SLUG}.v AS SELECT id FROM internal.${OTHER}.patients;"},
+			{"four_part_ref", "CREATE VIEW internal.tenant_${TENANT_SLUG}.v AS SELECT id FROM foo.internal.tenant_${TENANT_SLUG}.patients;"},
+		}
+
+		for _, tc := range badCases {
+			t.Run(tc.name, func(t *testing.T) {
+				beforeTables := len(seenTables)
+				beforeViews := len(seenViews)
+				beforeOwned := len(ownedTables)
+				if err := doris.ValidateTenantChainStatement(tc.stmt, seenTables, seenViews, &ownedTables); err == nil {
+					t.Errorf("expected ValidateTenantChainStatement to reject %q", tc.stmt)
+				}
+				if len(seenTables) != beforeTables || len(seenViews) != beforeViews || len(ownedTables) != beforeOwned {
+					t.Errorf("failed statement %s mutated tracking state (tables %d->%d, views %d->%d, owned %d->%d)",
+						tc.name, beforeTables, len(seenTables), beforeViews, len(seenViews), beforeOwned, len(ownedTables))
+				}
+			})
+		}
+
+		// Valid trailing semicolon + comment, backticked column rename name, and 2-part alias.col must pass
+		for _, goodStmt := range []string{
+			"CREATE TABLE internal.tenant_${TENANT_SLUG}.new_tbl (id VARCHAR(64), `rename` INT); -- trailing comment\n",
+			"CREATE VIEW internal.tenant_${TENANT_SLUG}.vw_alias AS SELECT p.id, v.id FROM internal.tenant_${TENANT_SLUG}.patients p JOIN internal.tenant_${TENANT_SLUG}.vw_patients v ON p.id = v.id WHERE p.id = 'ok;semi';",
+		} {
+			if err := doris.ValidateTenantChainStatement(goodStmt, seenTables, seenViews, &ownedTables); err != nil {
+				t.Errorf("expected valid statement to succeed: %q\nerr=%v", goodStmt, err)
+			}
+		}
+	})
+
+	t.Run("coupled_err_unicode_safe", func(t *testing.T) {
+		// Turkish uppercase İ expands byte length under strings.ToLower
+		unicodeErr := errors.New("İİİİ Unknown properties: {storage_vault_name=v1}")
+		if !doris.IsCoupledModeUnknownPropertiesErr(unicodeErr) {
+			t.Errorf("expected Unicode-prefixed Unknown properties error to match safely")
+		}
+		badUnicodeErr := errors.New("KK Unknown properties: {other_prop=1}")
+		if doris.IsCoupledModeUnknownPropertiesErr(badUnicodeErr) {
+			t.Errorf("expected non-coupled property with Unicode prefix to return false")
+		}
+	})
+
+	t.Run("strip_coupled_comments_preserved", func(t *testing.T) {
+		commentBeforeProps := "CREATE TABLE internal.tenant_a.t (\n    id INT\n) -- trailing comment\nPROPERTIES (\n    \"storage_vault_name\" = \"v1\"\n);"
+		got := doris.StripCoupledModeCreateTableProperties(commentBeforeProps)
+		if !strings.Contains(got, "-- trailing comment\n;") {
+			t.Errorf("expected newline after line comment before semicolon to be preserved:\n%s", got)
+		}
+
+		commentBeforeComma := "CREATE TABLE internal.tenant_a.t (\n    id INT\n)\nPROPERTIES (\n    \"replication_num\" = \"1\" -- keep comment\n    , \"storage_vault_name\" = \"v1\",\n    \"enable_unique_key_merge_on_write\" = \"true\"\n);"
+		gotComma := doris.StripCoupledModeCreateTableProperties(commentBeforeComma)
+		if !strings.Contains(gotComma, "-- keep comment\n    , ") {
+			t.Errorf("expected comma after line comment not to be swallowed into comment:\n%s", gotComma)
+		}
+	})
+
+	t.Run("iceberg_struct_map_and_if_not_exists", func(t *testing.T) {
+		ddl := "CREATE TABLE azra_lake.tenant_a.t (id BIGINT, payload STRUCT<smallint:INT, cnt:SMALLINT(6), m:MAP<STRING, TINYINT>>, tags ARRAY<TINYINT(1)>);"
+		got := doris.NormalizeIcebergCatalogDDL(ddl, "azra_lake")
+		wantSubstrs := []string{
+			"smallint:INT",
+			"cnt:INT",
+			"m:MAP<STRING, INT>",
+			"ARRAY<INT>",
+		}
+		for _, w := range wantSubstrs {
+			if !strings.Contains(got, w) {
+				t.Errorf("expected %q in normalized Iceberg DDL:\n%s", w, got)
+			}
+		}
+
+		alter := "ALTER TABLE azra_lake.tenant_a.t ADD COLUMN IF NOT EXISTS flag TINYINT(1), MODIFY COLUMN cnt SMALLINT;"
+		gotAlter := doris.NormalizeIcebergCatalogDDL(alter, "")
+		if !strings.Contains(gotAlter, "flag INT") || !strings.Contains(gotAlter, "cnt INT") {
+			t.Errorf("expected ADD COLUMN IF NOT EXISTS and MODIFY COLUMN to widen:\n%s", gotAlter)
+		}
+	})
+
+	t.Run("nereids_comparison_operators_and_depth_cap", func(t *testing.T) {
+		cmpView := "CREATE VIEW internal.db.v AS SELECT MAX_BY(v, CASE WHEN a < b AND c > d THEN STRUCT(ts, id) ELSE NULL END) FROM internal.db.t;"
+		gotCmp := doris.NormalizeNereidsViewOrderKeys(cmpView)
+		if !strings.Contains(gotCmp, "a < b AND c > d") || !strings.Contains(gotCmp, "CONCAT_WS(CHAR(1)") {
+			t.Errorf("expected comparison operators inside MAX_BY not to break splitting:\n%s", gotCmp)
+		}
+
+		// Deep nesting > depth cap (4) stays bounded cleanly
+		deep := "STRUCT(a, STRUCT(b, STRUCT(c, STRUCT(d, STRUCT(e, f)))))"
+		deepView := "CREATE VIEW internal.db.v AS SELECT MAX_BY(v, " + deep + ") FROM internal.db.t;"
+		gotDeep := doris.NormalizeNereidsViewOrderKeys(deepView)
+		if !strings.Contains(gotDeep, "CONCAT_WS(CHAR(1)") {
+			t.Errorf("expected outer levels of deep nested STRUCT to rewrite cleanly:\n%s", gotDeep)
+		}
+		// Unbalanced or malformed inputs remain safe no-ops
+		for _, mal := range []string{
+			"CREATE TABLE internal.t.p (id INT) /* open",
+			"CREATE TABLE internal.t.p (id INT) PROPERTIES (\"storage_vault_name\" = 'unclosed);",
+			"CREATE VIEW internal.db.v AS SELECT MAX_BY(v, STRUCT(a, b) FROM internal.db.t;",
+		} {
+			_ = doris.StripCoupledModeCreateTableProperties(mal)
+			_ = doris.NormalizeNereidsViewOrderKeys(mal)
+		}
+	})
+}

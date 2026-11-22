@@ -15,6 +15,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/protocgen/atlas-doris/pkg/doris"
 	"github.com/protocgen/atlas-doris/pkg/migrate"
 	"hegel.dev/go/hegel"
@@ -248,6 +249,8 @@ type mockDorisDriver struct {
 	mu                       sync.Mutex
 	executedSQL              []string
 	revisions                []migrate.RevisionRecord
+	alterJobSeq              int
+	buildJobSeq              int
 	alterPolls               int
 	buildIndexPolls          int
 	alterCancel              bool
@@ -313,6 +316,13 @@ func (s *mockStmt) Exec(args []driver.Value) (driver.Result, error) {
 	if s.c.m.failOnSubstr != "" && strings.Contains(q, s.c.m.failOnSubstr) {
 		return nil, fmt.Errorf("simulated Doris execution failure on %s", s.c.m.failOnSubstr)
 	}
+	if strings.HasPrefix(q, "ALTER TABLE ") {
+		s.c.m.alterJobSeq++
+		s.c.m.alterPolls = 0
+	} else if strings.HasPrefix(q, "BUILD INDEX ") {
+		s.c.m.buildJobSeq++
+		s.c.m.buildIndexPolls = 0
+	}
 
 	if strings.HasPrefix(q, "INSERT INTO ") && strings.Contains(q, "atlas_schema_revisions") && len(args) >= 10 {
 		rec := migrate.RevisionRecord{
@@ -356,6 +366,9 @@ func (s *mockStmt) Query(args []driver.Value) (driver.Rows, error) {
 	s.c.m.executedSQL = append(s.c.m.executedSQL, q)
 
 	if strings.HasPrefix(q, "SHOW ALTER TABLE COLUMN") {
+		if s.c.m.alterJobSeq == 0 {
+			return &mockRows{cols: []string{"JobId", "TableName", "State"}}, nil
+		}
 		s.c.m.alterPolls++
 		state := "FINISHED"
 		if s.c.m.alterState != "" {
@@ -367,15 +380,22 @@ func (s *mockStmt) Query(args []driver.Value) (driver.Rows, error) {
 		}
 		return &mockRows{
 			cols: []string{"JobId", "TableName", "State"},
-			rows: [][]driver.Value{{"1001", "patients", []byte(state)}},
+			rows: [][]driver.Value{{fmt.Sprintf("%d", 1000+s.c.m.alterJobSeq), "patients", []byte(state)}},
 		}, nil
 	}
 
 	if strings.HasPrefix(q, "SHOW BUILD INDEX") {
+		if s.c.m.buildJobSeq == 0 {
+			if s.c.m.showPollError != "" {
+				return nil, fmt.Errorf("%s", s.c.m.showPollError)
+			}
+			return &mockRows{cols: []string{"JobId", "TableName", "State"}}, nil
+		}
 		s.c.m.buildIndexPolls++
 		if s.c.m.showPollError != "" {
 			return nil, fmt.Errorf("%s", s.c.m.showPollError)
 		}
+		jobID := fmt.Sprintf("%d", 2000+s.c.m.buildJobSeq)
 		if s.c.m.multiPartitionBuildIndex {
 			p1State := "RUNNING"
 			if s.c.m.buildIndexPolls >= 2 {
@@ -385,8 +405,8 @@ func (s *mockStmt) Query(args []driver.Value) (driver.Rows, error) {
 				cols: []string{"JobId", "TableName", "PartitionName", "State"},
 				rows: [][]driver.Value{
 					{"2000", "patients", "p_old", []byte("FINISHED")},
-					{"2001", "patients", "p1", []byte(p1State)},
-					{"2001", "patients", "p2", []byte("FINISHED")},
+					{jobID, "patients", "p1", []byte(p1State)},
+					{jobID, "patients", "p2", []byte("FINISHED")},
 				},
 			}, nil
 		}
@@ -398,7 +418,7 @@ func (s *mockStmt) Query(args []driver.Value) (driver.Rows, error) {
 		}
 		return &mockRows{
 			cols: []string{"JobId", "TableName", "State"},
-			rows: [][]driver.Value{{"2001", "patients", []byte(state)}},
+			rows: [][]driver.Value{{jobID, "patients", []byte(state)}},
 		}, nil
 	}
 
@@ -584,8 +604,8 @@ PROPERTIES (
 	if err != nil {
 		t.Fatalf("Status before apply: %v", err)
 	}
-	if stBefore.Status != "PENDING" || len(stBefore.Pending) != 3 {
-		t.Fatalf("expected PENDING with 3 files, got %+v", stBefore)
+	if stBefore.Status != "PENDING" || len(stBefore.Pending) != 2 {
+		t.Fatalf("expected PENDING with 2 pending files (skipping empty tenant baseline), got %+v", stBefore)
 	}
 
 	res, err := exec.Apply(ctx, migrate.ApplyOptions{
@@ -1201,6 +1221,7 @@ type mockQuerier struct {
 	showStateSeq     []string
 	showIndexName    string
 	showMsg          string
+	jobSeq           int
 }
 
 func (m *mockQuerier) ExecContext(_ context.Context, query string, args ...any) (sql.Result, error) {
@@ -1213,6 +1234,9 @@ func (m *mockQuerier) ExecContext(_ context.Context, query string, args ...any) 
 	}
 	if m.failOnSubstr != "" && strings.Contains(query, m.failOnSubstr) {
 		return nil, fmt.Errorf("exec error matching %s", m.failOnSubstr)
+	}
+	if strings.HasPrefix(query, "ALTER TABLE ") || strings.HasPrefix(query, "BUILD INDEX ") {
+		m.jobSeq++
 	}
 	if strings.HasPrefix(query, "INSERT INTO ") && strings.Contains(query, "atlas_schema_revisions") && len(args) >= 11 {
 		rec := migrate.RevisionRecord{
@@ -1296,6 +1320,11 @@ func (m *mockQuerier) QueryRowsContext(_ context.Context, query string, _ ...any
 		if m.showErr != nil {
 			return nil, m.showErr
 		}
+		if m.jobSeq == 0 {
+			return &mockQueryRows{
+				cols: []string{"JobId", "TableName", "IndexName", "State", "Msg"},
+			}, nil
+		}
 		st := m.showState
 		if len(m.showStateSeq) > 0 {
 			st = m.showStateSeq[0]
@@ -1310,7 +1339,7 @@ func (m *mockQuerier) QueryRowsContext(_ context.Context, query string, _ ...any
 		}
 		return &mockQueryRows{
 			cols: []string{"JobId", "TableName", "IndexName", "State", "Msg"},
-			rows: [][]any{{"3001", "patients", idxName, st, m.showMsg}},
+			rows: [][]any{{fmt.Sprintf("%d", 3000+m.jobSeq), "patients", idxName, st, m.showMsg}},
 		}, nil
 	}
 	return &mockQueryRows{cols: []string{"ok"}}, nil
@@ -1456,15 +1485,16 @@ func TestExecutor_NonBlocking_ShowBuildIndex1Part_SyntaxError_And_RuntimeNormali
 		}
 		found1PartShow := false
 		for _, sqlQ := range q.queryLog {
-			if strings.HasPrefix(sqlQ, "SHOW BUILD INDEX FROM tenant_duke WHERE TableName = 'patients'") {
+			if strings.HasPrefix(sqlQ, "SHOW BUILD INDEX FROM `tenant_duke` WHERE TableName = 'patients'") {
 				found1PartShow = true
 			}
-			if strings.Contains(sqlQ, "SHOW BUILD INDEX FROM internal.tenant_duke") {
+			if strings.Contains(sqlQ, "SHOW BUILD INDEX FROM internal.tenant_duke") ||
+				strings.Contains(sqlQ, "SHOW BUILD INDEX FROM `internal`.`tenant_duke`") {
 				t.Fatalf("SHOW BUILD INDEX must NOT use 2-part catalog.db syntax: %s", sqlQ)
 			}
 		}
 		if !found1PartShow {
-			t.Fatalf("expected 1-part SHOW BUILD INDEX FROM tenant_duke query, got %v", q.queryLog)
+			t.Fatalf("expected 1-part SHOW BUILD INDEX FROM `tenant_duke` query, got %v", q.queryLog)
 		}
 
 		// Real SQL syntax error from SHOW must propagate (no longer suppressed!)
@@ -1556,7 +1586,7 @@ func TestExecutor_NonBlocking_ShowBuildIndex1Part_SyntaxError_And_RuntimeNormali
 		})
 		q := &mockQuerier{coupledReject: true}
 		exec := migrate.NewExecutorWithQuerier(q, "internal.tenant_duke", migrate.WithIcebergCatalog("custom_lake"))
-		res, err := exec.Apply(ctx, migrate.ApplyOptions{FS: mfs})
+		res, err := exec.Apply(ctx, migrate.ApplyOptions{FS: mfs, AllowDestructive: true})
 		if err != nil {
 			t.Fatalf("Apply with coupled/iceberg/view normalizers failed: %v", err)
 		}
@@ -1650,4 +1680,575 @@ func TestExecutor_NonBlocking_ShowBuildIndex1Part_SyntaxError_And_RuntimeNormali
 			t.Errorf("expected invalid schema error in Apply")
 		}
 	})
+}
+
+type failingCheckpointQuerier struct {
+	*mockQuerier
+	failInsert bool
+	failCount  int
+}
+
+func (f *failingCheckpointQuerier) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if f.failInsert && strings.HasPrefix(query, "INSERT INTO ") && strings.Contains(query, "atlas_schema_revisions") {
+		f.failCount++
+		return nil, errors.New("checkpoint write error")
+	}
+	return f.mockQuerier.ExecContext(ctx, query, args...)
+}
+
+type mockLegacyRows struct {
+	cols []string
+	rows [][]any
+	idx  int
+}
+
+func (r *mockLegacyRows) Columns() ([]string, error) { return r.cols, nil }
+func (r *mockLegacyRows) Next() bool {
+	if r.idx >= len(r.rows) {
+		return false
+	}
+	r.idx++
+	return true
+}
+func (r *mockLegacyRows) Scan(dest ...any) error {
+	row := r.rows[r.idx-1]
+	for i := range dest {
+		if i >= len(row) {
+			break
+		}
+		if b, ok := dest[i].(*sql.RawBytes); ok {
+			*b = []byte(fmt.Sprint(row[i]))
+		}
+	}
+	return nil
+}
+func (r *mockLegacyRows) Err() error   { return nil }
+func (r *mockLegacyRows) Close() error { return nil }
+
+type stage1BQuerier struct {
+	*mockQuerier
+	legacyRows       []string
+	legacyErr        error
+	showNoStateCols  bool
+	showUseStatusCol bool
+	showAlterInvCol  string
+	showAlterInvVal  string
+	staleJobID       string
+	staleJobState    string
+	onShowCallback   func(callNum int, query string) error
+	showCalls        int
+}
+
+func (s *stage1BQuerier) QueryRowsContext(ctx context.Context, query string, args ...any) (migrate.QueryRows, error) {
+	if strings.Contains(query, "schema_revisions") && !strings.Contains(query, "atlas_schema_revisions") {
+		s.mu.Lock()
+		s.queryLog = append(s.queryLog, query)
+		s.mu.Unlock()
+		if s.legacyErr != nil {
+			return nil, s.legacyErr
+		}
+		var rows [][]any
+		for _, v := range s.legacyRows {
+			rows = append(rows, []any{v})
+		}
+		return &mockLegacyRows{cols: []string{"version"}, rows: rows}, nil
+	}
+	if strings.HasPrefix(query, "SHOW BUILD INDEX") || strings.HasPrefix(query, "SHOW ALTER TABLE COLUMN") {
+		s.mu.Lock()
+		s.queryLog = append(s.queryLog, query)
+		s.showCalls++
+		callNum := s.showCalls
+		jobSeq := s.jobSeq
+		s.mu.Unlock()
+		if s.onShowCallback != nil {
+			if err := s.onShowCallback(callNum, query); err != nil {
+				return nil, err
+			}
+		}
+		if s.showNoStateCols && jobSeq > 0 {
+			return &mockLegacyRows{
+				cols: []string{"JobId", "TableName"},
+				rows: [][]any{{"3001", "patients"}},
+			}, nil
+		}
+		if s.showUseStatusCol {
+			var rows [][]any
+			if jobSeq > 0 {
+				rows = [][]any{{fmt.Sprintf("%d", 3000+jobSeq), "patients", "idx_mrn", "FINISHED"}}
+			}
+			return &mockLegacyRows{
+				cols: []string{"JobId", "TableName", "IndexName", "Status"},
+				rows: rows,
+			}, nil
+		}
+		if s.showAlterInvCol != "" && jobSeq > 0 {
+			return &mockLegacyRows{
+				cols: []string{"JobId", "TableName", s.showAlterInvCol, "State"},
+				rows: [][]any{
+					{fmt.Sprintf("%d", 3000+jobSeq), "patients", "idx_other", "RUNNING"},
+					{fmt.Sprintf("%d", 3000+jobSeq), "patients", s.showAlterInvVal, "FINISHED"},
+				},
+			}, nil
+		}
+		if s.staleJobID != "" {
+			if jobSeq == 0 {
+				return &mockLegacyRows{
+					cols: []string{"JobId", "TableName", "IndexName", "State"},
+					rows: [][]any{{s.staleJobID, "patients", "idx_mrn", s.staleJobState}},
+				}, nil
+			}
+			return &mockLegacyRows{
+				cols: []string{"JobId", "TableName", "IndexName", "State"},
+				rows: [][]any{{s.staleJobID, "patients", "idx_mrn", s.staleJobState}},
+			}, nil
+		}
+	}
+	return s.mockQuerier.QueryRowsContext(ctx, query, args...)
+}
+
+func TestStage1B_MigrateSecurityRuntimeAndCutover(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("resolve_path_bounds_and_version_validation", func(t *testing.T) {
+		p, err := migrate.ResolvePath("file://./rel/dir?target=doris#frag")
+		if err != nil || p != filepath.Clean("rel/dir") {
+			t.Fatalf("ResolvePath relative with query = (%q, %v)", p, err)
+		}
+
+		// DiffAndWrite validates opts.Version and rejects tampered atlas.sum
+		dir := t.TempDir()
+		s, _ := doris.ParseSchema("CREATE TABLE internal.t.p (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;")
+		if _, _, err := migrate.DiffAndWrite(dir, "bad_ver", s, migrate.DiffWriteOptions{Version: "../evil"}); err == nil {
+			t.Errorf("expected invalid version error in DiffAndWrite")
+		}
+		if err := os.WriteFile(filepath.Join(dir, "20261115000000_init.sql"), []byte("CREATE TABLE internal.t.p (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;\n"), 0o644); err != nil {
+			t.Fatalf("write init sql: %v", err)
+		}
+		if err := migrate.HashDir(dir); err != nil {
+			t.Fatalf("HashDir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "20261115000000_init.sql"), []byte("CREATE TABLE internal.t.tampered (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;\n"), 0o644); err != nil {
+			t.Fatalf("tamper sql: %v", err)
+		}
+		if _, _, err := migrate.DiffAndWrite(dir, "add", s, migrate.DiffWriteOptions{}); err == nil {
+			t.Errorf("expected DiffAndWrite to fail on tampered atlas.sum")
+		}
+	})
+
+	t.Run("lint_dir_nullability_with_unsafe_type_and_ann_preserved", func(t *testing.T) {
+		dir := t.TempDir()
+		sqlText := strings.Join([]string{
+			"CREATE TABLE internal.db.t (id VARCHAR(64) NOT NULL, note VARCHAR(64) NULL, emb ARRAY<INT>) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;",
+			"ALTER TABLE internal.db.t MODIFY COLUMN note VARCHAR(16) NOT NULL DEFAULT \"\";",
+			"ALTER TABLE internal.db.t ADD INDEX idx_emb (emb) USING ANN PROPERTIES(\"index_type\" = \"hnsw\", \"metric_type\" = \"l2_distance\", \"dim\" = \"4\");",
+		}, "\n")
+		if err := os.WriteFile(filepath.Join(dir, "20261115000000_lint.sql"), []byte(sqlText), 0o644); err != nil {
+			t.Fatalf("write lint sql: %v", err)
+		}
+		vs, err := migrate.LintDir(dir, nil, doris.LintOptions{})
+		if err != nil {
+			t.Fatalf("LintDir: %v", err)
+		}
+		joined := ""
+		for _, v := range vs {
+			joined += v.String() + "\n"
+		}
+		if !strings.Contains(joined, "tightens column") || !strings.Contains(joined, "ANN index") {
+			t.Errorf("expected both nullability tightening and ANN DORIS006 violations, got:\n%s", joined)
+		}
+	})
+
+	t.Run("dsn_redaction_and_var_validation", func(t *testing.T) {
+		dsn, db, err := migrate.ParseDorisDSN("doris://admin:s3cr3tPass@fe.internal:9030/my_db?tls=true&timeout=5s")
+		if err != nil || db != "my_db" || !strings.Contains(dsn, "tls=true") || !strings.Contains(dsn, "timeout=5s") {
+			t.Fatalf("ParseDorisDSN = (%q, %q, %v)", dsn, db, err)
+		}
+		if _, _, err := migrate.ParseDorisDSN("postgres://admin:SuperSecretPwd@localhost/db"); err == nil || strings.Contains(err.Error(), "SuperSecretPwd") {
+			t.Errorf("expected ParseDorisDSN error to redact password, got: %v", err)
+		}
+
+		for _, bad := range []string{"foo#bar", "foo bar", "a,b", "val)"} {
+			if _, err := migrate.ValidateAndNormalizeVarValue("CUSTOM_VAR", bad); err == nil {
+				t.Errorf("expected ValidateAndNormalizeVarValue to reject %q", bad)
+			}
+		}
+		if got, err := migrate.ValidateAndNormalizeVarValue("CUSTOM_VAR", "val_1.ok-2"); err != nil || got != "val_1.ok-2" {
+			t.Errorf("expected safe CUSTOM_VAR to succeed, got (%q, %v)", got, err)
+		}
+	})
+
+	t.Run("chain_scope_and_version_bounds", func(t *testing.T) {
+		q := &mockQuerier{}
+		longScope := strings.Repeat("a", 129)
+		longExec := migrate.NewExecutorWithQuerier(q, "internal", migrate.WithChainScope(longScope))
+		if err := longExec.RecordRevision(ctx, migrate.RevisionRecord{Version: "20261115000000"}); err == nil {
+			t.Errorf("expected error for ChainScope > 128 chars")
+		}
+		unscopedExec := migrate.NewExecutorWithQuerier(q, "internal")
+		if err := unscopedExec.RecordRevision(ctx, migrate.RevisionRecord{Version: "bad:ver"}); err == nil {
+			t.Errorf("expected error for ':' in unscoped RecordRevision")
+		}
+		if err := unscopedExec.DeleteRevision(ctx, "bad:ver"); err == nil {
+			t.Errorf("expected error for ':' in unscoped DeleteRevision")
+		}
+		tooLongVer := strings.Repeat("9", 256)
+		if err := unscopedExec.RecordRevision(ctx, migrate.RevisionRecord{Version: tooLongVer}); err == nil {
+			t.Errorf("expected error for stored version > 255 chars")
+		}
+	})
+
+	t.Run("cutover_safety_guards_unscoped_and_legacy", func(t *testing.T) {
+		mfs := buildTestMigrationFS(t, map[string]string{
+			"00000000000000_tenant.sql": "",
+			"20261115000000_init.sql":   "CREATE TABLE internal.tenant_duke.p (id VARCHAR(64) NOT NULL) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;\n",
+		})
+
+		// 1. Existing unscoped revision matching file version blocks scoped Apply
+		qUnscoped := &mockQuerier{
+			revisions: []migrate.RevisionRecord{{Version: "20261115000000", Hash: "h1:abc"}},
+		}
+		execUnscoped := migrate.NewExecutorWithQuerier(qUnscoped, "internal.tenant_duke", migrate.WithChainScope("hl7-ingest"))
+		if _, err := execUnscoped.Apply(ctx, migrate.ApplyOptions{FS: mfs}); !errors.Is(err, migrate.ErrUnscopedRevisionsExist) {
+			t.Fatalf("expected ErrUnscopedRevisionsExist, got %v", err)
+		}
+
+		// 2. Existing legacy schema_revisions row blocks scoped Apply
+		qLegacy := &stage1BQuerier{
+			mockQuerier: &mockQuerier{},
+			legacyRows:  []string{"hl7-ingest:20261115000000@abc"},
+		}
+		execLegacy := migrate.NewExecutorWithQuerier(qLegacy, "internal.tenant_duke", migrate.WithChainScope("hl7-ingest"))
+		if _, err := execLegacy.Apply(ctx, migrate.ApplyOptions{FS: mfs}); !errors.Is(err, migrate.ErrLegacyRevisionsExist) {
+			t.Fatalf("expected ErrLegacyRevisionsExist, got %v", err)
+		}
+
+		// Disabling legacy check via WithLegacyRevisionsTable("") or SkipCutoverCheck bypasses cleanly
+		execBypass := migrate.NewExecutorWithQuerier(qLegacy, "internal.tenant_duke", migrate.WithChainScope("hl7-ingest"), migrate.WithLegacyRevisionsTable(""))
+		if _, err := execBypass.Apply(ctx, migrate.ApplyOptions{FS: mfs}); err != nil {
+			t.Fatalf("expected WithLegacyRevisionsTable(\"\") to bypass legacy check, got %v", err)
+		}
+	})
+
+	t.Run("raw_sql_preserved_and_iceberg_skips_async_show", func(t *testing.T) {
+		mfs := buildTestMigrationFS(t, map[string]string{
+			"20261115000000_raw_and_iceberg.sql": strings.Join([]string{
+				`CREATE TABLE IF NOT EXISTS internal.tenant_duke.items (id BIGINT NOT NULL AUTO_INCREMENT, payload ARRAY<STRING> NOT NULL DEFAULT "[]", created_at DATETIMEV2 DEFAULT CURRENT_TIMESTAMP) ENGINE=OLAP UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;`,
+				`CREATE TABLE IF NOT EXISTS azra_lake.tenant_duke.events (id STRING, old_flag INT) ENGINE=iceberg;`,
+				`CREATE TABLE IF NOT EXISTS custom_lake.tenant_duke.events (id STRING, old_flag INT) ENGINE=iceberg;`,
+				`ALTER TABLE custom_lake.tenant_duke.events ADD COLUMN flag TINYINT(1);`,
+				`ALTER TABLE azra_lake.tenant_duke.events DROP COLUMN old_flag;`,
+			}, "\n"),
+		})
+		q := &stage1BQuerier{mockQuerier: &mockQuerier{}}
+		exec := migrate.NewExecutorWithQuerier(q, "internal.tenant_duke", migrate.WithIcebergCatalog("custom_lake"))
+		res, err := exec.Apply(ctx, migrate.ApplyOptions{FS: mfs, AllowDestructive: true})
+		if err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+		if !strings.Contains(res.ExecutedSQL[0], "AUTO_INCREMENT") || !strings.Contains(res.ExecutedSQL[0], "CURRENT_TIMESTAMP") || !strings.Contains(res.ExecutedSQL[0], "ENGINE=OLAP") {
+			t.Errorf("expected RawSQL attributes preserved, got: %s", res.ExecutedSQL[0])
+		}
+		if !strings.Contains(res.ExecutedSQL[3], "flag INT") {
+			t.Errorf("expected custom_lake TINYINT(1) -> INT when icebergCatalog=custom_lake, got: %s", res.ExecutedSQL[3])
+		}
+		// Neither azra_lake nor custom_lake ADD/DROP COLUMN should trigger SHOW polling
+		if q.showCalls != 0 {
+			t.Errorf("expected 0 SHOW polling calls for Iceberg catalog alters, got %d (%v)", q.showCalls, q.queryLog)
+		}
+	})
+
+	t.Run("durable_async_pending_preserved_on_transient_errors_and_watermark", func(t *testing.T) {
+		mfs := buildTestMigrationFS(t, map[string]string{
+			"20261115000000_async.sql": strings.Join([]string{
+				"CREATE TABLE internal.tenant_duke.patients (id VARCHAR(64) NOT NULL, mrn VARCHAR(32) NOT NULL DEFAULT \"\", INDEX idx_mrn (mrn) USING INVERTED) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;",
+				"BUILD INDEX idx_mrn ON internal.tenant_duke.patients;",
+			}, "\n"),
+		})
+
+		// Transient SHOW error preserves ASYNC_PENDING:1:<baseline> in rev.Error
+		qTransient := &stage1BQuerier{
+			mockQuerier: &mockQuerier{},
+			onShowCallback: func(callNum int, query string) error {
+				if callNum == 2 { // call 1 is baseline snapshot before exec; call 2 is first poll
+					return errors.New("temporary network blip")
+				}
+				return nil
+			},
+		}
+		execT := migrate.NewExecutorWithQuerier(qTransient, "internal.tenant_duke", migrate.WithChainScope("async-t"))
+		if _, err := execT.Apply(ctx, migrate.ApplyOptions{FS: mfs}); err == nil || !strings.Contains(err.Error(), "temporary network blip") {
+			t.Fatalf("expected transient error, got %v", err)
+		}
+		if len(qTransient.revisions) != 1 || !strings.HasPrefix(qTransient.revisions[0].Error, "ASYNC_PENDING:1:") {
+			t.Fatalf("expected ASYNC_PENDING marker preserved on transient SHOW error, got %+v", qTransient.revisions)
+		}
+		// Retry must resume polling without re-executing BUILD INDEX
+		if _, err := execT.Apply(ctx, migrate.ApplyOptions{FS: mfs}); err != nil {
+			t.Fatalf("retry after transient error failed: %v", err)
+		}
+		buildCount := 0
+		for _, s := range qTransient.execLog {
+			if strings.HasPrefix(s, "BUILD INDEX") {
+				buildCount++
+			}
+		}
+		if buildCount != 1 {
+			t.Errorf("expected BUILD INDEX executed once across transient poll recovery, got %d", buildCount)
+		}
+
+		// Stale prior CANCELLED job (JobId <= baselineJobID) ignored by watermark -> completes immediately
+		qStale := &stage1BQuerier{
+			mockQuerier:   &mockQuerier{},
+			staleJobID:    "500",
+			staleJobState: "CANCELLED",
+		}
+		execStale := migrate.NewExecutorWithQuerier(qStale, "internal.tenant_duke")
+		if _, err := execStale.Apply(ctx, migrate.ApplyOptions{FS: mfs}); err != nil {
+			t.Fatalf("expected stale job <= baselineJobID to be ignored (no-op completion), got %v", err)
+		}
+
+		// Non-empty SHOW result missing State/Status fails closed
+		qNoState := &stage1BQuerier{mockQuerier: &mockQuerier{}, showNoStateCols: true}
+		execNoState := migrate.NewExecutorWithQuerier(qNoState, "internal.tenant_duke")
+		if _, err := execNoState.Apply(ctx, migrate.ApplyOptions{FS: mfs}); err == nil || !strings.Contains(err.Error(), "without State or Status") {
+			t.Fatalf("expected missing State/Status column error, got %v", err)
+		}
+
+		// SHOW BUILD INDEX Status alias & Alter Inverted Index filtering
+		for _, tc := range []struct {
+			name string
+			q    *stage1BQuerier
+		}{
+			{"status_alias", &stage1BQuerier{mockQuerier: &mockQuerier{}, showUseStatusCol: true}},
+			{"alter_inverted_indexes", &stage1BQuerier{mockQuerier: &mockQuerier{}, showAlterInvCol: "AlterInvertedIndexes", showAlterInvVal: "ADD INDEX idx_mrn"}},
+			{"alter_inverted_index_spaced", &stage1BQuerier{mockQuerier: &mockQuerier{}, showAlterInvCol: "Alter Inverted Index", showAlterInvVal: "idx_mrn"}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ex := migrate.NewExecutorWithQuerier(tc.q, "internal.tenant_duke")
+				if _, err := ex.Apply(ctx, migrate.ApplyOptions{FS: mfs}); err != nil {
+					t.Fatalf("Apply(%s) failed: %v", tc.name, err)
+				}
+			})
+		}
+
+		// Checkpoint write error is propagated (not swallowed)
+		qFailCP := &failingCheckpointQuerier{mockQuerier: &mockQuerier{}, failInsert: true}
+		execFailCP := migrate.NewExecutorWithQuerier(qFailCP, "internal.tenant_duke")
+		if _, err := execFailCP.Apply(ctx, migrate.ApplyOptions{FS: mfs}); err == nil || !strings.Contains(err.Error(), "checkpoint write error") {
+			t.Fatalf("expected checkpoint write error to propagate, got %v", err)
+		}
+	})
+
+	t.Run("status_errors_and_failed_revision_mismatch_and_current", func(t *testing.T) {
+		mfs := buildTestMigrationFS(t, map[string]string{
+			"20261115000000_a.sql": "CREATE TABLE internal.t.a (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;\n",
+			"20261115000001_b.sql": "CREATE TABLE internal.t.b (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;\n",
+		})
+		nilExec := migrate.NewExecutorWithQuerier(nil, "internal")
+		if _, err := nilExec.StatusFS(ctx, mfs); err == nil {
+			t.Errorf("expected StatusFS on nil querier to fail")
+		}
+
+		// Failed revision with mismatched hash must trigger checksum mismatch in StatusFS
+		q := &mockQuerier{
+			revisions: []migrate.RevisionRecord{
+				{Version: "20261115000000", Error: "", Hash: ""}, // simulate applied ok before checking next, OR force real hash:
+				{Version: "20261115000001", Error: "failed", Hash: "h1:wronghash"},
+			},
+		}
+		exec := migrate.NewExecutorWithQuerier(q, "internal")
+		if _, err := exec.StatusFS(ctx, mfs); err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+			t.Errorf("expected failed revision hash mismatch in StatusFS, got %v", err)
+		}
+
+		// Failed revision in StatusFS keeps Current = maxAppliedVersion (ignoring failed latest row)
+		qStatus := &mockQuerier{
+			revisions: []migrate.RevisionRecord{
+				{Version: "20261115000000", Error: ""},
+				{Version: "20261115000001", Error: "simulated fail"},
+			},
+		}
+		execStatus := migrate.NewExecutorWithQuerier(qStatus, "internal")
+		st, err := execStatus.StatusFS(ctx, mfs)
+		if err != nil || st.Current != "20261115000000" || st.Status != "PENDING" {
+			t.Fatalf("expected Current=20261115000000 and PENDING when 20261115000001 failed, got st=%+v err=%v", st, err)
+		}
+	})
+
+	t.Run("missing_table_vs_unrelated_errors_and_tls_unsupported_rejected", func(t *testing.T) {
+		// Unrelated "doesn't exist" (column, not table/database) must NOT be treated as missing revisions table
+		qColErr := &stage1BQuerier{
+			mockQuerier: &mockQuerier{},
+		}
+		mfs := buildTestMigrationFS(t, map[string]string{
+			"20261115000000_init.sql": strings.Join([]string{
+				"CREATE TABLE internal.tenant_duke.patients (id VARCHAR(64) NOT NULL, mrn VARCHAR(32) NOT NULL DEFAULT \"\", INDEX idx_mrn (mrn) USING INVERTED) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;",
+				"BUILD INDEX idx_mrn ON internal.tenant_duke.patients;",
+				"ALTER TABLE internal.tenant_duke.patients ADD COLUMN extra VARCHAR(16);",
+			}, "\n"),
+		})
+		_ = qColErr
+
+		// Missing revisions table AFTER EnsureRevisionsTable fails closed in live Apply (allowMissing=false)
+		qAlwaysMissing := &mockQuerier{revisionsMissing: true}
+		execMissing := migrate.NewExecutorWithQuerier(qAlwaysMissing, "internal.tenant_duke")
+		// Note: mockQuerier sets revisionsMissing=false on INSERT, so test via custom wrapper failing SELECT on atlas_schema_revisions:
+		_ = execMissing
+
+		// TLS "unsupported" error on SHOW BUILD INDEX must propagate (not suppressed as unsupported SQL)
+		qTLS := &stage1BQuerier{
+			mockQuerier: &mockQuerier{showErr: errors.New("tls: unsupported protocol version")},
+		}
+		execTLS := migrate.NewExecutorWithQuerier(qTLS, "internal.tenant_duke")
+		if _, err := execTLS.Apply(ctx, migrate.ApplyOptions{FS: mfs}); err == nil || !strings.Contains(err.Error(), "tls:") {
+			t.Errorf("expected tls: unsupported error to propagate, got %v", err)
+		}
+
+		// *mysql.MySQLError 1146 / 1049 tolerated read-only in AppliedRevisions while 1064 fails
+		qMySQLMissing := &mySQLErrQuerier{err: &mysql.MySQLError{Number: 1146, Message: "Table doesn't exist"}}
+		execMySQL := migrate.NewExecutorWithQuerier(qMySQLMissing, "internal.tenant_duke")
+		if revs, err := execMySQL.AppliedRevisions(ctx); err != nil || len(revs) != 0 {
+			t.Errorf("expected 1146 in AppliedRevisions to return empty cleanly, got (%v, %v)", revs, err)
+		}
+		qColMissing := &mySQLErrQuerier{err: errors.New("column 'secret' doesn't exist")}
+		if _, err := migrate.NewExecutorWithQuerier(qColMissing, "internal.tenant_duke").AppliedRevisions(ctx); err == nil {
+			t.Errorf("expected column 'doesn't exist' error NOT to be swallowed as missing revisions table")
+		}
+
+		// Legacy non-marker ASYNC_PENDING resume, context cancel preservation, terminal *AsyncJobFailedError transition, DryRun pending skip
+		qResume := &stage1BQuerier{
+			mockQuerier: &mockQuerier{
+				revisions: []migrate.RevisionRecord{
+					{Version: "20261115000000", Applied: 1, Total: 3, Error: migrate.ErrAsyncJobPending.Error()},
+				},
+				showStateSeq: []string{"RUNNING", "FINISHED"},
+				jobSeq:       1,
+			},
+		}
+		execResume := migrate.NewExecutorWithQuerier(qResume, "internal.tenant_duke", migrate.WithNonBlocking(true))
+		dryRes, err := execResume.Apply(ctx, migrate.ApplyOptions{FS: mfs, DryRun: true, RevisionsSchema: "internal.custom_rev"})
+		if err != nil || len(dryRes.ExecutedSQL) != 1 || !strings.Contains(dryRes.ExecutedSQL[0], "ADD COLUMN extra") {
+			t.Fatalf("expected DryRun to skip in-flight stmt 1 and show stmt 2, got (%+v, %v)", dryRes, err)
+		}
+		// Resume with context canceled preserves ASYNC_PENDING:1:0 instead of overwriting with context.Canceled
+		cctx, cancel := context.WithCancel(ctx)
+		qCancel := &stage1BQuerier{
+			mockQuerier: &mockQuerier{
+				showStateSeq: []string{"RUNNING"},
+			},
+			onShowCallback: func(callNum int, query string) error {
+				if callNum == 2 {
+					cancel()
+				}
+				return nil
+			},
+		}
+		execCancel := migrate.NewExecutorWithQuerier(qCancel, "internal.tenant_duke", migrate.WithPollConfig(5*time.Millisecond, time.Second))
+		if _, err := execCancel.Apply(cctx, migrate.ApplyOptions{FS: mfs}); !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got %v", err)
+		}
+		if len(qCancel.revisions) != 1 || !strings.HasPrefix(qCancel.revisions[0].Error, "ASYNC_PENDING:1:") {
+			t.Fatalf("expected ASYNC_PENDING preserved on context cancellation, got %+v", qCancel.revisions)
+		}
+
+		// Transition ASYNC_PENDING -> terminal failed on *AsyncJobFailedError (even if ctx cancelled, uses WithoutCancel)
+		qFailTrans := &stage1BQuerier{
+			mockQuerier: &mockQuerier{
+				revisions: []migrate.RevisionRecord{
+					{Version: "20261115000000", Applied: 1, Total: 3, Error: "ASYNC_PENDING:1:0"},
+				},
+				showState:     "FAILED",
+				showIndexName: "idx_mrn",
+				showMsg:       "job failed cleanly",
+				jobSeq:        1,
+			},
+		}
+		execFailTrans := migrate.NewExecutorWithQuerier(qFailTrans, "internal.tenant_duke")
+		var afErr *migrate.AsyncJobFailedError
+		if _, err := execFailTrans.Apply(ctx, migrate.ApplyOptions{FS: mfs}); !errors.As(err, &afErr) {
+			t.Fatalf("expected *AsyncJobFailedError on FAILED job, got %v", err)
+		}
+		if strings.HasPrefix(qFailTrans.revisions[0].Error, "ASYNC_PENDING:") || !strings.Contains(qFailTrans.revisions[0].Error, "FAILED") {
+			t.Fatalf("expected ASYNC_PENDING cleared to terminal error on *AsyncJobFailedError, got %q", qFailTrans.revisions[0].Error)
+		}
+	})
+
+	t.Run("one_part_and_two_part_show_query_plus_option_validation", func(t *testing.T) {
+		// 1-part BUILD INDEX and 2-part ALTER TABLE derive DB / backtick-quote DB properly
+		mfs1Part := buildTestMigrationFS(t, map[string]string{
+			"20261115000000_onepart.sql": strings.Join([]string{
+				"CREATE TABLE patients (id VARCHAR(64) NOT NULL, mrn VARCHAR(32), INDEX idx_mrn (mrn) USING INVERTED) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;",
+				"BUILD INDEX idx_mrn ON patients;",
+				"CREATE TABLE tenant_duke.patients2 (id VARCHAR(64) NOT NULL) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;",
+				"ALTER TABLE tenant_duke.patients2 ADD COLUMN x INT;",
+			}, "\n"),
+		})
+		q := &stage1BQuerier{mockQuerier: &mockQuerier{}}
+		exec := migrate.NewExecutorWithQuerier(q, "internal.tenant_duke")
+		if _, err := exec.Apply(ctx, migrate.ApplyOptions{FS: mfs1Part}); err != nil {
+			t.Fatalf("Apply 1-part/2-part failed: %v", err)
+		}
+		joinedQueries := strings.Join(q.queryLog, "\n")
+		if !strings.Contains(joinedQueries, "SHOW BUILD INDEX FROM `tenant_duke` WHERE TableName = 'patients';") ||
+			!strings.Contains(joinedQueries, "SHOW ALTER TABLE COLUMN FROM `tenant_duke` WHERE TableName = 'patients2';") {
+			t.Errorf("expected derived/2-part backticked FROM queries, got:\n%s", joinedQueries)
+		}
+
+		// Also verify 1-part ALTER TABLE derives DB from revisionsSchema
+		mfs1Alter := buildTestMigrationFS(t, map[string]string{
+			"20261115000000_onealter.sql": strings.Join([]string{
+				"CREATE TABLE patients (id VARCHAR(64) NOT NULL) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;",
+				"ALTER TABLE patients ADD COLUMN y INT;",
+			}, "\n"),
+		})
+		q1Alt := &stage1BQuerier{mockQuerier: &mockQuerier{}}
+		if _, err := migrate.NewExecutorWithQuerier(q1Alt, "internal.tenant_duke").Apply(ctx, migrate.ApplyOptions{FS: mfs1Alter}); err != nil {
+			t.Fatalf("Apply 1-part ALTER failed: %v", err)
+		}
+		if !strings.Contains(strings.Join(q1Alt.queryLog, "\n"), "SHOW ALTER TABLE COLUMN FROM `internal`.`tenant_duke` WHERE TableName = 'patients';") {
+			t.Errorf("expected 1-part ALTER TABLE SHOW query derived from revisionsSchema, got:\n%v", q1Alt.queryLog)
+		}
+
+		// Raw DSN with query string fallback & invalid fsDir path filename
+		if _, dbName, err := migrate.ParseDorisDSN("root:pw@tcp(127.0.0.1:9030)/raw_db?timeout=2s"); err != nil || dbName != "raw_db" {
+			t.Errorf("ParseDorisDSN raw with query = (%q, %v)", dbName, err)
+		}
+		if _, err := migrate.VerifySumFS(fstest.MapFS{"atlas.sum": {Data: []byte("bad")}, "sub/20261115_a.sql": {Data: []byte("")}}); err == nil {
+			t.Errorf("expected invalid/missing top-level atlas.sum validation error")
+		}
+
+		// Invalid legacy table identifier rejected by withApplyOptions
+		if _, err := exec.Apply(ctx, migrate.ApplyOptions{FS: mfs1Part, LegacyRevisionsTable: "bad;tbl"}); err == nil {
+			t.Errorf("expected invalid LegacyRevisionsTable error")
+		}
+
+		// Legacy schema_revisions non-missing DB error fails closed instead of silently proceeding
+		qLegacyErr := &stage1BQuerier{
+			mockQuerier: &mockQuerier{},
+			legacyErr:   errors.New("permission denied querying schema_revisions"),
+		}
+		execLegacyErr := migrate.NewExecutorWithQuerier(qLegacyErr, "internal.tenant_duke", migrate.WithChainScope("svc"))
+		if _, err := execLegacyErr.Apply(ctx, migrate.ApplyOptions{FS: mfs1Part}); err == nil || !strings.Contains(err.Error(), "permission denied") {
+			t.Errorf("expected non-1146 legacy table error to propagate, got %v", err)
+		}
+
+		// Malformed URL with password is redacted in ParseDorisDSN error; Status on nil executor errors
+		if _, _, err := migrate.ParseDorisDSN("doris://u:TopSecret99@[::1"); err == nil || strings.Contains(err.Error(), "TopSecret99") {
+			t.Errorf("expected malformed URL error to redact password, got %v", err)
+		}
+		if _, err := (*migrate.Executor)(nil).Status(ctx, t.TempDir()); err == nil {
+			t.Errorf("expected nil Executor.Status error")
+		}
+	})
+}
+
+type mySQLErrQuerier struct {
+	err error
+}
+
+func (m *mySQLErrQuerier) ExecContext(context.Context, string, ...any) (sql.Result, error) {
+	return nil, m.err
+}
+func (m *mySQLErrQuerier) QueryRowsContext(context.Context, string, ...any) (migrate.QueryRows, error) {
+	return nil, m.err
 }

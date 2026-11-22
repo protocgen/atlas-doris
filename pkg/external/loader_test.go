@@ -313,8 +313,9 @@ exit 0
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	protoRendered, err := external.ExternalSchemaSQL(ctx, external.ExternalSchemaOptions{
-		ProtoPath:     protoDir + "?mode=hcl&target=doris&include=" + protoDir + "&plugin=" + fakePlugin,
+		ProtoPath:     protoDir + "?mode=hcl&target=doris&include=" + protoDir,
 		ProtoIncludes: []string{protoDir},
+		PluginPath:    fakePlugin,
 		Format:        "hcl",
 	})
 	if err != nil {
@@ -340,8 +341,11 @@ exit 0
 		}
 	}
 
-	// Proto error paths: missing plugin, empty proto dir, nonexistent proto path
+	// Proto error paths: disallowed ?plugin=, missing plugin, empty proto dir, nonexistent proto path
 	if _, err := external.LoadSchema(ctx, "proto://"+protoFile+"?plugin=/nonexistent/plugin", external.LoadOptions{}); err == nil {
+		t.Errorf("expected error for disallowed ?plugin= URL query param")
+	}
+	if _, err := external.LoadSchema(ctx, "proto://"+protoFile, external.LoadOptions{PluginPath: "/nonexistent/plugin"}); err == nil {
 		t.Errorf("expected error for nonexistent explicit plugin")
 	}
 	if _, err := external.LoadSchema(ctx, "proto://"+t.TempDir(), external.LoadOptions{}); err == nil {
@@ -569,6 +573,11 @@ func TestRealProto2TypeIntegration_MultiTarget(t *testing.T) {
 	if proto2typeDir == "" {
 		t.Skip("skipping real proto2type integration test: sibling proto2type repository not found")
 	}
+	absProto2Type, err := filepath.Abs(proto2typeDir)
+	if err != nil {
+		t.Fatalf("filepath.Abs(%q): %v", proto2typeDir, err)
+	}
+	t.Setenv("PROTO2TYPE_DIR", absProto2Type)
 
 	protoDir := t.TempDir()
 	protoFile := filepath.Join(protoDir, "doris_tenant_profile.proto")
@@ -695,4 +704,135 @@ func TestLoadFromPaths_And_LoadSchemas(t *testing.T) {
 	if err != nil || len(sMigIce.Tables) != 1 || !sMigIce.Tables[0].IsIcebergTable() {
 		t.Fatalf("expected TargetIceberg migration dir load to retain only Iceberg table, got s=%+v err=%v", sMigIce, err)
 	}
+}
+
+func TestStage1B_LoaderSecurityAndFiltering(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("filter_schema_clones_and_filters_dbs_views_platform", func(t *testing.T) {
+		rawSQL := `
+CREATE WORKLOAD GROUP wg1 PROPERTIES ("cpu_share" = "10");
+CREATE DATABASE internal.tenant_a;
+CREATE DATABASE azra_lake.tenant_a;
+CREATE TABLE internal.tenant_a.patients (id VARCHAR(64) NOT NULL) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;
+CREATE TABLE azra_lake.tenant_a.patients (id STRING NOT NULL) ENGINE=iceberg;
+CREATE VIEW internal.tenant_a.vw_patients AS SELECT id FROM internal.tenant_a.patients;`
+		s, err := doris.ParseSchema(rawSQL)
+		if err != nil {
+			t.Fatalf("ParseSchema: %v", err)
+		}
+
+		ice := external.FilterSchemaByTarget(s, external.TargetIceberg)
+		if len(ice.Tables) != 1 || !ice.Tables[0].IsIcebergTable() {
+			t.Fatalf("expected 1 Iceberg table, got %+v", ice.Tables)
+		}
+		if len(ice.Databases) != 1 || ice.Databases[0].Catalog != "azra_lake" {
+			t.Fatalf("expected only azra_lake database for TargetIceberg, got %+v", ice.Databases)
+		}
+		if len(ice.Views) != 0 || len(ice.PlatformObjects) != 0 {
+			t.Fatalf("expected Views and PlatformObjects dropped for TargetIceberg, got views=%d platform=%d", len(ice.Views), len(ice.PlatformObjects))
+		}
+		// Mutating filtered table must not mutate original s
+		ice.Tables[0].Comment = "mutated"
+		if s.Tables[1].Comment == "mutated" {
+			t.Errorf("FilterSchemaByTarget failed to clone tables")
+		}
+
+		dor := external.FilterSchemaByTarget(s, external.TargetDoris)
+		if len(dor.Databases) != 1 || dor.Databases[0].Catalog != "internal" {
+			t.Fatalf("expected only internal database for TargetDoris, got %+v", dor.Databases)
+		}
+		if len(dor.Views) != 1 || len(dor.PlatformObjects) != 1 {
+			t.Fatalf("expected Views and PlatformObjects kept for TargetDoris, got views=%d platform=%d", len(dor.Views), len(dor.PlatformObjects))
+		}
+	})
+
+	t.Run("subdir_atlas_sum_and_neutral_filename_fallback", func(t *testing.T) {
+		root := t.TempDir()
+		subA := filepath.Join(root, "svc_a")
+		if err := os.MkdirAll(subA, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(subA, "20261115000001_init.sql"), []byte("CREATE TABLE internal.tenant_a.t1 (id VARCHAR(64) NOT NULL) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;\n"), 0o644); err != nil {
+			t.Fatalf("write subA sql: %v", err)
+		}
+		if err := migrate.HashDir(subA); err != nil {
+			t.Fatalf("HashDir(subA): %v", err)
+		}
+
+		loaded, err := external.LoadFromPath(root, external.TargetDoris)
+		if err != nil || len(loaded.Tables) != 1 {
+			t.Fatalf("expected subdir atlas.sum walk to load 1 table, got tables=%v err=%v", loaded, err)
+		}
+
+		// Tampered atlas.sum in subdir must be rejected
+		if err := os.WriteFile(filepath.Join(subA, "20261115000001_init.sql"), []byte("CREATE TABLE internal.tenant_a.tampered (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;\n"), 0o644); err != nil {
+			t.Fatalf("tamper sql: %v", err)
+		}
+		if _, err := external.LoadFromPath(root, external.TargetAll); err == nil {
+			t.Errorf("expected tampered subdir atlas.sum to fail VerifySumFS")
+		}
+
+		// Explicit dir with neutral schema.sql (no _doris/_iceberg filename suffix) falls back cleanly
+		neutralDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(neutralDir, "schema.sql"), []byte("CREATE TABLE internal.tenant_a.t1 (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;\nCREATE TABLE azra_lake.tenant_a.t2 (id STRING) ENGINE=iceberg;\n"), 0o644); err != nil {
+			t.Fatalf("write neutral schema.sql: %v", err)
+		}
+		neutralIce, err := external.LoadFromPath(neutralDir, external.TargetIceberg)
+		if err != nil || len(neutralIce.Tables) != 1 || !neutralIce.Tables[0].IsIcebergTable() {
+			t.Fatalf("expected neutral filename fallback + FilterSchemaByTarget, got s=%+v err=%v", neutralIce, err)
+		}
+	})
+
+	t.Run("proto_url_security_validations", func(t *testing.T) {
+		pDir := t.TempDir()
+		pFile := filepath.Join(pDir, "test.proto")
+		if err := os.WriteFile(pFile, []byte("syntax = \"proto3\";\n"), 0o644); err != nil {
+			t.Fatalf("write proto: %v", err)
+		}
+		fakeBin := filepath.Join(pDir, "fake-plugin")
+		if err := os.WriteFile(fakeBin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatalf("write fake plugin: %v", err)
+		}
+		for _, badURL := range []string{
+			"proto://" + pFile + "?plugin=" + fakeBin,
+			"proto://" + pFile + "?mode=invalid",
+			"proto://" + pFile + "?doris_storage_vault=bad,opt=1",
+			"proto://" + pFile + "?iceberg_catalog=123bad",
+		} {
+			if _, err := external.LoadSchema(ctx, badURL, external.LoadOptions{PluginPath: fakeBin}); err == nil {
+				t.Errorf("expected proto URL validation error for %q", badURL)
+			}
+		}
+
+		// FilterSchemaByTarget edge cases: nil, TargetAll, default unknown target, non-internal views filtered out
+		if external.FilterSchemaByTarget(nil, external.TargetDoris) != nil {
+			t.Errorf("expected nil FilterSchemaByTarget(nil)")
+		}
+		sMix, err := doris.ParseSchema("CREATE TABLE internal.db.t1 (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;\nCREATE VIEW custom_cat.db.v1 AS SELECT 1;")
+		if err != nil {
+			t.Fatalf("ParseSchema(sMix): %v", err)
+		}
+		if got := external.FilterSchemaByTarget(sMix, external.TargetAll); got != sMix {
+			t.Errorf("expected TargetAll to return identical pointer")
+		}
+		if got := external.FilterSchemaByTarget(sMix, external.TargetFilter("custom")); len(got.Tables) != 1 || len(got.Views) != 1 {
+			t.Errorf("expected unknown target filter default branch to keep objects: %+v", got)
+		}
+		if got := external.FilterSchemaByTarget(sMix, external.TargetDoris); len(got.Views) != 0 {
+			t.Errorf("expected TargetDoris to drop non-internal catalog view, got %+v", got.Views)
+		}
+
+		// proto:// valid storage vault, iceberg_catalog, comma-separated includes
+		fakeProtoc := filepath.Join(pDir, "protoc")
+		if err := os.WriteFile(fakeProtoc, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatalf("write protoc: %v", err)
+		}
+		t.Setenv("PATH", pDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+		if _, err := external.LoadSchema(ctx, "proto://"+pFile+"?mode=ddl&doris_storage_vault=azra_vault&iceberg_catalog=azra_lake&include="+pDir+","+t.TempDir(), external.LoadOptions{
+			PluginPath: fakeBin,
+		}); err == nil {
+			t.Errorf("expected empty fake protoc output directory error after validating proto options")
+		}
+	})
 }

@@ -105,16 +105,25 @@ func diffTable(current, desired *TableDef, opts DiffOptions) []Statement {
 
 	currentColByName := make(map[string]*ColumnDef, len(current.Columns))
 	for _, c := range current.Columns {
+		if c == nil {
+			continue
+		}
 		currentColByName[c.Name] = c
 	}
 	desiredColByName := make(map[string]*ColumnDef, len(desired.Columns))
 	for _, c := range desired.Columns {
+		if c == nil {
+			continue
+		}
 		desiredColByName[c.Name] = c
 	}
 
 	// 1. Dropped columns (if AllowDestructive).
 	evolvingCols := make([]string, 0, len(current.Columns)+len(desired.Columns))
 	for _, cc := range current.Columns {
+		if cc == nil {
+			continue
+		}
 		if opts.AllowDestructive {
 			if _, ok := desiredColByName[cc.Name]; !ok {
 				stmts = append(stmts, Statement{
@@ -132,6 +141,9 @@ func diffTable(current, desired *TableDef, opts DiffOptions) []Statement {
 	isIceberg := desired.IsIcebergTable()
 	isIcebergV3 := isIceberg && strings.TrimSpace(desired.PropertyMap()["format-version"]) == "3"
 	for i, dc := range desired.Columns {
+		if dc == nil {
+			continue
+		}
 		cc, existed := currentColByName[dc.Name]
 		if !existed {
 			colToAdd := dc.Clone()
@@ -178,7 +190,7 @@ func diffTable(current, desired *TableDef, opts DiffOptions) []Statement {
 			}
 			targetCol.HasDefault = cc.HasDefault
 			targetCol.Default = cc.Default
-			if IsIcebergArrayVarcharStringCompatible(cc.Type, targetCol.Type) {
+			if IsIcebergVarcharStringCompatible(cc.Type, targetCol.Type) {
 				targetCol.Type = cc.Type
 			}
 		}
@@ -197,7 +209,7 @@ func diffTable(current, desired *TableDef, opts DiffOptions) []Statement {
 	matchedCurrent, matchedDesired := pairTableIndexes(current.Indexes, desired.Indexes)
 
 	for ci, cIdx := range current.Indexes {
-		if !matchedCurrent[ci] {
+		if !matchedCurrent[ci] && cIdx != nil {
 			stmts = append(stmts, Statement{
 				Kind:          StmtAlterTableDropIndex,
 				TargetTable:   targetName,
@@ -207,7 +219,7 @@ func diffTable(current, desired *TableDef, opts DiffOptions) []Statement {
 	}
 
 	for di, dIdx := range desired.Indexes {
-		if !matchedDesired[di] {
+		if !matchedDesired[di] && dIdx != nil {
 			stmts = append(stmts, Statement{
 				Kind:        StmtAlterTableAddIndex,
 				TargetTable: targetName,
@@ -346,8 +358,16 @@ func pairTableIndexes(current, desired []*IndexDef) (matchedCurrent, matchedDesi
 
 	// Pass 1: exact name + exact IndexDef.Equal match.
 	for di, dIdx := range desired {
+		if dIdx == nil {
+			matchedDesired[di] = true
+			continue
+		}
 		for ci, cIdx := range current {
 			if matchedCurrent[ci] {
+				continue
+			}
+			if cIdx == nil {
+				matchedCurrent[ci] = true
 				continue
 			}
 			if cIdx.Name == dIdx.Name && cIdx.Equal(dIdx) {
@@ -358,18 +378,43 @@ func pairTableIndexes(current, desired []*IndexDef) (matchedCurrent, matchedDesi
 		}
 	}
 
-	// Pass 2: semantic single-column match on normalized (column, index-type, properties).
+	// Track lowercase names of still-unmatched desired indexes so Pass 2 does not
+	// steal a current index whose name is claimed by an unmatched desired index.
+	claimedDesiredNames := make(map[string]int, len(desired))
 	for di, dIdx := range desired {
-		if matchedDesired[di] {
+		if matchedDesired[di] || dIdx == nil {
 			continue
 		}
+		name := strings.ToLower(strings.TrimSpace(dIdx.Name))
+		if name != "" {
+			claimedDesiredNames[name]++
+		}
+	}
+
+	// Pass 2: semantic single-column match on normalized (column, index-type, properties)
+	// with consistent comment equality.
+	for di, dIdx := range desired {
+		if matchedDesired[di] || dIdx == nil {
+			continue
+		}
+		dLower := strings.ToLower(strings.TrimSpace(dIdx.Name))
 		for ci, cIdx := range current {
-			if matchedCurrent[ci] {
+			if matchedCurrent[ci] || cIdx == nil {
 				continue
 			}
-			if (cIdx.Name != dIdx.Name || cIdx.Comment == dIdx.Comment) && singleColumnIndexesSemanticallyEqual(cIdx, dIdx) {
+			if cIdx.Comment != dIdx.Comment {
+				continue
+			}
+			cLower := strings.ToLower(strings.TrimSpace(cIdx.Name))
+			if cLower != dLower && claimedDesiredNames[cLower] > 0 {
+				continue
+			}
+			if singleColumnIndexesSemanticallyEqual(cIdx, dIdx) {
 				matchedCurrent[ci] = true
 				matchedDesired[di] = true
+				if claimedDesiredNames[dLower] > 0 {
+					claimedDesiredNames[dLower]--
+				}
 				break
 			}
 		}

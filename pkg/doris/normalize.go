@@ -15,20 +15,22 @@ const (
 )
 
 var (
-	tenantChainIdentRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,62}$`)
-	createChainTableRe = regexp.MustCompile("(?i)^\\s*CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?`?(internal|azra_lake)`?\\s*\\.\\s*`?tenant_\\$\\{TENANT_SLUG\\}`?\\s*\\.\\s*`?([a-zA-Z_][a-zA-Z0-9_]*)`?\\b")
-	createChainViewRe  = regexp.MustCompile("(?i)^\\s*CREATE\\s+(?:OR\\s+REPLACE\\s+)?VIEW\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?`?(internal)`?\\s*\\.\\s*`?tenant_\\$\\{TENANT_SLUG\\}`?\\s*\\.\\s*`?([a-zA-Z_][a-zA-Z0-9_]*)`?\\b")
-	modifyChainViewRe  = regexp.MustCompile("(?i)^\\s*(?:ALTER\\s+VIEW|DROP\\s+VIEW(?:\\s+IF\\s+EXISTS)?)\\s+`?(internal)`?\\s*\\.\\s*`?tenant_\\$\\{TENANT_SLUG\\}`?\\s*\\.\\s*`?([a-zA-Z_][a-zA-Z0-9_]*)`?\\b")
-	modifyChainTableRe = regexp.MustCompile("(?i)^\\s*(?:ALTER\\s+TABLE|DROP\\s+TABLE(?:\\s+IF\\s+EXISTS)?|TRUNCATE\\s+TABLE|INSERT\\s+(?:OVERWRITE\\s+TABLE|INTO)|REPLACE\\s+INTO|UPDATE|DELETE\\s+FROM)\\s+`?(internal|azra_lake)`?\\s*\\.\\s*`?tenant_\\$\\{TENANT_SLUG\\}`?\\s*\\.\\s*`?([a-zA-Z_][a-zA-Z0-9_]*)`?\\b")
-	indexChainTableRe  = regexp.MustCompile("(?i)^\\s*(?:BUILD\\s+INDEX|DROP\\s+INDEX(?:\\s+IF\\s+EXISTS)?|CREATE\\s+INDEX(?:\\s+IF\\s+NOT\\s+EXISTS)?)\\s+`?[a-zA-Z_][a-zA-Z0-9_]*`?\\s+ON\\s+`?(internal|azra_lake)`?\\s*\\.\\s*`?tenant_\\$\\{TENANT_SLUG\\}`?\\s*\\.\\s*`?([a-zA-Z_][a-zA-Z0-9_]*)`?\\b")
-	forbiddenChainRe   = regexp.MustCompile(`(?i)^\s*(?:GRANT|REVOKE|DROP\s+(?:DATABASE|SCHEMA|CATALOG|USER|ROLE)|CREATE\s+(?:DATABASE|SCHEMA|CATALOG|USER|ROLE)|ALTER\s+(?:DATABASE|SCHEMA|CATALOG|USER|ROLE)|SET|USE|ADMIN|KILL|SHOW)\b`)
-	threePartRefRe     = regexp.MustCompile("`?([a-zA-Z_][a-zA-Z0-9_]*)`?\\s*\\.\\s*`?(tenant_\\$\\{TENANT_SLUG\\}|[a-zA-Z_][a-zA-Z0-9_]*)`?\\s*\\.\\s*`?([a-zA-Z_][a-zA-Z0-9_]*)`?")
+	tenantChainIdentRe  = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,62}$`)
+	createChainTableRe  = regexp.MustCompile("(?i)^\\s*CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?`?(internal|azra_lake)`?\\s*\\.\\s*`?tenant_\\$\\{TENANT_SLUG\\}`?\\s*\\.\\s*`?([a-zA-Z_][a-zA-Z0-9_]*)`?\\b")
+	createChainViewRe   = regexp.MustCompile("(?i)^\\s*CREATE\\s+(?:OR\\s+REPLACE\\s+)?VIEW\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?`?(internal)`?\\s*\\.\\s*`?tenant_\\$\\{TENANT_SLUG\\}`?\\s*\\.\\s*`?([a-zA-Z_][a-zA-Z0-9_]*)`?\\b")
+	modifyChainViewRe   = regexp.MustCompile("(?i)^\\s*(?:ALTER\\s+VIEW|DROP\\s+VIEW(?:\\s+IF\\s+EXISTS)?)\\s+`?(internal)`?\\s*\\.\\s*`?tenant_\\$\\{TENANT_SLUG\\}`?\\s*\\.\\s*`?([a-zA-Z_][a-zA-Z0-9_]*)`?\\b")
+	modifyChainTableRe  = regexp.MustCompile("(?i)^\\s*(?:ALTER\\s+TABLE|DROP\\s+TABLE(?:\\s+IF\\s+EXISTS)?|TRUNCATE\\s+TABLE|INSERT\\s+(?:OVERWRITE\\s+TABLE|INTO)|REPLACE\\s+INTO|UPDATE|DELETE\\s+FROM)\\s+`?(internal|azra_lake)`?\\s*\\.\\s*`?tenant_\\$\\{TENANT_SLUG\\}`?\\s*\\.\\s*`?([a-zA-Z_][a-zA-Z0-9_]*)`?\\b")
+	indexChainTableRe   = regexp.MustCompile("(?i)^\\s*(?:BUILD\\s+INDEX|DROP\\s+INDEX(?:\\s+IF\\s+EXISTS)?|CREATE\\s+INDEX(?:\\s+IF\\s+NOT\\s+EXISTS)?)\\s+`?[a-zA-Z_][a-zA-Z0-9_]*`?\\s+ON\\s+`?(internal|azra_lake)`?\\s*\\.\\s*`?tenant_\\$\\{TENANT_SLUG\\}`?\\s*\\.\\s*`?([a-zA-Z_][a-zA-Z0-9_]*)`?\\b")
+	forbiddenChainRe    = regexp.MustCompile(`(?i)^\s*(?:GRANT|REVOKE|DROP\s+(?:DATABASE|SCHEMA|CATALOG|USER|ROLE)|CREATE\s+(?:DATABASE|SCHEMA|CATALOG|USER|ROLE)|ALTER\s+(?:DATABASE|SCHEMA|CATALOG|USER|ROLE)|SET|USE|ADMIN|KILL|SHOW)\b`)
+	forbiddenChainTVF   = map[string]bool{"s3": true, "hdfs": true, "local": true, "http_stream": true}
+	twoPartRefKeywords  = map[string]bool{"FROM": true, "JOIN": true, "INTO": true, "LIKE": true, "USING": true, "TABLE": true, "VIEW": true}
+	fromClauseStopWords = map[string]bool{"WHERE": true, "GROUP": true, "HAVING": true, "ORDER": true, "LIMIT": true, "OFFSET": true, "UNION": true, "INTERSECT": true, "EXCEPT": true, "ON": true, "SET": true, "VALUES": true}
 )
 
 // ValidateTenantChainStatement verifies that stmt is a tenant-isolated DDL/DML statement
 // targeting `<internal|azra_lake>.tenant_${TENANT_SLUG}.<owned_table_or_view>`, rejects
 // administrative/privilege statements, registers newly created tables and views in seenTables,
-// seenViews, and ownedTables, and ensures all 3-part object references stay within owned objects.
+// seenViews, and ownedTables, and ensures all object references stay within owned objects.
 func ValidateTenantChainStatement(stmt string, seenTables, seenViews map[string]bool, ownedTables *[]string) error {
 	if seenTables == nil {
 		seenTables = make(map[string]bool)
@@ -37,10 +39,17 @@ func ValidateTenantChainStatement(stmt string, seenTables, seenViews map[string]
 		seenViews = make(map[string]bool)
 	}
 
-	stripped := stripSQLCommentsAndStringLiterals(stmt)
+	stripped, err := stripSQLCommentsAndStringLiterals(stmt)
+	if err != nil {
+		return err
+	}
 	if forbiddenChainRe.MatchString(stripped) {
 		return errors.New("forbidden administrative or privilege statement in migration chain")
 	}
+
+	var pendingTable string
+	var pendingView string
+	isAlterTable := false
 
 	switch {
 	case createChainTableRe.MatchString(stripped):
@@ -49,19 +58,14 @@ func ValidateTenantChainStatement(stmt string, seenTables, seenViews map[string]
 		if !isValidTenantChainIdent(tbl) {
 			return fmt.Errorf("invalid table identifier %q", tbl)
 		}
-		if !seenTables[tbl] {
-			seenTables[tbl] = true
-			if ownedTables != nil {
-				*ownedTables = append(*ownedTables, tbl)
-			}
-		}
+		pendingTable = tbl
 	case createChainViewRe.MatchString(stripped):
 		m := createChainViewRe.FindStringSubmatch(stripped)
 		vw := strings.ToLower(strings.TrimSpace(m[2]))
 		if !isValidTenantChainIdent(vw) {
 			return fmt.Errorf("invalid view identifier %q", vw)
 		}
-		seenViews[vw] = true
+		pendingView = vw
 	case modifyChainViewRe.MatchString(stripped):
 		m := modifyChainViewRe.FindStringSubmatch(stripped)
 		vw := strings.ToLower(strings.TrimSpace(m[2]))
@@ -74,6 +78,10 @@ func ValidateTenantChainStatement(stmt string, seenTables, seenViews map[string]
 		if !seenTables[tbl] {
 			return fmt.Errorf("statement targets unowned table %q", tbl)
 		}
+		tokens := scanLeadingKeywords(stripped, 2)
+		if len(tokens) >= 2 && strings.EqualFold(tokens[0], "ALTER") && strings.EqualFold(tokens[1], "TABLE") {
+			isAlterTable = true
+		}
 	case indexChainTableRe.MatchString(stripped):
 		m := indexChainTableRe.FindStringSubmatch(stripped)
 		tbl := strings.ToLower(strings.TrimSpace(m[2]))
@@ -84,69 +92,247 @@ func ValidateTenantChainStatement(stmt string, seenTables, seenViews map[string]
 		return errors.New("statement does not target <internal|azra_lake>.tenant_${TENANT_SLUG}.<owned_table>")
 	}
 
-	refs := threePartRefRe.FindAllStringSubmatch(stripped, -1)
-	if len(refs) == 0 {
+	toks := tokenizeTenantChainSQL(stripped)
+
+	// Reject REPLACE WITH TABLE anywhere and ALTER TABLE ... RENAME outside string literals/backticks.
+	for i := 0; i < len(toks); i++ {
+		tok := toks[i]
+		if !tok.isWord || tok.quoted {
+			continue
+		}
+		upper := strings.ToUpper(tok.val)
+		if isAlterTable && upper == "RENAME" {
+			return errors.New("ALTER TABLE ... RENAME is not allowed in migration chain")
+		}
+		if upper == "REPLACE" && i+2 < len(toks) &&
+			toks[i+1].isWord && !toks[i+1].quoted && strings.EqualFold(toks[i+1].val, "WITH") &&
+			toks[i+2].isWord && !toks[i+2].quoted && strings.EqualFold(toks[i+2].val, "TABLE") {
+			return errors.New("ALTER TABLE ... REPLACE WITH TABLE is not allowed in migration chain")
+		}
+	}
+
+	// Reject external Table-Valued Functions: s3(, hdfs(, local(, http_stream(.
+	for i := 0; i+1 < len(toks); i++ {
+		if !toks[i].isWord {
+			continue
+		}
+		if toks[i+1].raw == "(" && (i == 0 || toks[i-1].raw != ".") {
+			if forbiddenChainTVF[strings.ToLower(toks[i].val)] {
+				return fmt.Errorf("external table-valued function %s() is not allowed in migration chain", strings.ToLower(toks[i].val))
+			}
+		}
+	}
+
+	// Scan all dotted identifier chains (both 3+ part refs and 2-part table/view refs).
+	threePartCount := 0
+	fromListDepth := map[int]bool{}
+	parenDepth := 0
+
+	for i := 0; i < len(toks); i++ {
+		tok := toks[i]
+		if tok.raw == "(" {
+			parenDepth++
+			continue
+		}
+		if tok.raw == ")" {
+			delete(fromListDepth, parenDepth)
+			if parenDepth > 0 {
+				parenDepth--
+			}
+			continue
+		}
+		if tok.raw == ";" {
+			fromListDepth[parenDepth] = false
+			continue
+		}
+		if tok.isWord && !tok.quoted {
+			upper := strings.ToUpper(tok.val)
+			if upper == "FROM" {
+				fromListDepth[parenDepth] = true
+			} else if fromClauseStopWords[upper] {
+				fromListDepth[parenDepth] = false
+			}
+		}
+
+		// Detect maximal dotted identifier sequence starting at i.
+		if !tok.isWord || i+2 >= len(toks) || toks[i+1].raw != "." || !toks[i+2].isWord {
+			continue
+		}
+		segs := []string{tok.val}
+		endIdx := i
+		for endIdx+2 < len(toks) && toks[endIdx+1].raw == "." && toks[endIdx+2].isWord {
+			segs = append(segs, toks[endIdx+2].val)
+			endIdx += 2
+		}
+
+		switch len(segs) {
+		case 3:
+			threePartCount++
+			cat := strings.ToLower(strings.TrimSpace(segs[0]))
+			db := strings.TrimSpace(segs[1])
+			obj := strings.ToLower(strings.TrimSpace(segs[2]))
+			if cat != "internal" && cat != "azra_lake" {
+				return fmt.Errorf("statement references disallowed catalog %q", segs[0])
+			}
+			if db != "tenant_${TENANT_SLUG}" {
+				return fmt.Errorf("statement references disallowed database %q", db)
+			}
+			if !isValidTenantChainIdent(obj) {
+				return fmt.Errorf("statement references invalid object identifier %q", segs[2])
+			}
+			isOwned := seenTables[obj] || seenViews[obj] ||
+				(pendingTable != "" && obj == pendingTable) ||
+				(pendingView != "" && obj == pendingView)
+			if !isOwned {
+				return fmt.Errorf("statement references unowned object %q", obj)
+			}
+		case 2:
+			if isTwoPartTablePosition(toks, i, fromListDepth[parenDepth]) {
+				return fmt.Errorf("2-part object reference %q.%q is not allowed; must use <catalog>.tenant_${TENANT_SLUG}.<table>", segs[0], segs[1])
+			}
+		default:
+			return fmt.Errorf("unsupported %d-part object reference starting with %q", len(segs), segs[0])
+		}
+		i = endIdx
+	}
+
+	if threePartCount == 0 {
 		return errors.New("statement is missing <catalog>.tenant_${TENANT_SLUG}.<table> qualification")
 	}
-	for _, ref := range refs {
-		cat := strings.ToLower(strings.TrimSpace(ref[1]))
-		db := strings.TrimSpace(ref[2])
-		obj := strings.ToLower(strings.TrimSpace(ref[3]))
-		if cat != "internal" && cat != "azra_lake" {
-			return fmt.Errorf("statement references disallowed catalog %q", ref[1])
-		}
-		if db != "tenant_${TENANT_SLUG}" {
-			return fmt.Errorf("statement references disallowed database %q", db)
-		}
-		if !seenTables[obj] && !seenViews[obj] {
-			return fmt.Errorf("statement references unowned object %q", obj)
+
+	// All validation succeeded: commit staged table/view mutations.
+	if pendingTable != "" && !seenTables[pendingTable] {
+		seenTables[pendingTable] = true
+		if ownedTables != nil {
+			*ownedTables = append(*ownedTables, pendingTable)
 		}
 	}
+	if pendingView != "" {
+		seenViews[pendingView] = true
+	}
 	return nil
+}
+
+type chainSQLToken struct {
+	raw    string
+	val    string
+	isWord bool
+	quoted bool
+}
+
+func isTwoPartTablePosition(toks []chainSQLToken, startIdx int, inFromList bool) bool {
+	if startIdx <= 0 {
+		return false
+	}
+	prev := toks[startIdx-1]
+	if prev.isWord && !prev.quoted && twoPartRefKeywords[strings.ToUpper(prev.val)] {
+		return true
+	}
+	// Handle [TABLE|VIEW] IF [NOT] EXISTS <db.tbl>
+	if startIdx >= 3 && prev.isWord && !prev.quoted && strings.EqualFold(prev.val, "EXISTS") {
+		if toks[startIdx-2].isWord && !toks[startIdx-2].quoted {
+			if strings.EqualFold(toks[startIdx-2].val, "IF") {
+				return startIdx >= 3
+			}
+			if strings.EqualFold(toks[startIdx-2].val, "NOT") && startIdx >= 4 &&
+				toks[startIdx-3].isWord && !toks[startIdx-3].quoted && strings.EqualFold(toks[startIdx-3].val, "IF") {
+				return true
+			}
+		}
+	}
+	// Handle comma-chained tables in FROM clause: FROM a.b.c, other_db.tbl
+	if inFromList && prev.raw == "," {
+		return true
+	}
+	return false
+}
+
+func tokenizeTenantChainSQL(stripped string) []chainSQLToken {
+	var toks []chainSQLToken
+	n := len(stripped)
+	for i := 0; i < n; {
+		ch := stripped[i]
+		if isSQLSpace(ch) {
+			i++
+			continue
+		}
+		if ch == '\'' || ch == '"' {
+			nextQuote, ok := skipSQLQuotedOrBacktick(stripped, i)
+			if !ok {
+				toks = append(toks, chainSQLToken{raw: stripped[i:]})
+				break
+			}
+			toks = append(toks, chainSQLToken{raw: stripped[i:nextQuote]})
+			i = nextQuote
+			continue
+		}
+		if ch == '`' {
+			nextQuote, ok := skipSQLQuotedOrBacktick(stripped, i)
+			if !ok {
+				toks = append(toks, chainSQLToken{raw: stripped[i:]})
+				break
+			}
+			inner := strings.ReplaceAll(stripped[i+1:nextQuote-1], "``", "`")
+			toks = append(toks, chainSQLToken{raw: stripped[i:nextQuote], val: inner, isWord: true, quoted: true})
+			i = nextQuote
+			continue
+		}
+		if isSQLIdentStart(ch) || ch == '$' {
+			end := readChainIdentEnd(stripped, i)
+			if end > i {
+				raw := stripped[i:end]
+				toks = append(toks, chainSQLToken{raw: raw, val: raw, isWord: true})
+				i = end
+				continue
+			}
+		}
+		if ch >= '0' && ch <= '9' {
+			end := i + 1
+			for end < n && ((stripped[end] >= '0' && stripped[end] <= '9') || stripped[end] == '.') {
+				end++
+			}
+			toks = append(toks, chainSQLToken{raw: stripped[i:end]})
+			i = end
+			continue
+		}
+		toks = append(toks, chainSQLToken{raw: string(ch)})
+		i++
+	}
+	return toks
+}
+
+func readChainIdentEnd(s string, pos int) int {
+	n := len(s)
+	i := pos
+	for i < n {
+		if s[i] == '$' && i+1 < n && s[i+1] == '{' {
+			if closeIdx := strings.IndexByte(s[i+2:], '}'); closeIdx >= 0 {
+				i += 2 + closeIdx + 1
+				continue
+			}
+			break
+		}
+		if isSQLIdentPart(s[i]) {
+			i++
+			continue
+		}
+		break
+	}
+	return i
 }
 
 func isValidTenantChainIdent(name string) bool {
 	return tenantChainIdentRe.MatchString(name)
 }
 
-func stripSQLCommentsAndStringLiterals(stmt string) string {
+func stripSQLCommentsAndStringLiterals(stmt string) (string, error) {
 	var b strings.Builder
 	b.Grow(len(stmt))
 	n := len(stmt)
+	seenSemicolon := false
+
 	for i := 0; i < n; {
 		ch := stmt[i]
-		if ch == '\'' || ch == '"' {
-			quote := ch
-			b.WriteByte(quote)
-			i++
-			for i < n {
-				c := stmt[i]
-				if c == '\\' && i+1 < n {
-					i += 2
-					continue
-				}
-				i++
-				if c == quote {
-					if i < n && stmt[i] == quote {
-						i++
-						continue
-					}
-					break
-				}
-			}
-			b.WriteByte(quote)
-			continue
-		}
-		if ch == '`' {
-			nextQuote, ok := skipSQLQuotedOrBacktick(stmt, i)
-			if !ok {
-				b.WriteString(stmt[i:])
-				break
-			}
-			b.WriteString(stmt[i:nextQuote])
-			i = nextQuote
-			continue
-		}
 		if ch == '-' && i+1 < n && stmt[i+1] == '-' {
 			i += 2
 			for i < n && stmt[i] != '\n' {
@@ -164,18 +350,68 @@ func stripSQLCommentsAndStringLiterals(stmt string) string {
 			continue
 		}
 		if ch == '/' && i+1 < n && stmt[i+1] == '*' {
+			if i+2 < n && stmt[i+2] == '!' {
+				return "", errors.New("MySQL conditional comments (/*! ... */) are not allowed")
+			}
 			end := strings.Index(stmt[i+2:], "*/")
 			if end < 0 {
-				break
+				return "", errors.New("unterminated block comment in SQL statement")
 			}
 			i += 2 + end + 2
 			b.WriteByte(' ')
 			continue
 		}
+		if seenSemicolon {
+			if isSQLSpace(ch) {
+				b.WriteByte(ch)
+				i++
+				continue
+			}
+			return "", errors.New("multiple SQL statements (non-trailing semicolon) are not allowed")
+		}
+		if ch == '\'' || ch == '"' {
+			quote := ch
+			b.WriteByte(quote)
+			i++
+			closed := false
+			for i < n {
+				c := stmt[i]
+				if c == '\\' && i+1 < n {
+					i += 2
+					continue
+				}
+				i++
+				if c == quote {
+					if i < n && stmt[i] == quote {
+						i++
+						continue
+					}
+					closed = true
+					break
+				}
+			}
+			if !closed {
+				return "", errors.New("unterminated string literal in SQL statement")
+			}
+			b.WriteByte(quote)
+			continue
+		}
+		if ch == '`' {
+			nextQuote, ok := skipSQLQuotedOrBacktick(stmt, i)
+			if !ok {
+				return "", errors.New("unterminated backtick identifier in SQL statement")
+			}
+			b.WriteString(stmt[i:nextQuote])
+			i = nextQuote
+			continue
+		}
+		if ch == ';' {
+			seenSemicolon = true
+		}
 		b.WriteByte(ch)
 		i++
 	}
-	return b.String()
+	return b.String(), nil
 }
 
 func isCoupledModeDisallowedProp(key string) bool {
@@ -196,7 +432,7 @@ func IsCoupledModeUnknownPropertiesErr(err error) bool {
 	if idx < 0 {
 		return false
 	}
-	rest := msg[idx+len(unknownPropertiesErrPrefix):]
+	rest := lower[idx+len(unknownPropertiesErrPrefix):]
 	closeIdx := strings.IndexByte(rest, '}')
 	if closeIdx <= 0 {
 		return false
@@ -294,8 +530,14 @@ func StripCoupledModeCreateTableProperties(stmt string) string {
 							for trimStart > prevEnd && isSQLSpace(stmt[trimStart-1]) {
 								trimStart--
 							}
+							// Preserve the newline that terminates a trailing -- or # line comment
+							// before the stripped PROPERTIES clause so the following token/semicolon
+							// is not swallowed into the comment.
+							if endsInsideLineComment(stmt, trimStart) && trimStart < i && stmt[trimStart] == '\n' {
+								trimStart++
+							}
 							repText := ""
-							if trimStart < i && closeParen+1 < n && !isSQLSpace(stmt[closeParen+1]) && stmt[closeParen+1] != ';' {
+							if trimStart < i && closeParen+1 < n && !isSQLSpace(stmt[closeParen+1]) && stmt[closeParen+1] != ';' && stmt[trimStart-1] != '\n' {
 								repText = " "
 							}
 							repls = append(repls, spanReplacement{start: trimStart, end: closeParen + 1, text: repText})
@@ -341,9 +583,18 @@ type sqlSpan struct {
 }
 
 func splitTopLevelSQLItemSpans(s string) ([]sqlSpan, bool) {
+	return splitTopLevelItemSpans(s, false)
+}
+
+func splitTopLevelDDLItemSpans(s string) ([]sqlSpan, bool) {
+	return splitTopLevelItemSpans(s, true)
+}
+
+func splitTopLevelItemSpans(s string, trackAngles bool) ([]sqlSpan, bool) {
 	n := len(s)
 	var spans []sqlSpan
-	depth := 0
+	parenDepth := 0
+	angleDepth := 0
 	itemStart := 0
 	for i := 0; i < n; {
 		nextTrivia, ok := skipSQLTrivia(s, i)
@@ -365,21 +616,31 @@ func splitTopLevelSQLItemSpans(s string) ([]sqlSpan, bool) {
 		}
 		switch ch {
 		case '(':
-			depth++
+			parenDepth++
 		case ')':
-			if depth == 0 {
+			if parenDepth == 0 {
 				return nil, false
 			}
-			depth--
+			parenDepth--
+		case '<':
+			if trackAngles && parenDepth == 0 {
+				angleDepth++
+			}
+		case '>':
+			if trackAngles && parenDepth == 0 {
+				if angleDepth > 0 {
+					angleDepth--
+				}
+			}
 		case ',':
-			if depth == 0 {
+			if parenDepth == 0 && angleDepth == 0 {
 				spans = append(spans, sqlSpan{start: itemStart, end: i})
 				itemStart = i + 1
 			}
 		}
 		i++
 	}
-	if depth != 0 {
+	if parenDepth != 0 || angleDepth != 0 {
 		return nil, false
 	}
 	spans = append(spans, sqlSpan{start: itemStart, end: n})
@@ -528,6 +789,11 @@ func widenIcebergIntTypesInSpec(spec string) (string, bool) {
 		}
 		if isSQLIdentStart(ch) && (i == 0 || !isSQLIdentPart(spec[i-1])) {
 			word, wordEnd, _ := readSQLWord(spec, i)
+			// Skip STRUCT field names (e.g. `smallint:INT`, `tinyint: VARCHAR(10)`).
+			if colonPos, ok := skipSQLTrivia(spec, wordEnd); ok && colonPos < n && spec[colonPos] == ':' {
+				i = colonPos + 1
+				continue
+			}
 			if strings.EqualFold(word, "AFTER") {
 				afterPos, ok := skipSQLTrivia(spec, wordEnd)
 				if !ok {
@@ -556,7 +822,7 @@ func widenIcebergIntTypesInSpec(spec string) (string, bool) {
 }
 
 func rewriteIcebergColumnDefinitionsBlock(inner string) (string, bool) {
-	spans, ok := splitTopLevelSQLItemSpans(inner)
+	spans, ok := splitTopLevelDDLItemSpans(inner)
 	if !ok {
 		return inner, false
 	}
@@ -682,7 +948,7 @@ func NormalizeIcebergCatalogDDL(stmt, icebergCatalog string) string {
 		}
 		tailEnd := findTopLevelSemicolonOrEnd(stmt, afterRef)
 		tail := stmt[afterRef:tailEnd]
-		spans, ok := splitTopLevelSQLItemSpans(tail)
+		spans, ok := splitTopLevelDDLItemSpans(tail)
 		if !ok {
 			return stmt
 		}
@@ -767,6 +1033,14 @@ func rewriteIcebergAlterClause(clause string) (string, bool) {
 					return clause, false
 				}
 			case "INDEX", "KEY", "PARTITION", "CONSTRAINT", "PRIMARY", "UNIQUE", "FOREIGN":
+				return clause, false
+			}
+		}
+	}
+	if strings.EqualFold(action, "ADD") && clause[p] != '`' && clause[p] != '(' {
+		if afterINE, hasINE := consumeIfNotExists(clause, p); hasINE {
+			p = afterINE
+			if p >= len(clause) {
 				return clause, false
 			}
 		}
@@ -896,7 +1170,43 @@ func encodeCompositeOrderField(expr string) string {
 	)
 }
 
-func rewriteOrderKeyStructs(s string) (string, bool) {
+const (
+	maxNereidsOrderKeyDepth       = 4
+	maxNereidsOrderKeyOutputBytes = 1 << 20
+)
+
+func consumeIfNotExists(s string, pos int) (int, bool) {
+	wIf, afterIf, ok := readSQLWord(s, pos)
+	if !ok || !strings.EqualFold(wIf, "IF") {
+		return pos, false
+	}
+	pNot, ok := skipSQLTrivia(s, afterIf)
+	if !ok {
+		return pos, false
+	}
+	wNot, afterNot, ok := readSQLWord(s, pNot)
+	if !ok || !strings.EqualFold(wNot, "NOT") {
+		return pos, false
+	}
+	pEx, ok := skipSQLTrivia(s, afterNot)
+	if !ok {
+		return pos, false
+	}
+	wEx, afterEx, ok := readSQLWord(s, pEx)
+	if !ok || !strings.EqualFold(wEx, "EXISTS") {
+		return pos, false
+	}
+	nextPos, ok := skipSQLTrivia(s, afterEx)
+	if !ok {
+		return pos, false
+	}
+	return nextPos, true
+}
+
+func rewriteOrderKeyStructs(s string, depth int, byteBudget int) (string, bool) {
+	if depth >= maxNereidsOrderKeyDepth || byteBudget <= 0 || len(s) > byteBudget {
+		return s, false
+	}
 	n := len(s)
 	var repls []spanReplacement
 	for i := 0; i < n; {
@@ -942,14 +1252,21 @@ func rewriteOrderKeyStructs(s string) (string, bool) {
 					if ok && len(fields) > 0 {
 						encoded := make([]string, 0, len(fields))
 						validFields := true
+						totalLen := len("CONCAT_WS(CHAR(1), )")
 						for _, rawField := range fields {
 							cleanField := trimLeadingSQLTrivia(rawField)
 							if cleanField == "" {
 								validFields = false
 								break
 							}
-							rewrittenField, _ := rewriteOrderKeyStructs(cleanField)
-							encoded = append(encoded, encodeCompositeOrderField(rewrittenField))
+							rewrittenField, _ := rewriteOrderKeyStructs(cleanField, depth+1, byteBudget)
+							enc := encodeCompositeOrderField(rewrittenField)
+							totalLen += len(enc) + 2
+							if totalLen > byteBudget {
+								validFields = false
+								break
+							}
+							encoded = append(encoded, enc)
 						}
 						if validFields {
 							repls = append(repls, spanReplacement{
@@ -973,13 +1290,28 @@ func rewriteOrderKeyStructs(s string) (string, bool) {
 	if len(repls) == 0 {
 		return s, false
 	}
-	return applySpanReplacements(s, repls), true
+	out := applySpanReplacements(s, repls)
+	if len(out) > byteBudget {
+		return s, false
+	}
+	return out, true
 }
 
 // NormalizeNereidsViewOrderKeys rewrites composite `STRUCT(e_1, ..., e_k)` order-key
 // expressions inside the second argument of `MAX_BY(valExpr, ordExpr)` and `MIN_BY(valExpr, ordExpr)`
 // into an order-preserving lexicographic `CONCAT_WS(CHAR(1), ...)` key accepted by Doris 4.1.5 Nereids.
 func NormalizeNereidsViewOrderKeys(stmt string) string {
+	budget := maxNereidsOrderKeyOutputBytes
+	if b := len(stmt) * 16; b > budget && b <= 4*maxNereidsOrderKeyOutputBytes {
+		budget = b
+	}
+	return normalizeNereidsViewOrderKeysDepth(stmt, 0, budget)
+}
+
+func normalizeNereidsViewOrderKeysDepth(stmt string, depth int, byteBudget int) string {
+	if depth >= maxNereidsOrderKeyDepth || byteBudget <= 0 || len(stmt) > byteBudget {
+		return stmt
+	}
 	n := len(stmt)
 	var repls []spanReplacement
 	for i := 0; i < n; {
@@ -1015,10 +1347,10 @@ func NormalizeNereidsViewOrderKeys(stmt string) string {
 					inner := stmt[openParen+1 : closeParen]
 					args, ok := splitTopLevelSQLItems(inner)
 					if ok && len(args) == 2 {
-						newVal := NormalizeNereidsViewOrderKeys(args[0])
-						newOrd := NormalizeNereidsViewOrderKeys(args[1])
-						newOrd, _ = rewriteOrderKeyStructs(newOrd)
-						if newVal != args[0] || newOrd != args[1] {
+						newVal := normalizeNereidsViewOrderKeysDepth(args[0], depth+1, byteBudget)
+						newOrd := normalizeNereidsViewOrderKeysDepth(args[1], depth+1, byteBudget)
+						newOrd, _ = rewriteOrderKeyStructs(newOrd, depth, byteBudget)
+						if (newVal != args[0] || newOrd != args[1]) && len(newVal)+len(newOrd)+1 <= byteBudget {
 							repls = append(repls, spanReplacement{
 								start: openParen + 1,
 								end:   closeParen,
@@ -1038,7 +1370,11 @@ func NormalizeNereidsViewOrderKeys(stmt string) string {
 	if len(repls) == 0 {
 		return stmt
 	}
-	return applySpanReplacements(stmt, repls)
+	out := applySpanReplacements(stmt, repls)
+	if len(out) > byteBudget {
+		return stmt
+	}
+	return out
 }
 
 func isCreateTableStatement(stmt string) bool {
@@ -1330,6 +1666,68 @@ func stripCoupledPropsInner(inner string) (string, bool, bool) {
 		return strings.Join(kept, ", "), false, true
 	}
 	itemIndent, closeIndent := extractMultilineIndents(inner, segments)
-	rewritten := "\n" + itemIndent + strings.Join(kept, ",\n"+itemIndent) + "\n" + closeIndent
-	return rewritten, false, true
+	var out strings.Builder
+	out.WriteByte('\n')
+	out.WriteString(itemIndent)
+	for i, k := range kept {
+		out.WriteString(k)
+		if i < len(kept)-1 {
+			if endsInsideLineComment(k, len(k)) {
+				out.WriteByte('\n')
+				out.WriteString(itemIndent)
+				out.WriteString(", ")
+			} else {
+				out.WriteString(",\n")
+				out.WriteString(itemIndent)
+			}
+		}
+	}
+	out.WriteByte('\n')
+	out.WriteString(closeIndent)
+	return out.String(), false, true
+}
+
+func endsInsideLineComment(s string, pos int) bool {
+	if pos <= 0 || pos > len(s) {
+		return false
+	}
+	inLineComment := false
+	for i := 0; i < pos; {
+		ch := s[i]
+		if inLineComment {
+			if ch == '\n' {
+				inLineComment = false
+			}
+			i++
+			continue
+		}
+		if ch == '\'' || ch == '"' || ch == '`' {
+			nextQuote, ok := skipSQLQuotedOrBacktick(s, i)
+			if !ok {
+				return false
+			}
+			i = nextQuote
+			continue
+		}
+		if ch == '-' && i+1 < pos && s[i+1] == '-' {
+			inLineComment = true
+			i += 2
+			continue
+		}
+		if ch == '#' {
+			inLineComment = true
+			i++
+			continue
+		}
+		if ch == '/' && i+1 < pos && s[i+1] == '*' {
+			end := strings.Index(s[i+2:pos], "*/")
+			if end < 0 {
+				return false
+			}
+			i += 2 + end + 2
+			continue
+		}
+		i++
+	}
+	return inLineComment
 }

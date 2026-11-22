@@ -87,7 +87,7 @@ func runMigrateDiff(ctx context.Context, args []string, stdout, stderr io.Writer
 	var toURLs, includes multiStringFlag
 	fs.StringVar(&dirURL, "dir", "", "migration directory URL (file://path/to/migrations)")
 	fs.Var(&toURLs, "to", "desired schema URL (file://path or proto://path, repeatable)")
-	fs.StringVar(&target, "target", "all", "target filter: all | doris | iceberg")
+	fs.StringVar(&target, "target", "", "target filter: all | doris | iceberg")
 	fs.StringVar(&pluginPath, "plugin", "", "path to protoc-gen-proto2type binary")
 	fs.StringVar(&versionOverride, "version", "", "optional explicit 14-digit migration version")
 	fs.BoolVar(&allowDestructive, "allow-drop-column", false, "allow destructive column/table drops")
@@ -193,7 +193,7 @@ func runMigrateLint(ctx context.Context, args []string, stdout, stderr io.Writer
 	var toURLs, includes multiStringFlag
 	fs.StringVar(&dirURL, "dir", "", "migration directory URL (file://path/to/migrations)")
 	fs.Var(&toURLs, "to", "optional desired target schema URL (file:// or proto://, repeatable)")
-	fs.StringVar(&target, "target", "all", "target filter: all | doris | iceberg")
+	fs.StringVar(&target, "target", "", "target filter: all | doris | iceberg")
 	fs.StringVar(&pluginPath, "plugin", "", "path to protoc-gen-proto2type binary")
 	fs.BoolVar(&allowDestructive, "allow-drop-column", false, "allow destructive column/table drops")
 	fs.BoolVar(&allowDestructive, "allow-destructive", false, "allow destructive column/table drops")
@@ -323,7 +323,7 @@ func runMigrateApply(ctx context.Context, args []string, stdout, stderr io.Write
 	}
 
 	var exec *migrate.Executor
-	if dbURL != "" && !dryRun {
+	if dbURL != "" {
 		exec, err = migrate.DialExecutor(dbURL, revisionsSchema)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "connect to Doris: %v\n", err)
@@ -391,7 +391,7 @@ func runSchemaInspect(ctx context.Context, args []string, stdout, stderr io.Writ
 	var includes multiStringFlag
 	fs.StringVar(&targetURL, "url", "", "schema URL (file://path, proto://path, or doris://...)")
 	fs.StringVar(&targetURL, "u", "", "schema URL shorthand")
-	fs.StringVar(&target, "target", "all", "target filter: all | doris | iceberg")
+	fs.StringVar(&target, "target", "", "target filter: all | doris | iceberg")
 	fs.StringVar(&format, "format", "sql", "output format: sql | hcl")
 	fs.StringVar(&pluginPath, "plugin", "", "path to protoc-gen-proto2type binary")
 	fs.Var(&includes, "include", "proto include directory (repeatable)")
@@ -433,7 +433,7 @@ func runSchemaDiff(ctx context.Context, args []string, stdout, stderr io.Writer)
 	var fromURLs, toURLs, includes multiStringFlag
 	fs.Var(&fromURLs, "from", "source schema URL (file://path or proto://path, repeatable)")
 	fs.Var(&toURLs, "to", "target schema URL (file://path or proto://path, repeatable)")
-	fs.StringVar(&target, "target", "all", "target filter: all | doris | iceberg")
+	fs.StringVar(&target, "target", "", "target filter: all | doris | iceberg")
 	fs.StringVar(&pluginPath, "plugin", "", "path to protoc-gen-proto2type binary")
 	fs.BoolVar(&allowDestructive, "allow-drop-column", false, "allow destructive column/table drops")
 	fs.BoolVar(&allowDestructive, "allow-destructive", false, "allow destructive column/table drops")
@@ -497,13 +497,14 @@ func runSchemaParity(ctx context.Context, args []string, stdout, stderr io.Write
 		return 1
 	}
 
+	if len(dirPaths) > 0 && (len(dorisURLs) > 0 || len(icebergURLs) > 0) {
+		_, _ = fmt.Fprintln(stderr, "schema parity: --dir cannot be combined with --doris or --iceberg")
+		return 1
+	}
+
 	if len(dirPaths) > 0 {
-		if len(dorisURLs) == 0 {
-			dorisURLs = append([]string(nil), dirPaths...)
-		}
-		if len(icebergURLs) == 0 {
-			icebergURLs = append([]string(nil), dirPaths...)
-		}
+		dorisURLs = append([]string(nil), dirPaths...)
+		icebergURLs = append([]string(nil), dirPaths...)
 	}
 
 	if len(dorisURLs) == 0 || len(icebergURLs) == 0 {
@@ -780,6 +781,11 @@ func parityIcebergTypesCompatible(dorisType, icebergType string) bool {
 	if (dt == "TINYINT" || dt == "SMALLINT") && it == "INT" {
 		return true
 	}
+	// NormalizeType maps TINYINT(1) -> BOOLEAN (Doris boolean convention), while Iceberg
+	// widens TINYINT(1) to INT; accept either INT or BOOLEAN when raw Doris type is TINYINT(1).
+	if isRawTinyInt1(dorisType) && (it == "INT" || it == "BOOLEAN") {
+		return true
+	}
 	if strings.HasPrefix(dt, "ARRAY<") && strings.HasSuffix(dt, ">") &&
 		strings.HasPrefix(it, "ARRAY<") && strings.HasSuffix(it, ">") {
 		return parityIcebergTypesCompatible(dt[6:len(dt)-1], it[6:len(it)-1])
@@ -860,7 +866,7 @@ func runExternalSchema(ctx context.Context, args []string, stdout, stderr io.Wri
 	fs.Var(&hclFiles, "hcl-file", "path to HCL file (repeatable)")
 	fs.StringVar(&protoPath, "proto", "", "path to .proto file or directory")
 	fs.StringVar(&targetURL, "url", "", "schema URL (file:// or proto://)")
-	fs.StringVar(&target, "target", "all", "target filter: all | doris | iceberg")
+	fs.StringVar(&target, "target", "", "target filter: all | doris | iceberg")
 	fs.StringVar(&format, "format", "sql", "output format: sql | hcl")
 	fs.StringVar(&pluginPath, "plugin", "", "path to protoc-gen-proto2type binary")
 	fs.Var(&includes, "include", "proto include directory (repeatable)")
@@ -929,7 +935,10 @@ func reorderFlagsFirst(args []string, boolFlags map[string]bool) []string {
 		}
 		if strings.HasPrefix(a, "-") {
 			flags = append(flags, a)
-			if !strings.Contains(a, "=") && !boolFlags[a] && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+			norm := "--" + strings.TrimLeft(a, "-")
+			single := "-" + strings.TrimLeft(a, "-")
+			isBool := boolFlags[a] || boolFlags[norm] || boolFlags[single]
+			if !strings.Contains(a, "=") && !isBool && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
 				i++
 				flags = append(flags, args[i])
 			}
@@ -941,6 +950,10 @@ func reorderFlagsFirst(args []string, boolFlags map[string]bool) []string {
 		flags = append(flags, "--")
 	}
 	return append(flags, pos...)
+}
+
+func isRawTinyInt1(raw string) bool {
+	return strings.ReplaceAll(strings.ToUpper(strings.TrimSpace(raw)), " ", "") == "TINYINT(1)"
 }
 
 func printUsage(w io.Writer) {

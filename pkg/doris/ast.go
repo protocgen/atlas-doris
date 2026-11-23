@@ -767,8 +767,11 @@ func applySchemaDialectHint(s *Schema, dialect string) {
 func normalizeTableLookupKey(raw string) string {
 	full, cat, db, short := splitQualifiedName(raw)
 	if short == "" {
-		return full
+		return strings.TrimSpace(full)
 	}
+	cat = normalizeLookupKeyPart(cat)
+	db = normalizeLookupKeyPart(db)
+	short = strings.TrimSpace(short)
 	if !isDefaultDorisCatalog(cat) && db != "" {
 		return cat + "." + db + "." + short
 	}
@@ -781,15 +784,46 @@ func normalizeTableLookupKey(raw string) string {
 func normalizeDatabaseLookupKey(raw string) string {
 	full, cat, db, short := splitQualifiedName(raw)
 	if short == "" {
-		return full
+		return normalizeLookupKeyPart(full)
 	}
 	if cat == "" && db != "" {
 		cat = db
 	}
+	cat = normalizeLookupKeyPart(cat)
+	short = normalizeLookupKeyPart(short)
 	if !isDefaultDorisCatalog(cat) {
 		return cat + "." + short
 	}
 	return short
+}
+
+func normalizeLookupKeyPart(part string) string {
+	part = strings.TrimSpace(part)
+	if part == "" {
+		return ""
+	}
+	if !strings.Contains(part, "${") {
+		return strings.ToLower(part)
+	}
+	var b strings.Builder
+	b.Grow(len(part))
+	for i := 0; i < len(part); {
+		if part[i] == '$' && i+1 < len(part) && part[i+1] == '{' {
+			if closeIdx := strings.IndexByte(part[i+2:], '}'); closeIdx >= 0 {
+				end := i + 2 + closeIdx + 1
+				b.WriteString(part[i:end])
+				i = end
+				continue
+			}
+		}
+		ch := part[i]
+		if ch >= 'A' && ch <= 'Z' {
+			ch = ch - 'A' + 'a'
+		}
+		b.WriteByte(ch)
+		i++
+	}
+	return b.String()
 }
 
 // StatementKind classifies a parsed DDL / migration SQL statement.

@@ -365,6 +365,41 @@ PROPERTIES (
 			t.Errorf("expected inner complex type mismatch on %s, got:\n%s", colName, innerMismatches)
 		}
 	}
+
+	// 7. Test TINYINT / SMALLINT / ARRAY<SMALLINT> <-> Iceberg INT / ARRAY<INT> parity
+	sSmallIntDoris, err := doris.ParseSchema(`
+CREATE TABLE IF NOT EXISTS internal.tenant_a.small_int_items (
+    item_id VARCHAR(64) NOT NULL,
+    score TINYINT,
+    part_index SMALLINT,
+    scores ARRAY<SMALLINT>
+)
+UNIQUE KEY(item_id)
+DISTRIBUTED BY HASH(item_id) BUCKETS 4;`)
+	if err != nil {
+		t.Fatalf("ParseSchema(sSmallIntDoris): %v", err)
+	}
+	sSmallIntIce, err := doris.ParseSchema(`
+CREATE TABLE IF NOT EXISTS azra_lake.tenant_a.small_int_items (
+    item_id VARCHAR(64) NOT NULL,
+    score INT,
+    part_index INT,
+    scores ARRAY<INT>
+)
+PROPERTIES (
+    "compression_codec" = "zstd"
+);`)
+	if err != nil {
+		t.Fatalf("ParseSchema(sSmallIntIce): %v", err)
+	}
+	if m := CheckSchemaParity(sSmallIntDoris, sSmallIntIce); len(m) != 0 {
+		t.Fatalf("expected 0 parity mismatches for TINYINT/SMALLINT/ARRAY<SMALLINT> <-> INT/ARRAY<INT>, got: %v", m)
+	}
+	sBadSmallIntIce := sSmallIntIce.Clone()
+	sBadSmallIntIce.Tables[0].Columns[2].Type = "STRING"
+	if m := strings.Join(CheckSchemaParity(sSmallIntDoris, sBadSmallIntIce), "\n"); !strings.Contains(m, `column "part_index": Iceberg type mismatch`) {
+		t.Errorf("expected Iceberg type mismatch for SMALLINT <-> STRING, got:\n%s", m)
+	}
 }
 
 // TestProto2TypeCrossRepoGoldenContract verifies SQL/HCL equivalence, CheckSchemaParity
@@ -939,5 +974,167 @@ func TestReorderFlagsFirst_PreservesTerminator(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("at index %d: expected %q, got %q (full: %v)", i, want[i], got[i], got)
 		}
+	}
+}
+
+func TestCLI_Stage1B_RepeatableToAndV030(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Version must report v0.3.0
+	if out, errOut, code := runCLI(ctx, "version"); code != 0 || strings.TrimSpace(out) != "atlas-doris v0.3.0" {
+		t.Fatalf("expected 'atlas-doris v0.3.0', got out=%q err=%q code=%d", out, errOut, code)
+	}
+
+	tmpDir := t.TempDir()
+	dorisA := filepath.Join(tmpDir, "a_doris.sql")
+	dorisB := filepath.Join(tmpDir, "b_doris.sql")
+	iceA := filepath.Join(tmpDir, "a_iceberg.sql")
+	iceB := filepath.Join(tmpDir, "b_iceberg.sql")
+
+	if err := os.WriteFile(dorisA, []byte("CREATE TABLE internal.tenant_duke.patients (patient_id VARCHAR(64) NOT NULL) UNIQUE KEY(patient_id) DISTRIBUTED BY HASH(patient_id) BUCKETS 4;\n"), 0o644); err != nil {
+		t.Fatalf("write dorisA: %v", err)
+	}
+	if err := os.WriteFile(dorisB, []byte("CREATE TABLE internal.tenant_duke.encounters (encounter_id VARCHAR(64) NOT NULL) UNIQUE KEY(encounter_id) DISTRIBUTED BY HASH(encounter_id) BUCKETS 4;\n"), 0o644); err != nil {
+		t.Fatalf("write dorisB: %v", err)
+	}
+	if err := os.WriteFile(iceA, []byte("CREATE TABLE azra_lake.tenant_duke.patients (patient_id STRING NOT NULL) ENGINE=iceberg;\n"), 0o644); err != nil {
+		t.Fatalf("write iceA: %v", err)
+	}
+	if err := os.WriteFile(iceB, []byte("CREATE TABLE azra_lake.tenant_duke.encounters (encounter_id STRING NOT NULL) ENGINE=iceberg;\n"), 0o644); err != nil {
+		t.Fatalf("write iceB: %v", err)
+	}
+
+	// 2. Repeatable --to on migrate diff merges multiple files cleanly
+	migDir := filepath.Join(tmpDir, "migrations")
+	if err := os.MkdirAll(migDir, 0o755); err != nil {
+		t.Fatalf("mkdir migrations: %v", err)
+	}
+	out, errOut, code := runCLI(ctx,
+		"migrate", "diff", "multi_source",
+		"--dir", "file://"+migDir,
+		"--to", "file://"+dorisA,
+		"--to", "file://"+dorisB,
+		"--version", "20261115000000",
+	)
+	if code != 0 || !strings.Contains(out, "Created migration 20261115000000_multi_source.sql") {
+		t.Fatalf("migrate diff repeatable --to failed: code=%d out=%q err=%s", code, out, errOut)
+	}
+
+	// 3. Repeatable --to on migrate lint matches merged target
+	out, errOut, code = runCLI(ctx,
+		"migrate", "lint",
+		"--dir", "file://"+migDir,
+		"--to", "file://"+dorisA,
+		"--to", "file://"+dorisB,
+	)
+	if code != 0 || !strings.Contains(out, "migrate lint passed") {
+		t.Fatalf("migrate lint repeatable --to failed: code=%d out=%q err=%s", code, out, errOut)
+	}
+
+	// 4. Repeatable --from / --to on schema diff
+	out, errOut, code = runCLI(ctx,
+		"schema", "diff",
+		"--from", "file://"+dorisA,
+		"--from", "file://"+dorisB,
+		"--to", "file://"+dorisA,
+		"--to", "file://"+dorisB,
+	)
+	if code != 0 || !strings.Contains(out, "Schemas are identical") {
+		t.Fatalf("schema diff repeatable --from/--to failed: code=%d out=%q err=%s", code, out, errOut)
+	}
+
+	// 5. Repeatable --doris / --iceberg on schema parity
+	out, errOut, code = runCLI(ctx,
+		"schema", "parity",
+		"--doris", "file://"+dorisA,
+		"--doris", "file://"+dorisB,
+		"--iceberg", "file://"+iceA,
+		"--iceberg", "file://"+iceB,
+	)
+	if code != 0 || !strings.Contains(out, "2 table(s) verified") {
+		t.Fatalf("schema parity repeatable flags failed: code=%d out=%q err=%s", code, out, errOut)
+	}
+
+	// 6. --chain-scope and --non-blocking on migrate apply --dry-run
+	out, errOut, code = runCLI(ctx,
+		"migrate", "apply",
+		"--dir", "file://"+migDir,
+		"--chain-scope", "hl7-ingest",
+		"--non-blocking",
+		"--dry-run",
+	)
+	if code != 0 || !strings.Contains(out, "patients") || !strings.Contains(out, "encounters") {
+		t.Fatalf("migrate apply --chain-scope --non-blocking --dry-run failed: code=%d out=%q err=%s", code, out, errOut)
+	}
+
+	// Invalid --chain-scope fails cleanly
+	if _, errOut, code = runCLI(ctx,
+		"migrate", "apply",
+		"--dir", "file://"+migDir,
+		"--chain-scope", "bad:scope",
+		"--dry-run",
+	); code == 0 || !strings.Contains(errOut, "invalid chain scope") {
+		t.Fatalf("expected invalid chain scope error, got code=%d err=%s", code, errOut)
+	}
+}
+
+func TestStage1B_CLIFixes(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	dorisSQL := filepath.Join(tmpDir, "patients_doris.sql")
+	iceSQL := filepath.Join(tmpDir, "patients_iceberg.sql")
+	if err := os.WriteFile(dorisSQL, []byte("CREATE TABLE internal.tenant_a.patients (id VARCHAR(64) NOT NULL, flag TINYINT) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;\n"), 0o644); err != nil {
+		t.Fatalf("write doris sql: %v", err)
+	}
+	if err := os.WriteFile(iceSQL, []byte("CREATE TABLE azra_lake.tenant_a.patients (id STRING NOT NULL, flag INT) ENGINE=iceberg;\n"), 0o644); err != nil {
+		t.Fatalf("write ice sql: %v", err)
+	}
+
+	// parityIcebergTypesCompatible explicitly accepts raw TINYINT(1) against INT or BOOLEAN
+	if !parityIcebergTypesCompatible("TINYINT(1)", "INT") || !parityIcebergTypesCompatible("TINYINT(1)", "BOOLEAN") || parityIcebergTypesCompatible("BOOLEAN", "INT") {
+		t.Errorf("unexpected raw TINYINT(1) parity results")
+	}
+
+	// schema parity passes for TINYINT <-> Iceberg INT
+	out, errOut, code := runCLI(ctx, "schema", "parity", "--dir", tmpDir)
+	if code != 0 || !strings.Contains(out, "1 table(s) verified") {
+		t.Fatalf("expected parity with TINYINT<->INT to pass: code=%d out=%q err=%s", code, out, errOut)
+	}
+
+	// schema parity rejects combining --dir with --doris or --iceberg
+	if _, errOut, code = runCLI(ctx, "schema", "parity", "--dir", tmpDir, "--doris", dorisSQL); code == 0 || !strings.Contains(errOut, "cannot be combined") {
+		t.Errorf("expected --dir + --doris error, got code=%d err=%s", code, errOut)
+	}
+
+	// schema inspect honors ?target=doris when --target is omitted, and CLI --target=iceberg overrides ?target=doris
+	outQ, errOut, code := runCLI(ctx, "schema", "inspect", "--url", "file://"+tmpDir+"?target=doris")
+	if code != 0 || !strings.Contains(outQ, "internal.tenant_a.patients") || strings.Contains(outQ, "azra_lake") {
+		t.Errorf("expected URL ?target=doris to work when --target omitted: code=%d out=%q err=%s", code, outQ, errOut)
+	}
+	outOverride, errOut, code := runCLI(ctx, "schema", "inspect", "--url", "file://"+tmpDir+"?target=doris", "--target", "iceberg")
+	if code != 0 || !strings.Contains(outOverride, "azra_lake.tenant_a.patients") || strings.Contains(outOverride, "internal.tenant_a.patients") {
+		t.Errorf("expected explicit --target=iceberg to override ?target=doris: code=%d out=%q err=%s", code, outOverride, errOut)
+	}
+
+	// Single-dash -non-blocking and -dry-run work cleanly with positional args
+	migDir := filepath.Join(tmpDir, "mig")
+	if err := os.MkdirAll(migDir, 0o755); err != nil {
+		t.Fatalf("mkdir mig: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(migDir, "20261115000000_init.sql"), []byte("CREATE TABLE internal.tenant_a.patients (id VARCHAR(64) NOT NULL) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;\n"), 0o644); err != nil {
+		t.Fatalf("write mig: %v", err)
+	}
+	if _, errOut, code := runCLI(ctx, "migrate", "hash", "--dir", migDir); code != 0 {
+		t.Fatalf("migrate hash failed: code=%d err=%s", code, errOut)
+	}
+	outApply, errOut, code := runCLI(ctx, "migrate", "apply", "-non-blocking", "-dry-run", "--dir", migDir)
+	if code != 0 || !strings.Contains(outApply, "patients") {
+		t.Errorf("expected single-dash -non-blocking -dry-run to succeed: code=%d out=%q err=%s", code, outApply, errOut)
+	}
+
+	// migrate apply --dry-run with invalid --url fails rather than silently ignoring --url
+	if _, errOut, code = runCLI(ctx, "migrate", "apply", "--dir", migDir, "--url", "postgres://invalid/db", "--dry-run"); code == 0 || !strings.Contains(errOut, "unsupported URL scheme") {
+		t.Errorf("expected invalid --url in --dry-run mode to dial & report error, got code=%d err=%s", code, errOut)
 	}
 }

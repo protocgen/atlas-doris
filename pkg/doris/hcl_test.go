@@ -284,6 +284,9 @@ func TestFormatHCL_RealPlatformSchemasRoundTrip(t *testing.T) {
 		t.Run(file, func(t *testing.T) {
 			raw, err := os.ReadFile(filepath.Join(schemasDir, file))
 			if err != nil {
+				if os.IsNotExist(err) {
+					t.Skipf("legacy file removed in platform/schemas: %v", err)
+				}
 				t.Fatalf("read %s: %v", file, err)
 			}
 			sqlSchema, err := doris.ParseSchema(string(raw))

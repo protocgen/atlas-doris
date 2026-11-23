@@ -105,16 +105,25 @@ func diffTable(current, desired *TableDef, opts DiffOptions) []Statement {
 
 	currentColByName := make(map[string]*ColumnDef, len(current.Columns))
 	for _, c := range current.Columns {
+		if c == nil {
+			continue
+		}
 		currentColByName[c.Name] = c
 	}
 	desiredColByName := make(map[string]*ColumnDef, len(desired.Columns))
 	for _, c := range desired.Columns {
+		if c == nil {
+			continue
+		}
 		desiredColByName[c.Name] = c
 	}
 
 	// 1. Dropped columns (if AllowDestructive).
 	evolvingCols := make([]string, 0, len(current.Columns)+len(desired.Columns))
 	for _, cc := range current.Columns {
+		if cc == nil {
+			continue
+		}
 		if opts.AllowDestructive {
 			if _, ok := desiredColByName[cc.Name]; !ok {
 				stmts = append(stmts, Statement{
@@ -132,6 +141,9 @@ func diffTable(current, desired *TableDef, opts DiffOptions) []Statement {
 	isIceberg := desired.IsIcebergTable()
 	isIcebergV3 := isIceberg && strings.TrimSpace(desired.PropertyMap()["format-version"]) == "3"
 	for i, dc := range desired.Columns {
+		if dc == nil {
+			continue
+		}
 		cc, existed := currentColByName[dc.Name]
 		if !existed {
 			colToAdd := dc.Clone()
@@ -178,6 +190,9 @@ func diffTable(current, desired *TableDef, opts DiffOptions) []Statement {
 			}
 			targetCol.HasDefault = cc.HasDefault
 			targetCol.Default = cc.Default
+			if IsIcebergVarcharStringCompatible(cc.Type, targetCol.Type) {
+				targetCol.Type = cc.Type
+			}
 		}
 		if !cc.Equal(targetCol) {
 			stmts = append(stmts, Statement{
@@ -188,19 +203,13 @@ func diffTable(current, desired *TableDef, opts DiffOptions) []Statement {
 		}
 	}
 
-	// 3. Indexes: dropped or modified indexes first, then added/modified indexes.
-	currentIdxByName := make(map[string]*IndexDef, len(current.Indexes))
-	for _, idx := range current.Indexes {
-		currentIdxByName[idx.Name] = idx
-	}
-	desiredIdxByName := make(map[string]*IndexDef, len(desired.Indexes))
-	for _, idx := range desired.Indexes {
-		desiredIdxByName[idx.Name] = idx
-	}
+	// 3. Indexes: match exact names first, then match single-column indexes
+	// semantically on normalized (column, index-type, properties) even when
+	// names differ to avoid spurious drop+add+build index rename churn.
+	matchedCurrent, matchedDesired := pairTableIndexes(current.Indexes, desired.Indexes)
 
-	for _, cIdx := range current.Indexes {
-		dIdx, ok := desiredIdxByName[cIdx.Name]
-		if !ok || !cIdx.Equal(dIdx) {
+	for ci, cIdx := range current.Indexes {
+		if !matchedCurrent[ci] && cIdx != nil {
 			stmts = append(stmts, Statement{
 				Kind:          StmtAlterTableDropIndex,
 				TargetTable:   targetName,
@@ -209,9 +218,8 @@ func diffTable(current, desired *TableDef, opts DiffOptions) []Statement {
 		}
 	}
 
-	for _, dIdx := range desired.Indexes {
-		cIdx, ok := currentIdxByName[dIdx.Name]
-		if !ok || !cIdx.Equal(dIdx) {
+	for di, dIdx := range desired.Indexes {
+		if !matchedDesired[di] && dIdx != nil {
 			stmts = append(stmts, Statement{
 				Kind:        StmtAlterTableAddIndex,
 				TargetTable: targetName,
@@ -342,6 +350,120 @@ func shouldBuildIndexOnline(using string) bool {
 	default:
 		return false
 	}
+}
+
+func pairTableIndexes(current, desired []*IndexDef) (matchedCurrent, matchedDesired []bool) {
+	matchedCurrent = make([]bool, len(current))
+	matchedDesired = make([]bool, len(desired))
+
+	// Pass 1: exact name + exact IndexDef.Equal match.
+	for di, dIdx := range desired {
+		if dIdx == nil {
+			matchedDesired[di] = true
+			continue
+		}
+		for ci, cIdx := range current {
+			if matchedCurrent[ci] {
+				continue
+			}
+			if cIdx == nil {
+				matchedCurrent[ci] = true
+				continue
+			}
+			if cIdx.Name == dIdx.Name && cIdx.Equal(dIdx) {
+				matchedCurrent[ci] = true
+				matchedDesired[di] = true
+				break
+			}
+		}
+	}
+
+	// Track lowercase names of still-unmatched desired indexes so Pass 2 does not
+	// steal a current index whose name is claimed by an unmatched desired index.
+	claimedDesiredNames := make(map[string]int, len(desired))
+	for di, dIdx := range desired {
+		if matchedDesired[di] || dIdx == nil {
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(dIdx.Name))
+		if name != "" {
+			claimedDesiredNames[name]++
+		}
+	}
+
+	// Pass 2: semantic single-column match on normalized (column, index-type, properties)
+	// with consistent comment equality.
+	for di, dIdx := range desired {
+		if matchedDesired[di] || dIdx == nil {
+			continue
+		}
+		dLower := strings.ToLower(strings.TrimSpace(dIdx.Name))
+		for ci, cIdx := range current {
+			if matchedCurrent[ci] || cIdx == nil {
+				continue
+			}
+			if cIdx.Comment != dIdx.Comment {
+				continue
+			}
+			cLower := strings.ToLower(strings.TrimSpace(cIdx.Name))
+			if cLower != dLower && claimedDesiredNames[cLower] > 0 {
+				continue
+			}
+			if singleColumnIndexesSemanticallyEqual(cIdx, dIdx) {
+				matchedCurrent[ci] = true
+				matchedDesired[di] = true
+				if claimedDesiredNames[dLower] > 0 {
+					claimedDesiredNames[dLower]--
+				}
+				break
+			}
+		}
+	}
+
+	return matchedCurrent, matchedDesired
+}
+
+func singleColumnIndexesSemanticallyEqual(a, b *IndexDef) bool {
+	if a == nil || b == nil || len(a.Columns) != 1 || len(b.Columns) != 1 {
+		return false
+	}
+	if normalizeIndexColumnName(a.Columns[0]) != normalizeIndexColumnName(b.Columns[0]) {
+		return false
+	}
+	if normalizeIndexUsing(a.Using) != normalizeIndexUsing(b.Using) {
+		return false
+	}
+	propsA := normalizeIndexProperties(a.Properties)
+	propsB := normalizeIndexProperties(b.Properties)
+	if len(propsA) != len(propsB) {
+		return false
+	}
+	for k, v := range propsA {
+		if vb, ok := propsB[k]; !ok || v != vb {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeIndexColumnName(col string) string {
+	return strings.ToLower(strings.Trim(strings.TrimSpace(col), "`"))
+}
+
+func normalizeIndexUsing(using string) string {
+	u := strings.ToUpper(strings.TrimSpace(using))
+	if u == "" {
+		return "INVERTED"
+	}
+	return u
+}
+
+func normalizeIndexProperties(props []Property) map[string]string {
+	out := make(map[string]string, len(props))
+	for _, p := range props {
+		out[strings.ToLower(strings.TrimSpace(p.Key))] = strings.TrimSpace(p.Value)
+	}
+	return out
 }
 
 func isMutableTableProperty(key string) bool {

@@ -11,12 +11,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/protocgen/atlas-doris/pkg/doris"
 	"github.com/protocgen/atlas-doris/pkg/migrate"
 )
+
+var protoOptIdentRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
 // TargetFilter controls which generated DDL files are loaded from a directory or proto run.
 type TargetFilter string
@@ -46,6 +49,58 @@ type ExternalSchemaOptions struct {
 	Format        string
 	ProtoIncludes []string
 	PluginPath    string
+}
+
+// LoadSchemas loads one or more schema sources (file paths, directories, file://,
+// doris://, mysql://, or proto:// URLs) and merges them cleanly in order.
+func LoadSchemas(ctx context.Context, targetURLs []string, opts LoadOptions) (*doris.Schema, error) {
+	var cleaned []string
+	for _, u := range targetURLs {
+		if s := strings.TrimSpace(u); s != "" {
+			cleaned = append(cleaned, s)
+		}
+	}
+	if len(cleaned) == 0 {
+		return nil, fmt.Errorf("empty schema URL or path")
+	}
+	if len(cleaned) == 1 {
+		return LoadSchema(ctx, cleaned[0], opts)
+	}
+	merged := doris.NewSchema()
+	for _, raw := range cleaned {
+		sub, err := LoadSchema(ctx, raw, opts)
+		if err != nil {
+			return nil, err
+		}
+		merged.Merge(sub)
+	}
+	return merged, nil
+}
+
+// LoadFromPaths loads and merges one or more local schema files, directories,
+// or Atlas migration directories (with atlas.sum).
+func LoadFromPaths(paths []string, target TargetFilter) (*doris.Schema, error) {
+	var cleaned []string
+	for _, p := range paths {
+		if s := strings.TrimSpace(p); s != "" {
+			cleaned = append(cleaned, s)
+		}
+	}
+	if len(cleaned) == 0 {
+		return nil, fmt.Errorf("empty schema path")
+	}
+	if len(cleaned) == 1 {
+		return LoadFromPath(cleaned[0], target)
+	}
+	merged := doris.NewSchema()
+	for _, p := range cleaned {
+		sub, err := LoadFromPath(p, target)
+		if err != nil {
+			return nil, err
+		}
+		merged.Merge(sub)
+	}
+	return merged, nil
 }
 
 // LoadSchema loads a doris.Schema from a file:// URL, local file/directory path,
@@ -80,27 +135,82 @@ func LoadSchema(ctx context.Context, targetURL string, opts LoadOptions) (*doris
 	return LoadFromPath(localPath, target)
 }
 
-// FilterSchemaByTarget returns a copy of s retaining only tables that match target.
+// FilterSchemaByTarget returns a copy of s retaining only databases, tables, views,
+// and platform objects that match target.
 func FilterSchemaByTarget(s *doris.Schema, target TargetFilter) *doris.Schema {
 	if s == nil || target == "" || target == TargetAll {
 		return s
 	}
-	out := s.Clone()
-	out.Tables = nil
+	out := doris.NewSchema()
+
 	for _, t := range s.Tables {
+		if t == nil {
+			continue
+		}
 		switch target {
 		case TargetDoris:
 			if t.IsDorisInternalTable() {
-				out.Tables = append(out.Tables, t)
+				out.Tables = append(out.Tables, t.Clone())
 			}
 		case TargetIceberg:
 			if t.IsIcebergTable() {
-				out.Tables = append(out.Tables, t)
+				out.Tables = append(out.Tables, t.Clone())
 			}
 		default:
-			out.Tables = append(out.Tables, t)
+			out.Tables = append(out.Tables, t.Clone())
 		}
 	}
+
+	for _, d := range s.Databases {
+		if d == nil {
+			continue
+		}
+		isInternalDB := d.Catalog == "" || strings.EqualFold(d.Catalog, "internal")
+		switch target {
+		case TargetDoris:
+			if isInternalDB {
+				out.Databases = append(out.Databases, d.Clone())
+			}
+		case TargetIceberg:
+			if !isInternalDB {
+				out.Databases = append(out.Databases, d.Clone())
+			}
+		default:
+			out.Databases = append(out.Databases, d.Clone())
+		}
+	}
+
+	switch target {
+	case TargetIceberg:
+		out.Views = nil
+		out.PlatformObjects = nil
+	case TargetDoris:
+		for _, v := range s.Views {
+			if v == nil {
+				continue
+			}
+			if v.Catalog == "" || strings.EqualFold(v.Catalog, "internal") {
+				out.Views = append(out.Views, v.Clone())
+			}
+		}
+		for _, p := range s.PlatformObjects {
+			if p != nil {
+				out.PlatformObjects = append(out.PlatformObjects, p.Clone())
+			}
+		}
+	default:
+		for _, v := range s.Views {
+			if v != nil {
+				out.Views = append(out.Views, v.Clone())
+			}
+		}
+		for _, p := range s.PlatformObjects {
+			if p != nil {
+				out.PlatformObjects = append(out.PlatformObjects, p.Clone())
+			}
+		}
+	}
+
 	return out
 }
 
@@ -120,45 +230,74 @@ func LoadFromPath(localPath string, target TargetFilter) (*doris.Schema, error) 
 		if err != nil {
 			return nil, fmt.Errorf("parse schema file %q: %w", localPath, err)
 		}
-		return s, nil
+		return FilterSchemaByTarget(s, target), nil
 	}
 
-	// If the directory is an Atlas migration chain (contains atlas.sum), replay it.
+	// If the directory is an Atlas migration chain (contains atlas.sum), verify and replay it.
 	if _, err := os.Stat(filepath.Join(localPath, "atlas.sum")); err == nil {
+		if _, err := migrate.VerifySumFS(os.DirFS(localPath)); err != nil {
+			return nil, err
+		}
 		s, _, err := migrate.ReplayDir(localPath)
 		if err != nil {
 			return nil, err
 		}
-		return s, nil
+		return FilterSchemaByTarget(s, target), nil
 	}
 
-	var schemaFiles []string
+	merged := doris.NewSchema()
+	loadedSubdir := false
+	matchedRootFile := false
+	var filteredFiles []string
+	var allFiles []string
+
 	err = filepath.WalkDir(localPath, func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
 		if d.IsDir() {
+			if p != localPath {
+				if _, statErr := os.Stat(filepath.Join(p, "atlas.sum")); statErr == nil {
+					if _, err := migrate.VerifySumFS(os.DirFS(p)); err != nil {
+						return err
+					}
+					sub, _, err := migrate.ReplayDir(p)
+					if err != nil {
+						return err
+					}
+					merged.Merge(sub)
+					loadedSubdir = true
+					return fs.SkipDir
+				}
+			}
 			return nil
 		}
 		name := strings.ToLower(d.Name())
 		if !strings.HasSuffix(name, ".sql") && !strings.HasSuffix(name, ".hcl") {
 			return nil
 		}
-		if !matchesTargetFilter(name, target) {
-			return nil
+		allFiles = append(allFiles, p)
+		if matchesTargetFilter(name, target) {
+			matchedRootFile = true
+			filteredFiles = append(filteredFiles, p)
 		}
-		schemaFiles = append(schemaFiles, p)
 		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("scan schema directory %q: %w", localPath, err)
 	}
+
+	schemaFiles := filteredFiles
+	if !matchedRootFile && len(allFiles) > 0 {
+		// Fall back to parsing all .sql/.hcl files and relying on FilterSchemaByTarget
+		// when filenames in an explicit directory do not carry _doris/_iceberg suffixes.
+		schemaFiles = allFiles
+	}
 	sort.Strings(schemaFiles)
-	if len(schemaFiles) == 0 {
+	if len(schemaFiles) == 0 && !loadedSubdir {
 		return nil, fmt.Errorf("no matching .sql or .hcl files found in %q (target=%q)", localPath, target)
 	}
 
-	merged := doris.NewSchema()
 	for _, f := range schemaFiles {
 		data, err := os.ReadFile(f)
 		if err != nil {
@@ -170,7 +309,7 @@ func LoadFromPath(localPath string, target TargetFilter) (*doris.Schema, error) 
 		}
 		merged.Merge(sub)
 	}
-	return merged, nil
+	return FilterSchemaByTarget(merged, target), nil
 }
 
 // ExternalSchemaSQL resolves the schema from ExternalSchemaOptions and formats it
@@ -278,14 +417,14 @@ func loadFromProtoURL(ctx context.Context, rawURL string, opts LoadOptions) (*do
 		queryValues = parsedQ
 	}
 
+	if queryValues.Has("plugin") {
+		return nil, fmt.Errorf("proto:// URL query parameter ?plugin= is not allowed (pass LoadOptions.PluginPath or --plugin)")
+	}
 	target := opts.Target
-	if qTarget := queryValues.Get("target"); qTarget != "" {
+	if qTarget := strings.TrimSpace(queryValues.Get("target")); qTarget != "" && target == "" {
 		target = TargetFilter(strings.ToLower(qTarget))
 	}
 	pluginPath := opts.PluginPath
-	if qPlugin := queryValues.Get("plugin"); qPlugin != "" {
-		pluginPath = qPlugin
-	}
 	var includes []string
 	includes = append(includes, opts.ProtoIncludes...)
 	for _, inc := range queryValues["include"] {
@@ -296,7 +435,13 @@ func loadFromProtoURL(ctx context.Context, rawURL string, opts LoadOptions) (*do
 		}
 	}
 
-	protoTarget := filepath.Clean(pathPart)
+	protoTarget, err := filepath.Abs(filepath.Clean(pathPart))
+	if err != nil {
+		return nil, fmt.Errorf("resolve proto target %q: %w", pathPart, err)
+	}
+	if strings.HasPrefix(protoTarget, "-") || strings.HasPrefix(protoTarget, "@") {
+		return nil, fmt.Errorf("invalid proto target path %q", protoTarget)
+	}
 	info, err := os.Stat(protoTarget)
 	if err != nil {
 		return nil, fmt.Errorf("stat proto target %q: %w", protoTarget, err)
@@ -311,7 +456,14 @@ func loadFromProtoURL(ctx context.Context, rawURL string, opts LoadOptions) (*do
 				return walkErr
 			}
 			if !d.IsDir() && strings.HasSuffix(d.Name(), ".proto") {
-				protoFiles = append(protoFiles, p)
+				absP, err := filepath.Abs(p)
+				if err != nil {
+					return err
+				}
+				if strings.HasPrefix(absP, "-") || strings.HasPrefix(absP, "@") {
+					return fmt.Errorf("invalid proto file path %q", absP)
+				}
+				protoFiles = append(protoFiles, absP)
 			}
 			return nil
 		})
@@ -346,6 +498,11 @@ func loadFromProtoURL(ctx context.Context, rawURL string, opts LoadOptions) (*do
 	if dorisMode == "" {
 		dorisMode = "ddl"
 	}
+	switch dorisMode {
+	case "ddl", "hcl", "both":
+	default:
+		return nil, fmt.Errorf("invalid doris_mode %q (expected ddl, hcl, or both)", dorisMode)
+	}
 
 	optParts := []string{
 		"lang=go",
@@ -353,9 +510,15 @@ func loadFromProtoURL(ctx context.Context, rawURL string, opts LoadOptions) (*do
 		"doris_mode=" + dorisMode,
 	}
 	if vault := strings.TrimSpace(queryValues.Get("doris_storage_vault")); vault != "" {
+		if !protoOptIdentRe.MatchString(vault) {
+			return nil, fmt.Errorf("invalid doris_storage_vault %q (must match ^[a-zA-Z_][a-zA-Z0-9_]*$)", vault)
+		}
 		optParts = append(optParts, "doris_storage_vault="+vault)
 	}
 	if catalog := strings.TrimSpace(queryValues.Get("iceberg_catalog")); catalog != "" {
+		if !protoOptIdentRe.MatchString(catalog) {
+			return nil, fmt.Errorf("invalid iceberg_catalog %q (must match ^[a-zA-Z_][a-zA-Z0-9_]*$)", catalog)
+		}
 		optParts = append(optParts, "iceberg_catalog="+catalog)
 	}
 
@@ -365,10 +528,16 @@ func loadFromProtoURL(ctx context.Context, rawURL string, opts LoadOptions) (*do
 	args = append(args, "--proto2type_opt="+strings.Join(optParts, ","))
 	seenInc := make(map[string]bool)
 	for _, inc := range append([]string{rootInclude}, includes...) {
-		cleanInc := filepath.Clean(inc)
-		if !seenInc[cleanInc] {
-			seenInc[cleanInc] = true
-			args = append(args, "-I", cleanInc)
+		absInc, err := filepath.Abs(filepath.Clean(inc))
+		if err != nil {
+			return nil, fmt.Errorf("resolve proto include %q: %w", inc, err)
+		}
+		if strings.HasPrefix(absInc, "-") || strings.HasPrefix(absInc, "@") {
+			return nil, fmt.Errorf("invalid proto include path %q", absInc)
+		}
+		if !seenInc[absInc] {
+			seenInc[absInc] = true
+			args = append(args, "-I", absInc)
 		}
 	}
 	args = append(args, protoFiles...)
@@ -390,6 +559,9 @@ func resolveProto2TypePlugin(ctx context.Context, explicitPath string) (string, 
 		if err != nil {
 			return "", noop, err
 		}
+		if strings.HasPrefix(abs, "-") || strings.HasPrefix(abs, "@") {
+			return "", noop, fmt.Errorf("invalid plugin path %q", abs)
+		}
 		if _, err := os.Stat(abs); err != nil {
 			return "", noop, fmt.Errorf("protoc-gen-proto2type plugin not found at %q: %w", abs, err)
 		}
@@ -398,39 +570,29 @@ func resolveProto2TypePlugin(ctx context.Context, explicitPath string) (string, 
 	if p, err := exec.LookPath("protoc-gen-proto2type"); err == nil {
 		return p, noop, nil
 	}
-	// Check PROTO2TYPE_DIR or sibling proto2type repository if present in workspace
-	var candidates []string
 	if envDir := strings.TrimSpace(os.Getenv("PROTO2TYPE_DIR")); envDir != "" {
-		candidates = append(candidates, envDir)
-	}
-	candidates = append(candidates,
-		filepath.Join("..", "proto2type"),
-		filepath.Join("..", "..", "proto2type"),
-		filepath.Join("..", "..", "..", "proto2type"),
-	)
-	for _, repoDir := range candidates {
-		prebuilt := filepath.Join(repoDir, "protoc-gen-proto2type")
-		if info, err := os.Stat(prebuilt); err == nil && !info.IsDir() {
-			if abs, err := filepath.Abs(prebuilt); err == nil {
-				return abs, noop, nil
+		absDir, err := filepath.Abs(envDir)
+		if err == nil {
+			prebuilt := filepath.Join(absDir, "protoc-gen-proto2type")
+			if info, err := os.Stat(prebuilt); err == nil && !info.IsDir() {
+				return prebuilt, noop, nil
+			}
+			if info, err := os.Stat(filepath.Join(absDir, "go.mod")); err == nil && !info.IsDir() {
+				tmpBinDir, err := os.MkdirTemp("", "protoc-gen-proto2type-bin-*")
+				if err == nil {
+					binPath := filepath.Join(tmpBinDir, "protoc-gen-proto2type")
+					buildCmd := exec.CommandContext(ctx, "go", "build", "-o", binPath, ".")
+					buildCmd.Dir = absDir
+					buildCmd.Env = append(os.Environ(), "GOWORK=off")
+					if err := buildCmd.Run(); err == nil {
+						return binPath, func() { _ = os.RemoveAll(tmpBinDir) }, nil
+					}
+					_ = os.RemoveAll(tmpBinDir)
+				}
 			}
 		}
-		if info, err := os.Stat(filepath.Join(repoDir, "go.mod")); err == nil && !info.IsDir() {
-			tmpBinDir, err := os.MkdirTemp("", "protoc-gen-proto2type-bin-*")
-			if err != nil {
-				continue
-			}
-			binPath := filepath.Join(tmpBinDir, "protoc-gen-proto2type")
-			buildCmd := exec.CommandContext(ctx, "go", "build", "-o", binPath, ".")
-			buildCmd.Dir = repoDir
-			buildCmd.Env = append(os.Environ(), "GOWORK=off")
-			if err := buildCmd.Run(); err == nil {
-				return binPath, func() { _ = os.RemoveAll(tmpBinDir) }, nil
-			}
-			_ = os.RemoveAll(tmpBinDir)
-		}
 	}
-	return "", noop, fmt.Errorf("protoc-gen-proto2type binary not found in PATH (pass --plugin or install protoc-gen-proto2type)")
+	return "", noop, fmt.Errorf("protoc-gen-proto2type binary not found in PATH or PROTO2TYPE_DIR (pass --plugin or install protoc-gen-proto2type)")
 }
 
 func matchesTargetFilter(lowerFileName string, target TargetFilter) bool {

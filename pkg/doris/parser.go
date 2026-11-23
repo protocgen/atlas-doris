@@ -348,6 +348,11 @@ func StripCommentsAndSplitStatements(sqlText string) ([]string, error) {
 		if inBacktick {
 			cur.WriteByte(ch)
 			if ch == '`' {
+				if i+1 < n && sqlText[i+1] == '`' {
+					i++
+					cur.WriteByte(sqlText[i])
+					continue
+				}
 				inBacktick = false
 			}
 			continue
@@ -363,8 +368,21 @@ func StripCommentsAndSplitStatements(sqlText string) ([]string, error) {
 			continue
 		}
 
-		// Block comment /* ... */
+		// Line comment #
+		if ch == '#' {
+			i++
+			for i < n && sqlText[i] != '\n' {
+				i++
+			}
+			cur.WriteByte('\n')
+			continue
+		}
+
+		// Block comment /* ... */ (reject MySQL conditional comments /*! ... */)
 		if ch == '/' && i+1 < n && sqlText[i+1] == '*' {
+			if i+2 < n && sqlText[i+2] == '!' {
+				return nil, fmt.Errorf("MySQL conditional comments (/*! ... */) are not allowed")
+			}
 			i += 2
 			closed := false
 			for i+1 < n {

@@ -18,6 +18,9 @@ func TestParseRealPlatformDorisAndIcebergDDLs(t *testing.T) {
 	t.Run("doris_tenant_profile_ddl.sql (54 Doris tables)", func(t *testing.T) {
 		raw, err := os.ReadFile(filepath.Join(schemasDir, "doris_tenant_profile_ddl.sql"))
 		if err != nil {
+			if os.IsNotExist(err) {
+				t.Skipf("legacy file removed in platform/schemas: %v", err)
+			}
 			t.Fatalf("read doris_tenant_profile_ddl.sql: %v", err)
 		}
 		schema, err := doris.ParseSchema(string(raw))
@@ -60,6 +63,9 @@ func TestParseRealPlatformDorisAndIcebergDDLs(t *testing.T) {
 	t.Run("iceberg_tenant_profile_ddl.sql (54 Iceberg tables)", func(t *testing.T) {
 		raw, err := os.ReadFile(filepath.Join(schemasDir, "iceberg_tenant_profile_ddl.sql"))
 		if err != nil {
+			if os.IsNotExist(err) {
+				t.Skipf("legacy file removed in platform/schemas: %v", err)
+			}
 			t.Fatalf("read iceberg_tenant_profile_ddl.sql: %v", err)
 		}
 		schema, err := doris.ParseSchema(string(raw))
@@ -142,6 +148,9 @@ func TestParseRealPlatformDorisAndIcebergDDLs(t *testing.T) {
 	t.Run("vw_patient_summaries.sql (CREATE OR REPLACE VIEW)", func(t *testing.T) {
 		raw, err := os.ReadFile(filepath.Join(schemasDir, "vw_patient_summaries.sql"))
 		if err != nil {
+			if os.IsNotExist(err) {
+				t.Skipf("legacy file removed in platform/schemas: %v", err)
+			}
 			t.Fatalf("read vw_patient_summaries.sql: %v", err)
 		}
 		schema, err := doris.ParseSchema(string(raw))
@@ -1606,4 +1615,297 @@ table "events" {
 	if v := doris.LintSchemaEvolution(liveShowCreate, desiredFromHCL, doris.LintOptions{}); len(v) != 0 {
 		t.Errorf("expected 0 violations when comparing live range partitions against HCL empty partitions, got %v", v)
 	}
+}
+
+func TestDiff_SemanticSingleColumnIndexMatching(t *testing.T) {
+	t.Run("matches_renamed_single_column_indexes_with_reordered_props", func(t *testing.T) {
+		before, err := doris.ParseSchema(`
+CREATE TABLE internal.tenant_duke.patients (
+    patient_id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(64) NOT NULL DEFAULT "",
+    notes TEXT,
+    INDEX idx_patients_mrn (mrn) USING INVERTED PROPERTIES ("parser" = "unicode", "support_phrase" = "true"),
+    INDEX idx_notes_ngram (notes) USING NGRAM_BF PROPERTIES ("gram_size" = "3", "bf_size" = "256")
+)
+UNIQUE KEY(patient_id)
+DISTRIBUTED BY HASH(patient_id) BUCKETS 8;`)
+		if err != nil {
+			t.Fatalf("ParseSchema(before): %v", err)
+		}
+
+		after, err := doris.ParseSchema(`
+CREATE TABLE internal.tenant_duke.patients (
+    patient_id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(64) NOT NULL DEFAULT "",
+    notes TEXT,
+    INDEX idx_mrn_inv (mrn) USING INVERTED PROPERTIES ("support_phrase" = "true", "parser" = "unicode"),
+    INDEX idx_notes_ng (notes) USING NGRAM_BF PROPERTIES ("bf_size" = "256", "gram_size" = "3")
+)
+UNIQUE KEY(patient_id)
+DISTRIBUTED BY HASH(patient_id) BUCKETS 8;`)
+		if err != nil {
+			t.Fatalf("ParseSchema(after): %v", err)
+		}
+
+		stmts, err := doris.Diff(before, after)
+		if err != nil {
+			t.Fatalf("Diff: %v", err)
+		}
+		if len(stmts) != 0 {
+			t.Fatalf("expected 0 index churn statements on semantically equal renamed single-column indexes, got %d:\n%s", len(stmts), doris.FormatStatements(stmts))
+		}
+	})
+
+	t.Run("mismatched_properties_type_or_multicolumn_still_diffs", func(t *testing.T) {
+		before, err := doris.ParseSchema(`
+CREATE TABLE internal.tenant_duke.patients (
+    patient_id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(64) NOT NULL DEFAULT "",
+    first_name VARCHAR(64) NOT NULL DEFAULT "",
+    last_name VARCHAR(64) NOT NULL DEFAULT "",
+    INDEX idx_mrn (mrn) USING INVERTED PROPERTIES ("parser" = "english"),
+    INDEX idx_comp_a (first_name, last_name) USING INVERTED
+)
+UNIQUE KEY(patient_id)
+DISTRIBUTED BY HASH(patient_id) BUCKETS 8;`)
+		if err != nil {
+			t.Fatalf("ParseSchema(before): %v", err)
+		}
+
+		after, err := doris.ParseSchema(`
+CREATE TABLE internal.tenant_duke.patients (
+    patient_id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(64) NOT NULL DEFAULT "",
+    first_name VARCHAR(64) NOT NULL DEFAULT "",
+    last_name VARCHAR(64) NOT NULL DEFAULT "",
+    INDEX idx_mrn_unicode (mrn) USING INVERTED PROPERTIES ("parser" = "unicode"),
+    INDEX idx_comp_b (first_name, last_name) USING INVERTED
+)
+UNIQUE KEY(patient_id)
+DISTRIBUTED BY HASH(patient_id) BUCKETS 8;`)
+		if err != nil {
+			t.Fatalf("ParseSchema(after): %v", err)
+		}
+
+		stmts, err := doris.Diff(before, after)
+		if err != nil {
+			t.Fatalf("Diff: %v", err)
+		}
+		sqlOut := doris.FormatStatements(stmts)
+		if !strings.Contains(sqlOut, "DROP INDEX idx_mrn") || !strings.Contains(sqlOut, "ADD INDEX idx_mrn_unicode") || !strings.Contains(sqlOut, "BUILD INDEX idx_mrn_unicode") {
+			t.Errorf("expected property change on renamed index to drop+add+build:\n%s", sqlOut)
+		}
+		if !strings.Contains(sqlOut, "DROP INDEX idx_comp_a") || !strings.Contains(sqlOut, "ADD INDEX idx_comp_b") {
+			t.Errorf("expected multi-column renamed index NOT to match semantically:\n%s", sqlOut)
+		}
+	})
+}
+
+func TestIcebergArrayVarcharStringCompatibility_And_NullToNotNullLint(t *testing.T) {
+	t.Run("iceberg_array_varchar_and_array_string_compatible", func(t *testing.T) {
+		if !doris.IsIcebergArrayVarcharStringCompatible("ARRAY<VARCHAR(65533)>", "ARRAY<STRING>") ||
+			!doris.IsIcebergArrayVarcharStringCompatible("ARRAY<STRING>", "ARRAY<VARCHAR(128)>") ||
+			doris.IsIcebergArrayVarcharStringCompatible("ARRAY<INT>", "ARRAY<STRING>") ||
+			doris.IsIcebergArrayVarcharStringCompatible("VARCHAR(64)", "STRING") {
+			t.Fatalf("unexpected IsIcebergArrayVarcharStringCompatible results")
+		}
+
+		before, err := doris.ParseSchema(`
+CREATE TABLE azra_lake.tenant_duke.obs (
+    id STRING,
+    tags ARRAY<VARCHAR(65533)>
+) ENGINE=iceberg;`)
+		if err != nil {
+			t.Fatalf("ParseSchema(before): %v", err)
+		}
+		after, err := doris.ParseSchema(`
+CREATE TABLE azra_lake.tenant_duke.obs (
+    id STRING,
+    tags ARRAY<STRING>
+) ENGINE=iceberg;`)
+		if err != nil {
+			t.Fatalf("ParseSchema(after): %v", err)
+		}
+
+		if vs := doris.LintSchemaEvolution(before, after, doris.LintOptions{}); len(vs) != 0 {
+			t.Fatalf("expected 0 lint violations for Iceberg ARRAY<VARCHAR> -> ARRAY<STRING>, got %v", vs)
+		}
+		stmts, err := doris.Diff(before, after)
+		if err != nil {
+			t.Fatalf("Diff: %v", err)
+		}
+		if len(stmts) != 0 {
+			t.Fatalf("expected 0 diff statements for Iceberg ARRAY<VARCHAR> <-> ARRAY<STRING>, got %d:\n%s", len(stmts), doris.FormatStatements(stmts))
+		}
+	})
+
+	t.Run("doris_internal_array_varchar_to_string_still_blocked_unless_compatible", func(t *testing.T) {
+		before, err := doris.ParseSchema(`
+CREATE TABLE internal.tenant_duke.obs (
+    id VARCHAR(64) NOT NULL,
+    tags ARRAY<VARCHAR(64)>
+) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;`)
+		if err != nil {
+			t.Fatalf("ParseSchema(before): %v", err)
+		}
+		after, err := doris.ParseSchema(`
+CREATE TABLE internal.tenant_duke.obs (
+    id VARCHAR(64) NOT NULL,
+    tags ARRAY<INT>
+) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;`)
+		if err != nil {
+			t.Fatalf("ParseSchema(after): %v", err)
+		}
+		vs := doris.LintSchemaEvolution(before, after, doris.LintOptions{})
+		if len(vs) == 0 || vs[0].Rule != doris.DORIS006_SAFE_TYPE_EVOLUTION {
+			t.Fatalf("expected DORIS006 violation for incompatible Doris internal ARRAY type change, got %v", vs)
+		}
+	})
+
+	t.Run("null_to_not_null_triggers_doris006_and_not_null_to_null_allowed", func(t *testing.T) {
+		before, err := doris.ParseSchema(`
+CREATE TABLE internal.tenant_duke.patients (
+    id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(64) NULL,
+    code VARCHAR(64) NOT NULL DEFAULT ""
+) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;`)
+		if err != nil {
+			t.Fatalf("ParseSchema(before): %v", err)
+		}
+
+		// Tightening mrn NULL -> NOT NULL must be flagged by DORIS006
+		tightened, err := doris.ParseSchema(`
+CREATE TABLE internal.tenant_duke.patients (
+    id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(64) NOT NULL DEFAULT "",
+    code VARCHAR(64) NOT NULL DEFAULT ""
+) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;`)
+		if err != nil {
+			t.Fatalf("ParseSchema(tightened): %v", err)
+		}
+		vs := doris.LintSchemaEvolution(before, tightened, doris.LintOptions{})
+		if len(vs) == 0 || vs[0].Rule != doris.DORIS006_SAFE_TYPE_EVOLUTION || vs[0].ColumnName != "mrn" {
+			t.Fatalf("expected DORIS006 NULL -> NOT NULL violation on mrn, got %v", vs)
+		}
+
+		// Widening code NOT NULL -> NULL must remain permitted
+		widened, err := doris.ParseSchema(`
+CREATE TABLE internal.tenant_duke.patients (
+    id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(64) NULL,
+    code VARCHAR(64) NULL
+) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;`)
+		if err != nil {
+			t.Fatalf("ParseSchema(widened): %v", err)
+		}
+		vsWiden := doris.LintSchemaEvolution(before, widened, doris.LintOptions{})
+		if len(vsWiden) != 0 {
+			t.Fatalf("expected NOT NULL -> NULL widening to pass with 0 violations, got %v", vsWiden)
+		}
+	})
+}
+
+func TestStage1B_ParserAstFormatDiffLintFixes(t *testing.T) {
+	t.Run("strip_comments_and_split_statements_hardening", func(t *testing.T) {
+		if _, err := doris.StripCommentsAndSplitStatements("/*!40101 DROP TABLE x */;"); err == nil {
+			t.Errorf("expected /*! conditional comment to be rejected")
+		}
+		if _, err := doris.StripCommentsAndSplitStatements("CREATE TABLE t (`col` INT) /* unterminated;"); err == nil {
+			t.Errorf("expected unterminated /* comment to be rejected")
+		}
+		stmts, err := doris.StripCommentsAndSplitStatements("SELECT `a``b` FROM t # hash comment\n; CREATE TABLE t2 (id INT);")
+		if err != nil || len(stmts) != 2 || !strings.Contains(stmts[0], "`a``b`") {
+			t.Fatalf("expected # comment + doubled backticks to split cleanly into 2 statements, got (%v, %v)", stmts, err)
+		}
+	})
+
+	t.Run("ast_lookup_key_case_and_decimal_semantic", func(t *testing.T) {
+		if !doris.TypesSemanticallyEqual("DECIMAL(10)", "DECIMALV3(10, 0)") {
+			t.Errorf("expected DECIMAL(10) and DECIMALV3(10, 0) to be semantically equal")
+		}
+		if doris.CanonicalSemanticType("DECIMAL(10)") != "DECIMALV3(10, 0)" {
+			t.Errorf("expected CanonicalSemanticType(DECIMAL(10)) = DECIMALV3(10, 0), got %q", doris.CanonicalSemanticType("DECIMAL(10)"))
+		}
+
+		s1, err := doris.ParseSchema("CREATE DATABASE Internal.TENANT_${TENANT_SLUG};\nCREATE TABLE Internal.TENANT_${TENANT_SLUG}.Patients (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;")
+		if err != nil {
+			t.Fatalf("ParseSchema failed: %v", err)
+		}
+		if _, ok := s1.TableByName("internal.tenant_${TENANT_SLUG}.Patients"); !ok {
+			t.Errorf("expected case-insensitive catalog/db lookup with exact table case while preserving ${TENANT_SLUG}")
+		}
+		if _, ok := s1.TableByName("internal.tenant_${TENANT_SLUG}.patients"); ok {
+			t.Errorf("expected case-sensitive table-name lookup not to match Patients with patients")
+		}
+		if len(s1.Databases) != 1 || s1.Databases[0].LookupKey() != "tenant_${TENANT_SLUG}" {
+			t.Errorf("expected DatabaseDef.LookupKey()='tenant_${TENANT_SLUG}', got %q", s1.Databases[0].LookupKey())
+		}
+
+		// Distinct case-sensitive table identities (lower_case_table_names = 0)
+		sCase, err := doris.ParseSchema(`
+CREATE TABLE internal.db.Patients (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1;
+CREATE TABLE internal.db.patients (id INT, note VARCHAR(32)) DISTRIBUTED BY HASH(id) BUCKETS 1;
+DROP TABLE internal.db.patients;`)
+		if err != nil {
+			t.Fatalf("ParseSchema(case-sensitive DROP TABLE) failed: %v", err)
+		}
+		if len(sCase.Tables) != 1 || sCase.Tables[0].Name != "Patients" {
+			t.Errorf("expected DROP TABLE internal.db.patients to leave Patients intact, got %+v", sCase.Tables)
+		}
+	})
+
+	t.Run("pair_table_indexes_claimed_name_and_comment", func(t *testing.T) {
+		before, err := doris.ParseSchema(`
+CREATE TABLE internal.db.t (
+    id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(64) NOT NULL DEFAULT "",
+    INDEX idx_a (mrn) USING INVERTED,
+    INDEX idx_b (mrn) USING INVERTED COMMENT 'old'
+) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;`)
+		if err != nil {
+			t.Fatalf("ParseSchema(before): %v", err)
+		}
+		after, err := doris.ParseSchema(`
+CREATE TABLE internal.db.t (
+    id VARCHAR(64) NOT NULL,
+    mrn VARCHAR(64) NOT NULL DEFAULT "",
+    INDEX idx_renamed (mrn) USING INVERTED,
+    INDEX idx_b (mrn) USING INVERTED COMMENT 'new'
+) UNIQUE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 4;`)
+		if err != nil {
+			t.Fatalf("ParseSchema(after): %v", err)
+		}
+		stmts, err := doris.Diff(before, after)
+		if err != nil {
+			t.Fatalf("Diff: %v", err)
+		}
+		sqlOut := doris.FormatStatements(stmts)
+		// idx_b is claimed by desired idx_b (different comment), so idx_renamed pairs with idx_a,
+		// while idx_b is dropped + re-added with the new comment instead of wrongly stealing idx_a!
+		if !strings.Contains(sqlOut, "DROP INDEX idx_b") || !strings.Contains(sqlOut, "ADD INDEX idx_b") {
+			t.Errorf("expected comment change on claimed idx_b to drop+add idx_b cleanly:\n%s", sqlOut)
+		}
+		if strings.Contains(sqlOut, "DROP INDEX idx_a") {
+			t.Errorf("expected idx_renamed to pair with unclaimed idx_a:\n%s", sqlOut)
+		}
+	})
+
+	t.Run("recursive_iceberg_varchar_string_compatible", func(t *testing.T) {
+		if !doris.IsIcebergVarcharStringCompatible("VARCHAR(64)", "TEXT") ||
+			!doris.IsIcebergVarcharStringCompatible("MAP<VARCHAR(32), ARRAY<VARCHAR(64)>>", "MAP<STRING, ARRAY<STRING>>") ||
+			!doris.IsIcebergVarcharStringCompatible("STRUCT<a:VARCHAR(32), b:INT>", "STRUCT<a:STRING, b:INT>") ||
+			doris.IsIcebergVarcharStringCompatible("STRUCT<a:VARCHAR(32), b:INT>", "STRUCT<c:STRING, b:INT>") ||
+			doris.IsIcebergVarcharStringCompatible("INT", "STRING") {
+			t.Errorf("unexpected IsIcebergVarcharStringCompatible results")
+		}
+
+		ice1, _ := doris.ParseSchema("CREATE TABLE azra_lake.db.t (s VARCHAR(64), m MAP<VARCHAR(32), ARRAY<VARCHAR(64)>>) ENGINE=iceberg;")
+		ice2, _ := doris.ParseSchema("CREATE TABLE azra_lake.db.t (s STRING, m MAP<STRING, ARRAY<STRING>>) ENGINE=iceberg;")
+		if vs := doris.LintSchemaEvolution(ice1, ice2, doris.LintOptions{}); len(vs) != 0 {
+			t.Errorf("expected 0 lint violations for Iceberg nested VARCHAR<->STRING: %v", vs)
+		}
+		if stmts, err := doris.Diff(ice1, ice2); err != nil || len(stmts) != 0 {
+			t.Errorf("expected 0 diff stmts for Iceberg nested VARCHAR<->STRING: stmts=%d err=%v", len(stmts), err)
+		}
+	})
 }

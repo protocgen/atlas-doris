@@ -257,7 +257,14 @@ func CanonicalSemanticType(raw string) string {
 		return "DATETIMEV2(" + strings.TrimPrefix(norm, "DATETIME(")
 	}
 	if strings.HasPrefix(norm, "DECIMAL(") && strings.HasSuffix(norm, ")") {
-		return "DECIMALV3(" + strings.TrimPrefix(norm, "DECIMAL(")
+		norm = "DECIMALV3(" + strings.TrimPrefix(norm, "DECIMAL(")
+	}
+	if strings.HasPrefix(norm, "DECIMALV3(") && strings.HasSuffix(norm, ")") {
+		inner := strings.TrimSuffix(strings.TrimPrefix(norm, "DECIMALV3("), ")")
+		if !strings.Contains(inner, ",") {
+			return "DECIMALV3(" + strings.TrimSpace(inner) + ", 0)"
+		}
+		return "DECIMALV3(" + inner + ")"
 	}
 	return norm
 }

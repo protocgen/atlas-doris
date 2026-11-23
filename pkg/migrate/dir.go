@@ -3,17 +3,25 @@
 package migrate
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"testing/fstest"
 	"time"
 
 	"ariga.io/atlas/sql/migrate"
 	"github.com/protocgen/atlas-doris/pkg/doris"
 )
+
+var validMigrationVersionRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // MigrationFile represents a single versioned SQL migration file in a migration chain.
 type MigrationFile struct {
@@ -47,6 +55,9 @@ func ResolvePath(raw string) (string, error) {
 			p = filepath.Join(u.Host, u.Path)
 		} else if strings.HasPrefix(s, "file://./") || strings.HasPrefix(s, "file://../") {
 			p = strings.TrimPrefix(s, "file://")
+			if q := strings.IndexAny(p, "?#"); q >= 0 {
+				p = p[:q]
+			}
 		}
 		return filepath.Clean(p), nil
 	}
@@ -54,6 +65,137 @@ func ResolvePath(raw string) (string, error) {
 		return "", fmt.Errorf("unsupported URL scheme in %q (expected file://)", raw)
 	}
 	return filepath.Clean(s), nil
+}
+
+type fsDir struct {
+	fsys fs.FS
+}
+
+func (d fsDir) Open(name string) (fs.File, error) {
+	return d.fsys.Open(name)
+}
+
+func (d fsDir) WriteFile(string, []byte) error {
+	return fmt.Errorf("read-only migration filesystem")
+}
+
+func (d fsDir) Files() ([]migrate.File, error) {
+	names, err := fs.Glob(d.fsys, "*.sql")
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(names)
+	files := make([]migrate.File, 0, len(names))
+	for _, n := range names {
+		if !fs.ValidPath(n) || strings.ContainsAny(n, "/\\") || path.Base(n) != n {
+			return nil, fmt.Errorf("sql/migrate: invalid migration filename %q", n)
+		}
+		b, err := fs.ReadFile(d.fsys, n)
+		if err != nil {
+			return nil, fmt.Errorf("sql/migrate: read file %q: %w", n, err)
+		}
+		files = append(files, migrate.NewLocalFile(n, b))
+	}
+	return files, nil
+}
+
+func (d fsDir) Checksum() (migrate.HashFile, error) {
+	files, err := d.Files()
+	if err != nil {
+		return nil, err
+	}
+	return migrate.NewHashFile(files)
+}
+
+func snapshotMigrationFS(fsys fs.FS) (fstest.MapFS, error) {
+	if fsys == nil {
+		return nil, fmt.Errorf("nil migration filesystem")
+	}
+	snap := make(fstest.MapFS)
+	if rawSum, err := fs.ReadFile(fsys, migrate.HashFileName); err == nil {
+		snap[migrate.HashFileName] = &fstest.MapFile{Data: rawSum}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("read %s: %w", migrate.HashFileName, err)
+	}
+	names, err := fs.Glob(fsys, "*.sql")
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		if !fs.ValidPath(n) || strings.ContainsAny(n, "/\\") || path.Base(n) != n {
+			return nil, fmt.Errorf("sql/migrate: invalid migration filename %q", n)
+		}
+		b, err := fs.ReadFile(fsys, n)
+		if err != nil {
+			return nil, fmt.Errorf("sql/migrate: read file %q: %w", n, err)
+		}
+		snap[n] = &fstest.MapFile{Data: b}
+	}
+	return snap, nil
+}
+
+func validateUniqueMigrationVersions(files []migrate.File) error {
+	seen := make(map[string]string, len(files))
+	for _, f := range files {
+		ver := strings.TrimSpace(f.Version())
+		if ver == "" {
+			return fmt.Errorf("migration file %s has empty version", f.Name())
+		}
+		if prev, dup := seen[ver]; dup {
+			return fmt.Errorf("duplicate migration version %q in %s and %s", ver, prev, f.Name())
+		}
+		seen[ver] = f.Name()
+	}
+	return nil
+}
+
+// VerifySumFS validates the integrity of an Atlas migration filesystem against its
+// atlas.sum file and returns the canonical "h1:<base64>" directory checksum.
+func VerifySumFS(fsys fs.FS) (string, error) {
+	snap, err := snapshotMigrationFS(fsys)
+	if err != nil {
+		return "", err
+	}
+	return verifySumSnapshot(snap)
+}
+
+func verifySumSnapshot(snap fstest.MapFS) (string, error) {
+	rawSum, err := fs.ReadFile(snap, migrate.HashFileName)
+	if err != nil {
+		return "", fmt.Errorf("missing %s: %w", migrate.HashFileName, err)
+	}
+	if strings.Contains(string(rawSum), "atlas:sum ignore") {
+		return "", fmt.Errorf("atlas.sum validation failed: atlas:sum ignore directive is not permitted")
+	}
+	var hf migrate.HashFile
+	if err := hf.UnmarshalText(rawSum); err != nil {
+		return "", fmt.Errorf("invalid %s: %w", migrate.HashFileName, err)
+	}
+	dir := fsDir{fsys: snap}
+	if err := migrate.Validate(dir); err != nil {
+		return "", fmt.Errorf("atlas.sum validation failed: %w", err)
+	}
+	files, err := dir.Files()
+	if err != nil {
+		return "", fmt.Errorf("atlas.sum validation failed: %w", err)
+	}
+	for _, f := range files {
+		h, err := hf.SumByName(f.Name())
+		if err != nil || strings.TrimSpace(h) == "" {
+			return "", fmt.Errorf("atlas.sum validation failed: migration %s is missing a valid checksum", f.Name())
+		}
+	}
+	return "h1:" + hf.Sum(), nil
+}
+
+// ReplayFS reads all migration .sql files from fsys in lexical version order
+// and replays them offline to construct the current doris.Schema state.
+func ReplayFS(fsys fs.FS) (*doris.Schema, []MigrationFile, error) {
+	if fsys == nil {
+		return nil, nil, fmt.Errorf("nil migration filesystem")
+	}
+	return replayAtlasDir(fsDir{fsys: fsys}, "fs")
 }
 
 // ReplayDir reads all migration .sql files from dirPath in lexical version order
@@ -67,11 +209,21 @@ func ReplayDir(dirPath string) (*doris.Schema, []MigrationFile, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("open migration directory %q: %w", cleanPath, err)
 	}
-	files, err := localDir.Files()
+	return replayAtlasDir(localDir, fmt.Sprintf("%q", cleanPath))
+}
+
+func replayAtlasDir(dir migrate.Dir, label string) (*doris.Schema, []MigrationFile, error) {
+	files, err := dir.Files()
 	if err != nil {
-		return nil, nil, fmt.Errorf("read migration files in %q: %w", cleanPath, err)
+		return nil, nil, fmt.Errorf("read migration files in %s: %w", label, err)
 	}
-	hf, _ := localDir.Checksum()
+	if err := validateUniqueMigrationVersions(files); err != nil {
+		return nil, nil, err
+	}
+	hf, err := dir.Checksum()
+	if err != nil {
+		return nil, nil, fmt.Errorf("compute checksum in %s: %w", label, err)
+	}
 
 	schema := doris.NewSchema()
 	var migFiles []MigrationFile
@@ -86,22 +238,35 @@ func ReplayDir(dirPath string) (*doris.Schema, []MigrationFile, error) {
 				return nil, nil, fmt.Errorf("migration %s statement %d: %w", f.Name(), i+1, err)
 			}
 		}
-		hashVal := ""
-		if hf != nil {
-			if h, err := hf.SumByName(f.Name()); err == nil {
-				hashVal = "h1:" + h
-			}
+		if hf == nil {
+			return nil, nil, fmt.Errorf("migration %s missing valid checksum in %s", f.Name(), migrate.HashFileName)
+		}
+		h, err := hf.SumByName(f.Name())
+		if err != nil {
+			return nil, nil, fmt.Errorf("migration %s missing valid checksum in %s: %w", f.Name(), migrate.HashFileName, err)
+		}
+		if strings.TrimSpace(h) == "" {
+			return nil, nil, fmt.Errorf("migration %s has empty checksum in %s", f.Name(), migrate.HashFileName)
 		}
 		migFiles = append(migFiles, MigrationFile{
 			Name:        f.Name(),
 			Version:     f.Version(),
 			Description: f.Desc(),
-			Hash:        hashVal,
+			Hash:        "h1:" + h,
 			SQL:         rawSQL,
 			Statements:  stmts,
 		})
 	}
 	return schema, migFiles, nil
+}
+
+// LintFS replays all migrations in fsys step-by-step, validating each step
+// (and optional desired target schema) against Doris/Iceberg evolution lint rules.
+func LintFS(fsys fs.FS, desired *doris.Schema, opts doris.LintOptions) ([]doris.Violation, error) {
+	if fsys == nil {
+		return nil, fmt.Errorf("nil migration filesystem")
+	}
+	return lintAtlasDir(fsDir{fsys: fsys}, desired, opts, "fs")
 }
 
 // LintDir replays all migrations in dirPath step-by-step, validating each step
@@ -115,19 +280,40 @@ func LintDir(dirPath string, desired *doris.Schema, opts doris.LintOptions) ([]d
 	if err != nil {
 		return nil, fmt.Errorf("open migration directory %q: %w", cleanPath, err)
 	}
-	files, err := localDir.Files()
+	return lintAtlasDir(localDir, desired, opts, fmt.Sprintf("%q", cleanPath))
+}
+
+func lintAtlasDir(dir migrate.Dir, desired *doris.Schema, opts doris.LintOptions, label string) ([]doris.Violation, error) {
+	_, _, violations, err := lintAndReplayAtlasDir(dir, desired, opts, label, false)
+	return violations, err
+}
+
+func lintAndReplayAtlasDir(dir migrate.Dir, desired *doris.Schema, opts doris.LintOptions, label string, computeHash bool) (*doris.Schema, []MigrationFile, []doris.Violation, error) {
+	files, err := dir.Files()
 	if err != nil {
-		return nil, fmt.Errorf("read migration files in %q: %w", cleanPath, err)
+		return nil, nil, nil, fmt.Errorf("read migration files in %s: %w", label, err)
+	}
+	if err := validateUniqueMigrationVersions(files); err != nil {
+		return nil, nil, nil, err
+	}
+	var hf migrate.HashFile
+	if computeHash {
+		hf, err = migrate.NewHashFile(files)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("compute checksum in %s: %w", label, err)
+		}
 	}
 
 	current := doris.NewSchema()
 	var violations []doris.Violation
+	var migFiles []MigrationFile
 
 	for _, f := range files {
 		before := current.Clone()
-		stmts, err := doris.ParseStatements(string(f.Bytes()))
+		rawSQL := string(f.Bytes())
+		stmts, err := doris.ParseStatements(rawSQL)
 		if err != nil {
-			return nil, fmt.Errorf("migration %s: %w", f.Name(), err)
+			return nil, nil, nil, fmt.Errorf("migration %s: %w", f.Name(), err)
 		}
 		for i, st := range stmts {
 			if !opts.AllowDestructive {
@@ -160,7 +346,11 @@ func LintDir(dirPath string, desired *doris.Schema, opts doris.LintOptions) ([]d
 			if st.Kind == doris.StmtAlterTableModifyColumn && st.Column != nil {
 				if tbl, ok := current.TableByName(st.TargetTable); ok {
 					if origCol, ok := tbl.ColumnByName(st.Column.Name); ok {
-						if !doris.IsSafeTypeEvolution(origCol.Type, st.Column.Type) {
+						typeSafe := doris.IsSafeTypeEvolution(origCol.Type, st.Column.Type)
+						if !typeSafe && tbl.IsIcebergTable() && doris.IsIcebergVarcharStringCompatible(origCol.Type, st.Column.Type) {
+							typeSafe = true
+						}
+						if !typeSafe {
 							violations = append(violations, doris.Violation{
 								Rule:       doris.DORIS006_SAFE_TYPE_EVOLUTION,
 								TableName:  st.TargetTable,
@@ -168,20 +358,50 @@ func LintDir(dirPath string, desired *doris.Schema, opts doris.LintOptions) ([]d
 								Message:    fmt.Sprintf("migration %s performs unsafe type evolution on column %q from %q to %q", f.Name(), st.Column.Name, origCol.Type, st.Column.Type),
 							})
 						}
+						if origCol.Nullable && !st.Column.Nullable {
+							violations = append(violations, doris.Violation{
+								Rule:       doris.DORIS006_SAFE_TYPE_EVOLUTION,
+								TableName:  st.TargetTable,
+								ColumnName: st.Column.Name,
+								Message:    fmt.Sprintf("migration %s tightens column %q nullability from NULL to NOT NULL", f.Name(), st.Column.Name),
+							})
+						}
 					}
 				}
 			}
 			if err := doris.ApplyStatement(current, st); err != nil {
-				return nil, fmt.Errorf("migration %s statement %d: %w", f.Name(), i+1, err)
+				return nil, nil, nil, fmt.Errorf("migration %s statement %d: %w", f.Name(), i+1, err)
 			}
 		}
-		// Check static & evolution rules for this step (using AllowDestructive=true to avoid duplicate DORIS004/005/006 already recorded per-stmt)
+		// Check static & evolution rules for this step (using AllowDestructive=true to avoid duplicate DORIS004/005/006 already recorded per-stmt,
+		// while preserving ANN index DORIS006 checks from lintTableKeyAndANN).
 		stepViolations := doris.LintSchemaEvolution(before, current, doris.LintOptions{AllowDestructive: true})
 		for _, sv := range stepViolations {
-			if sv.Rule == doris.DORIS005_NON_NULL_SCALAR_DEFAULT || sv.Rule == doris.DORIS006_SAFE_TYPE_EVOLUTION {
+			if sv.Rule == doris.DORIS005_NON_NULL_SCALAR_DEFAULT ||
+				(sv.Rule == doris.DORIS006_SAFE_TYPE_EVOLUTION && !strings.HasPrefix(sv.Message, "ANN index ")) {
 				continue
 			}
 			violations = append(violations, sv)
+		}
+		if computeHash {
+			if hf == nil {
+				return nil, nil, nil, fmt.Errorf("migration %s missing valid checksum in %s", f.Name(), migrate.HashFileName)
+			}
+			h, err := hf.SumByName(f.Name())
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("migration %s missing valid checksum in %s: %w", f.Name(), migrate.HashFileName, err)
+			}
+			if strings.TrimSpace(h) == "" {
+				return nil, nil, nil, fmt.Errorf("migration %s has empty checksum in %s", f.Name(), migrate.HashFileName)
+			}
+			migFiles = append(migFiles, MigrationFile{
+				Name:        f.Name(),
+				Version:     f.Version(),
+				Description: f.Desc(),
+				Hash:        "h1:" + h,
+				SQL:         rawSQL,
+				Statements:  stmts,
+			})
 		}
 	}
 
@@ -189,7 +409,7 @@ func LintDir(dirPath string, desired *doris.Schema, opts doris.LintOptions) ([]d
 		violations = append(violations, doris.LintSchemaEvolution(current, desired, opts)...)
 	}
 
-	return violations, nil
+	return current, migFiles, violations, nil
 }
 
 // HashDir recomputes and writes the Atlas-compatible atlas.sum file in dirPath.
@@ -212,29 +432,47 @@ func HashDir(dirPath string) error {
 	return nil
 }
 
+// ValidateFS verifies the atlas.sum checksum integrity in fsys and replays
+// all migrations to validate SQL syntax and Doris/Iceberg lint rules.
+func ValidateFS(fsys fs.FS, opts doris.LintOptions) error {
+	_, _, err := validateAndReplayFS(fsys, opts)
+	return err
+}
+
+func validateAndReplayFS(fsys fs.FS, opts doris.LintOptions) (*doris.Schema, []MigrationFile, error) {
+	snap, err := snapshotMigrationFS(fsys)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, err := verifySumSnapshot(snap); err != nil {
+		return nil, nil, err
+	}
+	schema, files, violations, err := lintAndReplayAtlasDir(fsDir{fsys: snap}, nil, opts, "fs", true)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := doris.ViolationsToError(violations); err != nil {
+		return nil, nil, err
+	}
+	return schema, files, nil
+}
+
 // ValidateDir verifies the atlas.sum checksum integrity in dirPath and replays
 // all migrations to validate SQL syntax and Doris/Iceberg lint rules.
 func ValidateDir(dirPath string, opts doris.LintOptions) error {
+	_, _, err := validateAndReplayDir(dirPath, opts)
+	return err
+}
+
+func validateAndReplayDir(dirPath string, opts doris.LintOptions) (*doris.Schema, []MigrationFile, error) {
 	cleanPath, err := ResolvePath(dirPath)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	sumPath := filepath.Join(cleanPath, migrate.HashFileName)
-	if _, err := os.Stat(sumPath); err != nil {
-		return fmt.Errorf("missing %s in %q: %w", migrate.HashFileName, cleanPath, err)
+	if _, err := migrate.NewLocalDir(cleanPath); err != nil {
+		return nil, nil, fmt.Errorf("open migration directory %q: %w", cleanPath, err)
 	}
-	localDir, err := migrate.NewLocalDir(cleanPath)
-	if err != nil {
-		return fmt.Errorf("open migration directory %q: %w", cleanPath, err)
-	}
-	if err := migrate.Validate(localDir); err != nil {
-		return fmt.Errorf("atlas.sum validation failed in %q: %w", cleanPath, err)
-	}
-	violations, err := LintDir(cleanPath, nil, opts)
-	if err != nil {
-		return err
-	}
-	return doris.ViolationsToError(violations)
+	return validateAndReplayFS(os.DirFS(cleanPath), opts)
 }
 
 // DiffAndWrite replays dirPath, computes the migration diff to reach desired,
@@ -245,11 +483,23 @@ func DiffAndWrite(dirPath, migrationName string, desired *doris.Schema, opts Dif
 	if err != nil {
 		return "", nil, err
 	}
+	if opts.Version != "" && !validMigrationVersionRe.MatchString(opts.Version) {
+		return "", nil, fmt.Errorf("invalid migration version %q (must match ^[A-Za-z0-9_-]+$)", opts.Version)
+	}
 	if err := os.MkdirAll(cleanPath, 0o755); err != nil {
 		return "", nil, fmt.Errorf("create migration directory %q: %w", cleanPath, err)
 	}
+	snap, err := snapshotMigrationFS(os.DirFS(cleanPath))
+	if err != nil {
+		return "", nil, fmt.Errorf("snapshot migration directory %q: %w", cleanPath, err)
+	}
+	if _, hasSum := snap[migrate.HashFileName]; hasSum {
+		if _, err := verifySumSnapshot(snap); err != nil {
+			return "", nil, fmt.Errorf("verify atlas.sum in %q: %w", cleanPath, err)
+		}
+	}
 
-	current, existingFiles, err := ReplayDir(cleanPath)
+	current, existingFiles, err := ReplayFS(snap)
 	if err != nil {
 		return "", nil, err
 	}

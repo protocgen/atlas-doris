@@ -387,6 +387,7 @@ func LintTableEvolution(before, after *TableDef, opts LintOptions) []Violation {
 	}
 
 	// DORIS005, DORIS006, and DORIS007 on after columns.
+	isIcebergPair := before.IsIcebergTable() && after.IsIcebergTable()
 	isIcebergV2 := after.IsIcebergTable() && strings.TrimSpace(after.PropertyMap()["format-version"]) != "3"
 	for _, ac := range after.Columns {
 		if IsForbiddenColumnType(ac.Type) {
@@ -414,12 +415,22 @@ func LintTableEvolution(before, after *TableDef, opts LintOptions) []Violation {
 		}
 
 		// Existing column: check DORIS006_SAFE_TYPE_EVOLUTION.
-		if !IsSafeTypeEvolution(bc.Type, ac.Type) {
+		typeSafe := IsSafeTypeEvolution(bc.Type, ac.Type) ||
+			(isIcebergPair && IsIcebergVarcharStringCompatible(bc.Type, ac.Type))
+		if !typeSafe {
 			violations = append(violations, Violation{
 				Rule:       DORIS006_SAFE_TYPE_EVOLUTION,
 				TableName:  tblName,
 				ColumnName: ac.Name,
 				Message:    fmt.Sprintf("unsafe type evolution on column %q from %q to %q", ac.Name, bc.Type, ac.Type),
+			})
+		}
+		if !isIcebergV2 && bc.Nullable && !ac.Nullable {
+			violations = append(violations, Violation{
+				Rule:       DORIS006_SAFE_TYPE_EVOLUTION,
+				TableName:  tblName,
+				ColumnName: ac.Name,
+				Message:    fmt.Sprintf("cannot tighten column %q from NULL to NOT NULL", ac.Name),
 			})
 		}
 	}
@@ -569,6 +580,86 @@ func IsSafeTypeEvolution(beforeType, afterType string) bool {
 	default:
 		return false
 	}
+}
+
+// IsIcebergVarcharStringCompatible reports whether t1 and t2 are Iceberg-compatible
+// with respect to Doris VARCHAR(N) vs Iceberg STRING/TEXT representations, including
+// scalar VARCHAR(N) <-> STRING/TEXT and recursively inside ARRAY, MAP, and STRUCT types.
+func IsIcebergVarcharStringCompatible(t1, t2 string) bool {
+	c1 := CanonicalSemanticType(t1)
+	c2 := CanonicalSemanticType(t2)
+	if c1 == "" || c2 == "" {
+		return false
+	}
+	return isIcebergVarcharStringCanonicalCompatible(c1, c2)
+}
+
+func isIcebergVarcharStringCanonicalCompatible(c1, c2 string) bool {
+	if c1 == c2 {
+		return true
+	}
+	if isScalarVarcharStringPair(c1, c2) {
+		return true
+	}
+	if strings.HasPrefix(c1, "ARRAY<") && strings.HasSuffix(c1, ">") &&
+		strings.HasPrefix(c2, "ARRAY<") && strings.HasSuffix(c2, ">") {
+		return isIcebergVarcharStringCanonicalCompatible(c1[6:len(c1)-1], c2[6:len(c2)-1])
+	}
+	if strings.HasPrefix(c1, "MAP<") && strings.HasSuffix(c1, ">") &&
+		strings.HasPrefix(c2, "MAP<") && strings.HasSuffix(c2, ">") {
+		p1 := splitTopLevelComma(c1[4 : len(c1)-1])
+		p2 := splitTopLevelComma(c2[4 : len(c2)-1])
+		if len(p1) == 2 && len(p2) == 2 {
+			return isIcebergVarcharStringCanonicalCompatible(strings.TrimSpace(p1[0]), strings.TrimSpace(p2[0])) &&
+				isIcebergVarcharStringCanonicalCompatible(strings.TrimSpace(p1[1]), strings.TrimSpace(p2[1]))
+		}
+		return false
+	}
+	if strings.HasPrefix(c1, "STRUCT<") && strings.HasSuffix(c1, ">") &&
+		strings.HasPrefix(c2, "STRUCT<") && strings.HasSuffix(c2, ">") {
+		f1 := splitTopLevelComma(c1[7 : len(c1)-1])
+		f2 := splitTopLevelComma(c2[7 : len(c2)-1])
+		if len(f1) != len(f2) {
+			return false
+		}
+		for i := range f1 {
+			n1, t1, ok1 := splitStructField(strings.TrimSpace(f1[i]))
+			n2, t2, ok2 := splitStructField(strings.TrimSpace(f2[i]))
+			if !ok1 || !ok2 {
+				if !isIcebergVarcharStringCanonicalCompatible(strings.TrimSpace(f1[i]), strings.TrimSpace(f2[i])) {
+					return false
+				}
+				continue
+			}
+			if n1 != n2 || !isIcebergVarcharStringCanonicalCompatible(CanonicalSemanticType(t1), CanonicalSemanticType(t2)) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func isScalarVarcharStringPair(c1, c2 string) bool {
+	if _, ok := parseVarcharLength(c1); ok && c2 == "STRING" {
+		return true
+	}
+	if _, ok := parseVarcharLength(c2); ok && c1 == "STRING" {
+		return true
+	}
+	return false
+}
+
+// IsIcebergArrayVarcharStringCompatible reports whether t1 and t2 represent an
+// Apache Iceberg-equivalent pair of ARRAY types containing VARCHAR(N) and STRING/TEXT.
+func IsIcebergArrayVarcharStringCompatible(t1, t2 string) bool {
+	c1 := CanonicalSemanticType(t1)
+	c2 := CanonicalSemanticType(t2)
+	if !strings.HasPrefix(c1, "ARRAY<") || !strings.HasSuffix(c1, ">") ||
+		!strings.HasPrefix(c2, "ARRAY<") || !strings.HasSuffix(c2, ">") {
+		return false
+	}
+	return isIcebergVarcharStringCanonicalCompatible(c1[6:len(c1)-1], c2[6:len(c2)-1])
 }
 
 func parseDatetimePrecision(t string) (int, bool) {
